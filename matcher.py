@@ -17,21 +17,34 @@ class TemplateMatch:
 
 
 def find_element(
-    img,
-    bgra_template,
+    img_gray,
+    template_gray,
+    mask,
+    img_bgr,
+    template_bgr,
+    template_size,
     method,
     roi: PixelROI,
     confidence_threshold: float,
 ) -> TemplateMatch:
-    img_bgr = img[:, :, :3]
-    bgr_template = bgra_template[:, :, :3]
-    alpha_mask = bgra_template[:, :, 3]
-    result: MatLike = cv2.matchTemplate(img_bgr, bgr_template, method, mask=alpha_mask)
+    if mask is not None:
+        result: MatLike = cv2.matchTemplate(img_gray, template_gray, method, mask=mask)
+    else:
+        result: MatLike = cv2.matchTemplate(img_gray, template_gray, method)
+
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    top_left = tuple(max_loc)
-
-    found_target = max_val > confidence_threshold
-
-    template_size = ImageSize.from_image(bgra_template)
-
-    return TemplateMatch(found_target, top_left, max_val, result, roi, template_size)
+    
+    # Grayscale fast reject (allow 0.03 margin of error for color differences)
+    if max_val < confidence_threshold - 0.03:
+        return TemplateMatch(False, tuple(max_loc), max_val, result, roi, template_size)
+        
+    # Second pass BGR for true confidence
+    if mask is not None:
+        result_bgr = cv2.matchTemplate(img_bgr, template_bgr, method, mask=mask)
+    else:
+        result_bgr = cv2.matchTemplate(img_bgr, template_bgr, method)
+        
+    _, max_val_bgr, _, max_loc_bgr = cv2.minMaxLoc(result_bgr)
+    found_target = max_val_bgr > confidence_threshold
+    
+    return TemplateMatch(found_target, tuple(max_loc_bgr), max_val_bgr, result_bgr, roi, template_size)

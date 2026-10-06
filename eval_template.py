@@ -29,12 +29,13 @@ def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
 
 
 def eval(
-    template: Template, img: cv2.mat_wrapper.Mat, config: Config, video_timestamp_str: str = ""
+    template: Template, img: cv2.mat_wrapper.Mat, img_gray: cv2.mat_wrapper.Mat, config: Config, video_timestamp_str: str = ""
 ) -> EvaluationResult:
-    if img is None:
+    if img is None or img_gray is None:
         raise ValueError("Got None for image")
 
-    for image, px_roi in product(template.images, template.px_rois):
+    from geometry import ImageSize
+    for (image, image_gray, mask), px_roi in product(zip(template.images, template.images_gray, template.masks), template.px_rois):
         h_inp, w_inp = image.shape[:2]
 
         img_h, img_w = img.shape[:2]
@@ -65,11 +66,16 @@ def eval(
             logger.warning("ROI is too small and cannot be expanded!")
             continue
 
+        roi_img_gray = img_gray[y1:y2, x1:x2]
         roi_img = img[y1:y2, x1:x2]
 
         match = find_element(
+            roi_img_gray,
+            image_gray,
+            mask,
             roi_img,
-            image,
+            image[:, :, :3],
+            ImageSize(width=w_inp, height=h_inp),
             config.matching_method,
             px_roi,
             config.elem_conf_thresh,
@@ -91,9 +97,9 @@ def eval(
                 y_max=bottom_right[1] + height + dy + dh,
             )
 
-            shadow_img = crop_image_to_roi(img, shadow_region)
+            shadow_img_gray = crop_image_to_roi(img_gray, shadow_region)
             has_shadow = analyze_shadow_presence(
-                shadow_img, threshold=config.shadow_threshold
+                shadow_img_gray, threshold=config.shadow_threshold
             )
             clicked = not has_shadow
 

@@ -29,6 +29,7 @@ class Config:
 
     debug_plot: bool = False
     setup_mode: bool = False
+    run_benchmark: bool = True
 
     @property
     def resolution(self) -> ImageSize:
@@ -47,6 +48,7 @@ def get_config() -> Config:
     parser.add_argument("--skip-frames", type=int, default=default_cfg.skip_frames)
     parser.add_argument("--debug-plot", action=argparse.BooleanOptionalAction, default=default_cfg.debug_plot)
     parser.add_argument("--setup-mode", action=argparse.BooleanOptionalAction, default=default_cfg.setup_mode)
+    parser.add_argument("--run-benchmark", action=argparse.BooleanOptionalAction, default=default_cfg.run_benchmark)
 
     args, unknown = parser.parse_known_args()
 
@@ -60,6 +62,7 @@ def get_config() -> Config:
         skip_frames=args.skip_frames,
         debug_plot=args.debug_plot,
         setup_mode=args.setup_mode,
+        run_benchmark=args.run_benchmark,
     )
 
 

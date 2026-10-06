@@ -68,10 +68,13 @@ class TestTemplates(unittest.TestCase):
                     img = cv2.imread(str(img_path))
                     self.assertIsNotNone(img, f"Failed to read image via cv2: {path}")
                     
+                    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    
                     # Run the core evaluation logic
                     result = eval_template.eval(
                         template, 
                         img, 
+                        img_gray,
                         self.config, 
                         video_timestamp_str=f"Frame {frame_idx}"
                     )

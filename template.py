@@ -14,6 +14,8 @@ class Template:
     norm_rois: list[NormalizedROI]
     px_rois: list[PixelROI]
     images: list[MatLike]
+    images_gray: list[MatLike]
+    masks: list[MatLike]
     shadow_dy: int
     shadow_dw: int
     shadow_dh: int
@@ -60,6 +62,12 @@ def template_loader(
             is not None
         ]
 
-        templates.append(Template(name, filenames, norm_rois, px_rois, images, shadow_dy, shadow_dw, shadow_dh, adjusted))
+        images_gray = []
+        masks = []
+        for img in images:
+            images_gray.append(cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY))
+            masks.append(img[:, :, 3] if img.shape[2] == 4 else None)
+
+        templates.append(Template(name, filenames, norm_rois, px_rois, images, images_gray, masks, shadow_dy, shadow_dw, shadow_dh, adjusted))
 
     return templates
