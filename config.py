@@ -14,6 +14,7 @@ class Config:
     template_img_dir: str = "assets/templates/drspectred"
     input_img_path: str = "assets/sample_inputs/scraped_frames/test_frame_1.jpg"
     input_video_path: str = "assets/sample_inputs/videos/bu_full.mp4"
+    output_dir: str = "output"
     resolution_width: int = 1920
     resolution_height: int = 1080
     matching_method: int = cv2.TM_CCORR_NORMED
@@ -24,8 +25,8 @@ class Config:
     shadow_threshold: float = 52.0
     skip_frames: int = 2  # skip n frames then use 1
 
-    start_timestamp: float = 80.0
-    end_timestamp: float = 90.0
+    start_timestamp: float = 0
+    end_timestamp: float = 150
 
     debug_plot: bool = False
     setup_mode: bool = False

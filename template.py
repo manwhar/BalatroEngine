@@ -6,7 +6,6 @@ import cv2
 from cv2.typing import MatLike
 from geometry import ImageSize, NormalizedROI, PixelROI
 
-
 @dataclass
 class Template:
     name: str
