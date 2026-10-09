@@ -1,14 +1,15 @@
+import concurrent.futures
 import itertools
 import json
 import logging
 import math
 import os
 import time
-import concurrent.futures
+
 import cv2
 from tqdm import tqdm
 
-from config import Config, get_config, configure_logging
+from config import Config, configure_logging, get_config
 from debug_plotter import plot
 from eval_template import eval, format_timestamp
 from frame import iter_video_frames
@@ -26,13 +27,22 @@ def get_expected_frame_count(config: Config) -> int | None:
     if fps <= 0:
         return None
 
-    start_frame = math.ceil(config.start_timestamp * fps) if config.start_timestamp is not None else 0
-    end_frame = math.ceil(config.end_timestamp * fps) if config.end_timestamp is not None else total_frames
+    start_frame = (
+        math.ceil(config.start_timestamp * fps)
+        if config.start_timestamp is not None
+        else 0
+    )
+    end_frame = (
+        math.ceil(config.end_timestamp * fps)
+        if config.end_timestamp is not None
+        else total_frames
+    )
     end_frame = min(end_frame, total_frames)
 
     frame_span = max(0, end_frame - start_frame)
     step = config.skip_frames + 1
     return math.ceil(frame_span / step)
+
 
 if __name__ == "__main__":
     configure_logging()
@@ -50,24 +60,30 @@ if __name__ == "__main__":
     def process_frame(video_frame) -> tuple[int, list, dict[str, float], int | None]:
         frame_idx = video_frame.index
         ts_str = format_timestamp(video_frame.timestamp_seconds, frame_idx)
-        
+
         logger.info(f"Processing frame {frame_idx}...")
-        
+
         t0 = time.perf_counter()
         img_gray = cv2.cvtColor(video_frame.image, cv2.COLOR_BGR2GRAY)
         t1 = time.perf_counter()
-        
+
         matches = []
         template_clicked = None
         for template in templates:
-            result = eval(template, video_frame.image, img_gray, config, video_timestamp_str=ts_str)
+            result = eval(
+                template,
+                video_frame.image,
+                img_gray,
+                config,
+                video_timestamp_str=ts_str,
+            )
             if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
                 matches.append((template, result.plot_kwargs))
             if result.found and result.clicked:
                 template_clicked = template_key[result.template_name]
                 break  # only one template can be clicked in a given frame
         t2 = time.perf_counter()
-        
+
         metrics = {
             "grayscale_time": t1 - t0,
             "eval_time": t2 - t1,
@@ -85,19 +101,20 @@ if __name__ == "__main__":
     def prefetch_generator(iterable, prefetch=64):
         import queue
         import threading
+
         q = queue.Queue(maxsize=prefetch)
         sentinel = object()
-        
+
         def producer():
             try:
                 for item in iterable:
                     q.put(item)
             finally:
                 q.put(sentinel)
-                
+
         thread = threading.Thread(target=producer, daemon=True)
         thread.start()
-        
+
         while True:
             item = q.get()
             if item is sentinel:
@@ -111,8 +128,9 @@ if __name__ == "__main__":
         start_timestamp_seconds=config.start_timestamp,
         end_timestamp_seconds=config.end_timestamp,
     )
-    
+
     video_extract_times = []
+
     def timed_frames(it):
         while True:
             t0 = time.perf_counter()
@@ -146,28 +164,46 @@ if __name__ == "__main__":
             total_grayscale_time += metrics["grayscale_time"]
             total_eval_time += metrics["eval_time"]
             for template, plot_kwargs in matches:
-                should_plot = config.debug_plot or (config.setup_mode and not template.adjusted)
+                should_plot = config.debug_plot or (
+                    config.setup_mode and not template.adjusted
+                )
                 if should_plot:
                     plot(**plot_kwargs)
                     try:
-                        with open(config.template_json_path, "r", encoding="utf-8") as f:
+                        with open(
+                            config.template_json_path, "r", encoding="utf-8"
+                        ) as f:
                             data = json.load(f)
                         if template.name in data:
-                            template.adjusted = data[template.name].get("adjusted", template.adjusted)
-                            template.shadow_dy = data[template.name].get("shadow_dy", template.shadow_dy)
-                            template.shadow_dw = data[template.name].get("shadow_dw", template.shadow_dw)
-                            template.shadow_dh = data[template.name].get("shadow_dh", template.shadow_dh)
+                            template.adjusted = data[template.name].get(
+                                "adjusted", template.adjusted
+                            )
+                            template.shadow_dy = data[template.name].get(
+                                "shadow_dy", template.shadow_dy
+                            )
+                            template.shadow_dw = data[template.name].get(
+                                "shadow_dw", template.shadow_dw
+                            )
+                            template.shadow_dh = data[template.name].get(
+                                "shadow_dh", template.shadow_dh
+                            )
                     except Exception as e:
-                        logger.error(f"Failed to reload template data for {template.name}: {e}")
+                        logger.error(
+                            f"Failed to reload template data for {template.name}: {e}"
+                        )
             results.append(frame_idx)
     else:
         # Chunked multithreaded processing for CPU maximum speed (avoids OOM on large videos)
         total_frames = get_expected_frame_count(config)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             num_workers = executor._max_workers
-            with tqdm(total=total_frames, desc="Processing video", unit="frame") as pbar:
+            with tqdm(
+                total=total_frames, desc="Processing video", unit="frame"
+            ) as pbar:
                 for chunk in chunked_iterable(frames, 64):
-                    for frame_idx, matches, metrics, template_clicked in executor.map(process_frame, chunk):
+                    for frame_idx, matches, metrics, template_clicked in executor.map(
+                        process_frame, chunk
+                    ):
                         results.append(frame_idx)
                         total_grayscale_time += metrics["grayscale_time"]
                         total_eval_time += metrics["eval_time"]
@@ -197,8 +233,8 @@ if __name__ == "__main__":
             print(f"Template Matching:  {wall_eval:.5f}s ({pct_eval:4.1f}%)")
             print(f"Other (Overhead):   {wall_other:.5f}s ({pct_other:4.1f}%)")
             print("-----------------------------------------------------------")
-        
-        base_name = os.path.splitext(config.input_video_path.rsplit('/', 1)[-1])[0]
+
+        base_name = os.path.splitext(config.input_video_path.rsplit("/", 1)[-1])[0]
         out_path = f"{config.output_dir}/{base_name}_{int(time.time())}.json"
 
         output_payload = {

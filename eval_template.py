@@ -2,11 +2,12 @@
 Evaluates a given template for a given frame.
 """
 
-import logging
 import json
+import logging
 from itertools import product
 
 import cv2
+import cv2.mat_wrapper
 
 from config import Config
 from debug_plotter import plot
@@ -29,13 +30,20 @@ def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
 
 
 def eval(
-    template: Template, img: cv2.mat_wrapper.Mat, img_gray: cv2.mat_wrapper.Mat, config: Config, video_timestamp_str: str = ""
+    template: Template,
+    img: cv2.mat_wrapper.Mat,
+    img_gray: cv2.mat_wrapper.Mat,
+    config: Config,
+    video_timestamp_str: str = "",
 ) -> EvaluationResult:
     if img is None or img_gray is None:
         raise ValueError("Got None for image")
 
     from geometry import ImageSize
-    for (image, image_gray, mask), px_roi in product(zip(template.images, template.images_gray, template.masks), template.px_rois):
+
+    for (image, image_gray, mask), px_roi in product(
+        zip(template.images, template.images_gray, template.masks), template.px_rois
+    ):
         h_inp, w_inp = image.shape[:2]
 
         img_h, img_w = img.shape[:2]
@@ -134,18 +142,26 @@ def eval(
                 "video_timestamp_str": video_timestamp_str,
             }
             if match.found:
-                plot_kwargs["shadow_region"] = shadow_region
+                plot_kwargs["shadow_region"] = shadow_region  # type:ignore
 
             plot(**plot_kwargs)
-            
+
             try:
                 with open(config.template_json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if template.name in data:
-                    template.adjusted = data[template.name].get("adjusted", template.adjusted)
-                    template.shadow_dy = data[template.name].get("shadow_dy", template.shadow_dy)
-                    template.shadow_dw = data[template.name].get("shadow_dw", template.shadow_dw)
-                    template.shadow_dh = data[template.name].get("shadow_dh", template.shadow_dh)
+                    template.adjusted = data[template.name].get(
+                        "adjusted", template.adjusted
+                    )
+                    template.shadow_dy = data[template.name].get(
+                        "shadow_dy", template.shadow_dy
+                    )
+                    template.shadow_dw = data[template.name].get(
+                        "shadow_dw", template.shadow_dw
+                    )
+                    template.shadow_dh = data[template.name].get(
+                        "shadow_dh", template.shadow_dh
+                    )
             except Exception as e:
                 logger.error(f"Failed to reload template data for {template.name}: {e}")
 

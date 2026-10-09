@@ -1,9 +1,8 @@
+import argparse
 import logging
+from dataclasses import dataclass
 
 import cv2
-
-import argparse
-from dataclasses import dataclass
 
 from geometry import ImageSize
 
@@ -26,7 +25,7 @@ class Config:
     skip_frames: int = 2  # skip n frames then use 1
 
     start_timestamp: float = 0
-    end_timestamp: float = 150
+    end_timestamp: float = 1
 
     debug_plot: bool = False
     setup_mode: bool = False
@@ -40,16 +39,36 @@ class Config:
 def get_config() -> Config:
     default_cfg = Config()
     parser = argparse.ArgumentParser(description="Botlatro Video Processing Config")
-    parser.add_argument("--template-json", type=str, default=default_cfg.template_json_path)
-    parser.add_argument("--template-dir", type=str, default=default_cfg.template_img_dir)
+    parser.add_argument(
+        "--template-json", type=str, default=default_cfg.template_json_path
+    )
+    parser.add_argument(
+        "--template-dir", type=str, default=default_cfg.template_img_dir
+    )
     parser.add_argument("--input-img", type=str, default=default_cfg.input_img_path)
     parser.add_argument("--input-video", type=str, default=default_cfg.input_video_path)
-    parser.add_argument("--start-timestamp", type=float, default=default_cfg.start_timestamp)
-    parser.add_argument("--end-timestamp", type=float, default=default_cfg.end_timestamp)
+    parser.add_argument(
+        "--start-timestamp", type=float, default=default_cfg.start_timestamp
+    )
+    parser.add_argument(
+        "--end-timestamp", type=float, default=default_cfg.end_timestamp
+    )
     parser.add_argument("--skip-frames", type=int, default=default_cfg.skip_frames)
-    parser.add_argument("--debug-plot", action=argparse.BooleanOptionalAction, default=default_cfg.debug_plot)
-    parser.add_argument("--setup-mode", action=argparse.BooleanOptionalAction, default=default_cfg.setup_mode)
-    parser.add_argument("--run-benchmark", action=argparse.BooleanOptionalAction, default=default_cfg.run_benchmark)
+    parser.add_argument(
+        "--debug-plot",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.debug_plot,
+    )
+    parser.add_argument(
+        "--setup-mode",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.setup_mode,
+    )
+    parser.add_argument(
+        "--run-benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.run_benchmark,
+    )
 
     args, unknown = parser.parse_known_args()
 

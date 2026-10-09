@@ -1,0 +1,5 @@
+# YOLO & Dataset artifacts
+runs/
+data_split/
+*.pt
+
