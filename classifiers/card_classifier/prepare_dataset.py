@@ -8,10 +8,11 @@ and writes data.yaml pointing to the train and val splits.
 """
 
 import os
-import shutil
 import random
-import yaml
+import shutil
 from pathlib import Path
+
+import yaml
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent.parent
