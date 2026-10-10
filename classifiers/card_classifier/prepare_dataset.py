@@ -16,7 +16,9 @@ import yaml
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent.parent
-DATASET_SRC = PROJECT_ROOT / "dataset" / "card_classifier"
+DATASET_SRC = CURRENT_DIR / "dataset"
+if not DATASET_SRC.exists() and (PROJECT_ROOT / "dataset" / "card_classifier").exists():
+    DATASET_SRC = PROJECT_ROOT / "dataset" / "card_classifier"
 PROCESSED_DATA_DIR = CURRENT_DIR / "data_split"
 DATA_YAML_PATH = CURRENT_DIR / "data.yaml"
 

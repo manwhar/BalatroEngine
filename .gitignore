@@ -5,4 +5,8 @@ __pycache__
 
 output
 
+# Artifacts that belong inside classifiers/ or other submodules
 dataset
+runs
+weights
+*.pt

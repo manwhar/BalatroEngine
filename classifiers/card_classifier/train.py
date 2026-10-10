@@ -9,12 +9,14 @@ Trains YOLO on the prepared dataset with:
 
 import os
 import sys
+import shutil
 import argparse
 from pathlib import Path
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -123,8 +125,9 @@ def overlay_cursor_noise(img_tensor: torch.Tensor, cursor_rgba: np.ndarray, p: f
 
 def attach_batch_augmentations(model: YOLO, compression_prob: float = 0.5, cursor_prob: float = 0.3):
     """
-    Hooks into the Ultralytics training loop via 'on_train_batch_start' callback
-    to apply compression artifacts and synthetic cursor occlusion on training batches.
+    Hooks into the Ultralytics training pipeline via 'on_train_start' callback
+    by wrapping trainer.preprocess_batch to apply video compression noise
+    and synthetic cursor occlusion on training batches on-device.
     """
     cursor_rgba = load_cursor_asset()
     if cursor_rgba is not None:
@@ -132,17 +135,67 @@ def attach_batch_augmentations(model: YOLO, compression_prob: float = 0.5, curso
     else:
         print(f"Notice: Cursor asset not found at {CURSOR_PATH}. Cursor augmentation skipped.")
 
-    def on_train_batch_start(trainer):
-        if hasattr(trainer, "batch") and isinstance(trainer.batch, dict) and "img" in trainer.batch:
-            # 1. Apply compression noise
-            if compression_prob > 0.0:
-                trainer.batch["img"] = apply_video_compression_noise(trainer.batch["img"], p=compression_prob)
-            # 2. Apply cursor occlusion
-            if cursor_prob > 0.0 and cursor_rgba is not None:
-                trainer.batch["img"] = overlay_cursor_noise(trainer.batch["img"], cursor_rgba, p=cursor_prob)
+    def on_train_start(trainer):
+        orig_preprocess = trainer.preprocess_batch
+        batch_counter = 0
 
-    model.add_callback("on_train_batch_start", on_train_batch_start)
-    print(f"Attached batch augmentations: compression_p={compression_prob}, cursor_p={cursor_prob}")
+        def custom_preprocess(batch):
+            nonlocal batch_counter
+            batch = orig_preprocess(batch)
+
+            if batch_counter == 0 and "img" in batch:
+                device_str = str(batch["img"].device)
+                print(f"[Augmentations] Active: custom augmentations applying to batches on device '{device_str}'.")
+
+            batch_counter += 1
+
+            if "img" in batch:
+                # 1. Apply compression noise
+                if compression_prob > 0.0:
+                    batch["img"] = apply_video_compression_noise(batch["img"], p=compression_prob)
+                # 2. Apply cursor occlusion
+                if cursor_prob > 0.0 and cursor_rgba is not None:
+                    batch["img"] = overlay_cursor_noise(batch["img"], cursor_rgba, p=cursor_prob)
+
+            return batch
+
+        trainer.preprocess_batch = custom_preprocess
+        print("[Augmentations] Successfully attached to trainer preprocessing pipeline.")
+
+    model.add_callback("on_train_start", on_train_start)
+    print(f"Configured batch augmentations: compression_p={compression_prob}, cursor_p={cursor_prob}")
+
+
+def organize_run_figures(run_dir: Path):
+    """Moves all generated figures (*.png, *.jpg) into a dedicated figures/ subfolder."""
+    fig_dir = run_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for f in run_dir.glob(ext):
+            dest = fig_dir / f.name
+            shutil.move(str(f), str(dest))
+            count += 1
+    if count > 0:
+        print(f"[Run Output] Organized {count} figures into: {fig_dir}")
+
+
+def resolve_model_weights(model_name: str) -> str:
+    """Resolves model weights path, checking classifiers/card_classifier/weights first."""
+    p = Path(model_name)
+    if p.exists():
+        return str(p)
+    # Check in weights/ folder inside card_classifier
+    cand_weights = CURRENT_DIR / "weights" / model_name
+    if cand_weights.exists():
+        return str(cand_weights)
+    cand_curr = CURRENT_DIR / model_name
+    if cand_curr.exists():
+        return str(cand_curr)
+    # Default to placing downloaded base weights inside classifiers/card_classifier/weights/
+    weights_dir = CURRENT_DIR / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    return str(weights_dir / model_name)
 
 
 def run_train(
@@ -153,6 +206,7 @@ def run_train(
     batch=16,
     project=None,
     name="balatro_cards",
+    exist_ok=False,
     compression_noise_prob=0.5,
     cursor_prob=0.3
 ):
@@ -161,19 +215,51 @@ def run_train(
         from prepare_dataset import prepare_dataset
         prepare_dataset()
 
-    device = 0 if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    print("\n" + "=" * 60)
+    print("Balatro Card Classifier Training Setup")
+    print("=" * 60)
+
+    # CUDA & Device verification
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"[CUDA OK] GPU Device : {gpu_name}")
+        print(f"[CUDA OK] Total VRAM : {vram_gb:.2f} GB")
+        print(f"[CUDA OK] CUDA Ver   : {torch.version.cuda}")
+        device = 0
+    else:
+        print("[WARNING] CUDA is NOT available! Training will run on CPU.")
+        device = "cpu"
 
     if project is None:
         project = (CURRENT_DIR / "runs").as_posix()
 
-    print(f"Loading base model: {model_name}")
-    model = YOLO(model_name)
+    print(f"\nConfiguration:")
+    print(f"  - Dataset config : {data_yaml}")
+    print(f"  - Base model     : {model_name}")
+    print(f"  - Target epochs  : {epochs}")
+    print(f"  - Batch size     : {batch}")
+    print(f"  - Image size     : {imgsz}x{imgsz}")
+    print(f"  - Base run name  : {name} (auto-increments if exists: {not exist_ok})")
+    print(f"  - Output root    : {project}")
+    print(f"  - Device         : {device}")
+    print("=" * 60 + "\n")
+
+    resolved_model = resolve_model_weights(model_name)
+    print(f"Loading base model: {resolved_model}")
+    model = YOLO(resolved_model)
+
+    # Attach smart label-stacking and high-resolution figure plotting patch
+    try:
+        from regenerate_figures import apply_smart_plotting_patch
+        apply_smart_plotting_patch(font_size=11, line_width=1, max_size=2880)
+    except Exception as e:
+        print(f"Notice: Could not load plotting patch ({e}), continuing with default plotting.")
 
     if compression_noise_prob > 0.0 or cursor_prob > 0.0:
         attach_batch_augmentations(model, compression_prob=compression_noise_prob, cursor_prob=cursor_prob)
 
-    print(f"Starting training: {epochs} epochs, imgsz={imgsz}, batch={batch}...")
+    print(f"\nStarting training loop...")
     results = model.train(
         data=str(data_yaml),
         epochs=epochs,
@@ -185,14 +271,18 @@ def run_train(
         workers=2,
         val=True,
         save=True,
-        exist_ok=True,
+        exist_ok=exist_ok,
         verbose=True
     )
 
+    actual_run_dir = Path(results.save_dir) if hasattr(results, "save_dir") else (Path(project) / name)
+    organize_run_figures(actual_run_dir)
+
     print("\nTraining complete!")
-    best_pt = Path(project) / name / "weights" / "best.pt"
+    best_pt = actual_run_dir / "weights" / "best.pt"
     if best_pt.exists():
-        print(f"Best model weights saved to: {best_pt}")
+        print(f"Best model weights saved to : {best_pt}")
+    print(f"Output figures saved to     : {actual_run_dir / 'figures'}")
     return results
 
 
@@ -202,7 +292,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="Base model weights")
-    parser.add_argument("--name", type=str, default="balatro_cards", help="Run name")
+    parser.add_argument("--name", type=str, default="balatro_cards", help="Run name (auto-increments if exists)")
+    parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing run directory if it shares the same name")
     parser.add_argument("--compression-prob", type=float, default=0.5, help="Probability of applying compression noise per frame")
     parser.add_argument("--cursor-prob", type=float, default=0.3, help="Probability of applying cursor overlay per frame")
     args = parser.parse_args()
@@ -213,6 +304,7 @@ if __name__ == "__main__":
         imgsz=args.imgsz,
         batch=args.batch,
         name=args.name,
+        exist_ok=args.exist_ok,
         compression_noise_prob=args.compression_prob,
         cursor_prob=args.cursor_prob
     )

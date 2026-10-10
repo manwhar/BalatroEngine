@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 import torch
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -102,14 +103,46 @@ def _summarize_card_items(items):
 
     return summary
 
-def run_eval(weights_path=BEST_WEIGHTS, test_img_path=None):
-    if not Path(weights_path).exists():
-        print(f"Weights not found at {weights_path}. Train a model first!")
+def get_latest_weights() -> Path | None:
+    runs_dir = CURRENT_DIR / "runs"
+    if not runs_dir.exists():
+        return None
+    candidates = list(runs_dir.glob("*/weights/best.pt"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def run_eval(weights_path=None, test_img_path=None):
+    if weights_path is None:
+        weights_path = get_latest_weights()
+
+    if weights_path is None:
+        print("No trained weights found in runs/! Train a model first with train.py.")
         return
 
-    model = YOLO(str(weights_path))
+    weights_file = Path(weights_path)
+    # If a run folder name was passed, resolve to weights/best.pt
+    if weights_file.is_dir():
+        weights_file = weights_file / "weights" / "best.pt"
+    elif not weights_file.is_absolute() and not weights_file.exists():
+        candidate_run = CURRENT_DIR / "runs" / weights_path / "weights" / "best.pt"
+        candidate_weight = CURRENT_DIR / "weights" / weights_path
+        if candidate_run.exists():
+            weights_file = candidate_run
+        elif candidate_weight.exists():
+            weights_file = candidate_weight
+
+    if not weights_file.exists():
+        print(f"Weights file not found at: {weights_file}")
+        return
+
+    model = YOLO(str(weights_file))
     if test_img_path is None:
         sample_images = list((CURRENT_DIR / "data_split" / "val" / "images").glob("*.png"))
+        if not sample_images:
+            sample_images = list((CURRENT_DIR / "dataset" / "images").glob("*.png"))
         if not sample_images:
             sample_images = list((PROJECT_ROOT / "dataset" / "card_classifier" / "images").glob("*.png"))
         if not sample_images:
@@ -117,7 +150,7 @@ def run_eval(weights_path=BEST_WEIGHTS, test_img_path=None):
             return
         test_img_path = sample_images[0]
 
-    print(f"Testing weights: {weights_path}")
+    print(f"Testing weights: {weights_file}")
     print(f"Testing on image: {test_img_path}")
     results = model(str(test_img_path))
     
@@ -131,8 +164,9 @@ def run_eval(weights_path=BEST_WEIGHTS, test_img_path=None):
         print(f"   Seal:        {card['seal']}")
         print(f"   Selected:    {card['selected']}")
 
+
 if __name__ == "__main__":
-    weights = sys.argv[1] if len(sys.argv) > 1 else BEST_WEIGHTS
+    weights = sys.argv[1] if len(sys.argv) > 1 else None
     test_img = sys.argv[2] if len(sys.argv) > 2 else None
     run_eval(weights, test_img)
 
