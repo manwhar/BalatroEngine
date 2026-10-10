@@ -4,12 +4,7 @@ G.DATASET_MOD = {
     config = {
         roi = {x = 300, y = 200, w = 1320, h = 680}, -- Default screen-space ROI (adjustable)
         boxes = {
-            -- Width/height relative to card, offsets relative to card center (-0.5 to 0.5)
-            identity = {w = 0.25, h = 0.25, ox = -0.35, oy = -0.35}, 
-            edition = {w = 0.15, h = 1.0, ox = -0.425, oy = 0},
-            enhancement = {w = 0.15, h = 1.0, ox = -0.35, oy = 0},
-            seal = {w = 0.2, h = 0.2, ox = 0.35, oy = -0.35},
-            state = {w = 1.0, h = 1.0, ox = 0, oy = 0} 
+            card = {w = 1.0, h = 1.0, ox = 0, oy = 0}
         },
         mode = 'setup' -- 'setup' or 'generation'
     },
@@ -400,64 +395,73 @@ end
 
 function G.DATASET_MOD:save_labels(frame_num)
     frame_num = frame_num or self.frame_count
-    local labels = {}
     local roi = self.config.roi
+    local yolo_labels = {}
+    local json_cards = {}
 
     if G.hand and G.hand.cards then
-        for _, card in ipairs(G.hand.cards) do
+        for idx, card in ipairs(G.hand.cards) do
             local boxes = self.captured_boxes and self.captured_boxes[card]
-            if boxes then
-                local function add_box(box_name, class_name)
-                    local box = boxes[box_name]
-                    if not box then return end
-                    local min_x, min_y, bw, bh = box.aabb[1], box.aabb[2], box.aabb[3], box.aabb[4]
-                    local clamped = {clamp_aabb_to_roi(roi, min_x, min_y, bw, bh)}
-                    if clamped[1] then
-                        local nx, ny, nw, nh = to_yolo(roi, clamped[1], clamped[2], clamped[3], clamped[4])
-                        local class_id = self:get_class_id(class_name)
-                        table.insert(labels, string.format("%d %.6f %.6f %.6f %.6f", class_id, nx, ny, nw, nh))
+            local card_box = boxes and (boxes.card or boxes.state or boxes.identity)
+            
+            if card_box then
+                local min_x, min_y, bw, bh = card_box.aabb[1], card_box.aabb[2], card_box.aabb[3], card_box.aabb[4]
+                local clamped = {clamp_aabb_to_roi(roi, min_x, min_y, bw, bh)}
+                if clamped[1] then
+                    local nx, ny, nw, nh = to_yolo(roi, clamped[1], clamped[2], clamped[3], clamped[4])
+                    
+                    -- Stage 1 YOLO detection label: single class 0 ("card")
+                    table.insert(yolo_labels, string.format("0 %.6f %.6f %.6f %.6f", nx, ny, nw, nh))
+                    
+                    -- Stage 2 Card Attributes
+                    local rank = "None"
+                    local suit = "None"
+                    if card.config.center and card.config.center.name == "Stone Card" then
+                        rank = "Stone"
+                        suit = "None"
+                    elseif card.base then
+                        rank = tostring(card.base.value or "None")
+                        suit = tostring(card.base.suit or "None")
                     end
-                end
-                
-                local identity_name = "Identity_"
-                if card.config.center.name == "Stone Card" then
-                    identity_name = "Stone_Card"
-                else
-                    local rank = tostring(card.base.value or "UnknownRank")
-                    local suit = tostring(card.base.suit or "UnknownSuit")
-                    identity_name = rank .. "_" .. suit
-                end
-                add_box('identity', identity_name)
-                
-                if card.edition then
-                    local ed_name = "Edition_"
-                    if card.edition.foil then ed_name = ed_name .. "Foil"
-                    elseif card.edition.holo then ed_name = ed_name .. "Holo"
-                    elseif card.edition.polychrome then ed_name = ed_name .. "Polychrome"
-                    elseif card.edition.negative then ed_name = ed_name .. "Negative"
+                    
+                    local edition = "None"
+                    if card.edition then
+                        if card.edition.foil then edition = "Foil"
+                        elseif card.edition.holo then edition = "Holo"
+                        elseif card.edition.polychrome then edition = "Polychrome"
+                        elseif card.edition.negative then edition = "Negative"
+                        end
                     end
-                    if ed_name ~= "Edition_" then add_box('edition', ed_name) end
-                end
-                
-                if card.config.center and card.config.center.name ~= "Default Base" and card.config.center.name ~= "Stone Card" then
-                    local enh_name = "Enhancement_" .. string.gsub(card.config.center.name, " ", "")
-                    add_box('enhancement', enh_name)
-                end
-                
-                if card.seal then
-                    local seal_name = "Seal_" .. card.seal
-                    add_box('seal', seal_name)
-                end
-                
-                if card.highlighted then
-                    add_box('state', "Card_Selected")
+                    
+                    local enhancement = "None"
+                    if card.config.center and card.config.center.name ~= "Default Base" and card.config.center.name ~= "Stone Card" then
+                        enhancement = string.gsub(card.config.center.name, " Card", "")
+                        enhancement = string.gsub(enhancement, " ", "")
+                    elseif card.config.center and card.config.center.name == "Stone Card" then
+                        enhancement = "Stone"
+                    end
+                    
+                    local seal = card.seal or "None"
+                    local selected = card.highlighted and true or false
+                    
+                    table.insert(json_cards, string.format(
+                        '  {"card_index": %d, "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s}',
+                        idx, nx, ny, nw, nh, clamped[1] - roi.x, clamped[2] - roi.y, clamped[3], clamped[4],
+                        rank, suit, edition, enhancement, seal, selected and "true" or "false"
+                    ))
                 end
             end
         end
     end
 
+    -- Write Stage 1 YOLO detection label (class 0: card)
     local label_path = "Mods/gamestate_dataset_cv/dataset/labels/frame_" .. string.format("%04d", frame_num) .. ".txt"
-    love.filesystem.write(label_path, table.concat(labels, "\n"))
+    love.filesystem.write(label_path, table.concat(yolo_labels, "\n"))
+
+    -- Write Stage 2 Structured JSON label with card attributes
+    local json_path = "Mods/gamestate_dataset_cv/dataset/labels/frame_" .. string.format("%04d", frame_num) .. ".json"
+    local json_content = "[\n" .. table.concat(json_cards, ",\n") .. "\n]\n"
+    love.filesystem.write(json_path, json_content)
 end
 
 -- Hooks & Updates
@@ -534,11 +538,8 @@ function G.DATASET_MOD:draw_debug()
                     local pts = box.points
                     
                     local is_sel = (self.selected_box == box_name)
-                    if box_name == 'identity' then love.graphics.setColor(1, 0, 0, is_sel and 1 or 0.5)
-                    elseif box_name == 'edition' then love.graphics.setColor(0, 1, 1, is_sel and 1 or 0.5)
-                    elseif box_name == 'enhancement' then love.graphics.setColor(1, 0, 1, is_sel and 1 or 0.5)
-                    elseif box_name == 'seal' then love.graphics.setColor(1, 1, 0, is_sel and 1 or 0.5)
-                    elseif box_name == 'state' then love.graphics.setColor(1, 0.5, 0, is_sel and 1 or 0.5)
+                    if box_name == 'card' then love.graphics.setColor(0, 1, 1, is_sel and 1 or 0.6)
+                    else love.graphics.setColor(1, 1, 0, is_sel and 1 or 0.5)
                     end
                     
                     love.graphics.setLineWidth(is_sel and 4 or 2)
@@ -552,7 +553,7 @@ function G.DATASET_MOD:draw_debug()
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.print("DATASET CALIBRATION MODE", 10, 10)
     love.graphics.print("Currently Editing: " .. self.selected_box, 10, 30)
-    love.graphics.print("1-6: Select Box | W,A,S,D: Move Offset | Arrows: Adjust Size", 10, 50)
+    love.graphics.print("1: ROI | 2: Card Box | W,A,S,D: Move Offset | Arrows: Adjust Size", 10, 50)
     love.graphics.print("TAB: Start Generation | R: Randomize Hand | T: Toggle Selected | C: Capture Test Frame", 10, 70)
     love.graphics.print("[, ]: Save / Load Config", 10, 90)
     
@@ -610,11 +611,7 @@ function G.DATASET_MOD:on_keypressed(key)
             self.capture_flash = 1.0
             self.capture_flash_text = "CONFIG LOADED!"
         elseif key == '1' then self.selected_box = 'roi'
-        elseif key == '2' then self.selected_box = 'identity'
-        elseif key == '3' then self.selected_box = 'edition'
-        elseif key == '4' then self.selected_box = 'enhancement'
-        elseif key == '5' then self.selected_box = 'seal'
-        elseif key == '6' then self.selected_box = 'state'
+        elseif key == '2' then self.selected_box = 'card'
         end
     end
 end

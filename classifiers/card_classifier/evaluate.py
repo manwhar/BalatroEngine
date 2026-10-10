@@ -1,172 +1,84 @@
 """
-Validation and Inference Test Script
-====================================
-Runs the trained YOLO weights on a sample image or validation set,
-groups bounding boxes by x-coordinate, and displays reconstructed cards.
+Evaluate Two-Stage Card Recognition Pipeline
+============================================
+Runs Stage 1 detector + Stage 2 classifier on a sample image or validation set.
+Prints reconstructed cards and compares directly against ground truth JSON.
 """
 
 import sys
+import json
+import argparse
 from pathlib import Path
-from collections import defaultdict
-import torch
-# pyrefly: ignore [missing-import]
-from ultralytics import YOLO
 
 CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent.parent
-BEST_WEIGHTS = CURRENT_DIR / "runs" / "sanity_check" / "weights" / "best.pt"
+DATASET_DIR = CURRENT_DIR / "dataset"
+IMAGES_DIR = DATASET_DIR / "images"
+JSON_LABELS_DIR = DATASET_DIR / "labels_json"
 
-# Categories based on the naming convention in classes.txt
-def categorize_class(class_name: str) -> str:
-    if class_name.startswith("Edition_"):
-        return "edition"
-    elif class_name.startswith("Enhancement_"):
-        return "enhancement"
-    elif class_name.startswith("Seal_"):
-        return "seal"
-    elif class_name == "Card_Selected":
-        return "selected"
-    else:
-        # e.g. Ace_Spades, 5_Hearts, Stone_Card
-        return "identity"
-
-def parse_detections(results, x_threshold=25.0):
-    boxes = results[0].boxes
-    names = results[0].names
-
-    raw_items = []
-    for box in boxes:
-        cls_id = int(box.cls[0])
-        class_name = names[cls_id]
-        conf = float(box.conf[0])
-        # xywh format: x_center, y_center, width, height
-        x_center = float(box.xywh[0][0])
-        y_center = float(box.xywh[0][1])
-
-        raw_items.append({
-            "class": class_name,
-            "category": categorize_class(class_name),
-            "conf": conf,
-            "x": x_center,
-            "y": y_center
-        })
-
-    # Sort left to right
-    raw_items.sort(key=lambda item: item["x"])
-
-    # Group into cards by horizontal clustering
-    cards = []
-    current_card_items = []
-    current_cluster_x = None
-
-    for item in raw_items:
-        if current_cluster_x is None:
-            current_cluster_x = item["x"]
-            current_card_items.append(item)
-        elif abs(item["x"] - current_cluster_x) <= x_threshold:
-            # Update running average or keep base
-            current_card_items.append(item)
-        else:
-            # New card cluster
-            cards.append(_summarize_card_items(current_card_items))
-            current_card_items = [item]
-            current_cluster_x = item["x"]
-
-    if current_card_items:
-        cards.append(_summarize_card_items(current_card_items))
-
-    return cards
-
-def _summarize_card_items(items):
-    summary = {
-        "x": sum(it["x"] for it in items) / len(items),
-        "identity": None,
-        "edition": None,
-        "enhancement": None,
-        "seal": None,
-        "selected": False,
-        "raw_items": items
-    }
-    for it in items:
-        cat = it["category"]
-        if cat == "identity":
-            if summary["identity"] is None or it["conf"] > summary["raw_items"][0].get("conf", 0):
-                summary["identity"] = it["class"]
-        elif cat == "edition":
-            summary["edition"] = it["class"].replace("Edition_", "")
-        elif cat == "enhancement":
-            summary["enhancement"] = it["class"].replace("Enhancement_", "")
-        elif cat == "seal":
-            summary["seal"] = it["class"].replace("Seal_", "")
-        elif cat == "selected":
-            summary["selected"] = True
-
-    return summary
-
-def get_latest_weights() -> Path | None:
-    runs_dir = CURRENT_DIR / "runs"
-    if not runs_dir.exists():
-        return None
-    candidates = list(runs_dir.glob("*/weights/best.pt"))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+from pipeline import CardRecognitionPipeline
 
 
-def run_eval(weights_path=None, test_img_path=None):
-    if weights_path is None:
-        weights_path = get_latest_weights()
+def run_evaluation(image_path=None, detector_weights=None, classifier_weights=None):
+    pipeline = CardRecognitionPipeline(
+        detector_path=detector_weights,
+        classifier_path=classifier_weights
+    )
 
-    if weights_path is None:
-        print("No trained weights found in runs/! Train a model first with train.py.")
-        return
-
-    weights_file = Path(weights_path)
-    # If a run folder name was passed, resolve to weights/best.pt
-    if weights_file.is_dir():
-        weights_file = weights_file / "weights" / "best.pt"
-    elif not weights_file.is_absolute() and not weights_file.exists():
-        candidate_run = CURRENT_DIR / "runs" / weights_path / "weights" / "best.pt"
-        candidate_weight = CURRENT_DIR / "weights" / weights_path
-        if candidate_run.exists():
-            weights_file = candidate_run
-        elif candidate_weight.exists():
-            weights_file = candidate_weight
-
-    if not weights_file.exists():
-        print(f"Weights file not found at: {weights_file}")
-        return
-
-    model = YOLO(str(weights_file))
-    if test_img_path is None:
-        sample_images = list((CURRENT_DIR / "data_split" / "val" / "images").glob("*.png"))
-        if not sample_images:
-            sample_images = list((CURRENT_DIR / "dataset" / "images").glob("*.png"))
-        if not sample_images:
-            sample_images = list((PROJECT_ROOT / "dataset" / "card_classifier" / "images").glob("*.png"))
-        if not sample_images:
-            print("No test images found!")
+    if image_path is None:
+        val_imgs = sorted(list(IMAGES_DIR.glob("*.png")))
+        if not val_imgs:
+            print("No images found in dataset/images/!")
             return
-        test_img_path = sample_images[0]
+        image_path = val_imgs[0]
 
-    print(f"Testing weights: {weights_file}")
-    print(f"Testing on image: {test_img_path}")
-    results = model(str(test_img_path))
-    
-    parsed_cards = parse_detections(results)
-    print(f"\n--- Parsed Hand ({len(parsed_cards)} cards detected left-to-right) ---")
-    for idx, card in enumerate(parsed_cards, 1):
-        print(f"Card {idx:2d} (x={card['x']:.1f}):")
-        print(f"   Identity:    {card['identity']}")
-        print(f"   Edition:     {card['edition']}")
-        print(f"   Enhancement: {card['enhancement']}")
-        print(f"   Seal:        {card['seal']}")
-        print(f"   Selected:    {card['selected']}")
+    image_path = Path(image_path)
+    print(f"\nEvaluating on image: {image_path.name}")
+
+    # Run Two-Stage Pipeline
+    results = pipeline.predict(image_path)
+
+    # Check for ground-truth JSON
+    gt_file = JSON_LABELS_DIR / f"{image_path.stem}.json"
+    gt_cards = []
+    if gt_file.exists():
+        with open(gt_file, "r", encoding="utf-8") as f:
+            gt_cards = json.load(f)
+
+    print("\n" + "=" * 70)
+    print(f"RECONSTRUCTED HAND ({len(results)} cards detected left-to-right)")
+    print("=" * 70)
+
+    for i, c in enumerate(results):
+        gt = gt_cards[i] if i < len(gt_cards) else None
+        
+        # Check match with ground truth
+        match_str = ""
+        if gt:
+            rank_match = (c.rank == gt.get("rank"))
+            suit_match = (c.suit == gt.get("suit"))
+            ed_match = (c.edition == gt.get("edition"))
+            enh_match = (c.enhancement == gt.get("enhancement"))
+            seal_match = (c.seal == gt.get("seal"))
+            all_match = rank_match and suit_match and ed_match and enh_match and seal_match
+            match_str = " [ALL CORRECT]" if all_match else " [MISMATCH]"
+
+        print(f"Card {c.index:2d}: {c.display_name}{match_str}")
+        print(f"   Rank       : {c.rank:<8} (conf: {c.confidences['rank']:.2f})")
+        print(f"   Suit       : {c.suit:<8} (conf: {c.confidences['suit']:.2f})")
+        print(f"   Edition    : {c.edition:<8} (conf: {c.confidences['edition']:.2f})")
+        print(f"   Enhancement: {c.enhancement:<8} (conf: {c.confidences['enhancement']:.2f})")
+        print(f"   Seal       : {c.seal:<8} (conf: {c.confidences['seal']:.2f})")
+        print(f"   Selected   : {c.selected}")
+        if gt and not all_match:
+            print(f"   --> Ground Truth: {gt.get('rank')} of {gt.get('suit')} | Ed: {gt.get('edition')} | Enh: {gt.get('enhancement')} | Seal: {gt.get('seal')}")
+        print("-" * 50)
 
 
 if __name__ == "__main__":
-    weights = sys.argv[1] if len(sys.argv) > 1 else None
-    test_img = sys.argv[2] if len(sys.argv) > 2 else None
-    run_eval(weights, test_img)
+    parser = argparse.ArgumentParser(description="Evaluate Two-Stage Card Recognition Pipeline")
+    parser.add_argument("--image", type=str, default=None, help="Path to input image")
+    parser.add_argument("--detector", type=str, default=None, help="Path to detector weights")
+    parser.add_argument("--classifier", type=str, default=None, help="Path to classifier weights")
+    args = parser.parse_args()
 
+    run_evaluation(args.image, args.detector, args.classifier)
