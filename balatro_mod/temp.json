@@ -1,0 +1,9 @@
+{
+  "id": "temp",
+  "name": "temp",
+  "author": ["Dukky"],
+  "description": "temp",
+  "prefix": "gdcv",
+  "main_file": "main.lua",
+  "version": "1.0.0"
+}
