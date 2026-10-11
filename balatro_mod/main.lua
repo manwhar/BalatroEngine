@@ -381,6 +381,26 @@ function G.DATASET_MOD:generate_random_hand()
         end
     end
     
+    -- Randomly debuff cards in 10% of hands (between 1 card and all of them)
+    if math.random() < 0.10 and #G.hand.cards > 0 then
+        local num_debuffed = math.random(1, #G.hand.cards)
+        local indices = {}
+        for idx = 1, #G.hand.cards do indices[idx] = idx end
+        -- Shuffle indices
+        for idx = #indices, 2, -1 do
+            local j = math.random(idx)
+            indices[idx], indices[j] = indices[j], indices[idx]
+        end
+        for i = 1, num_debuffed do
+            local c = G.hand.cards[indices[i]]
+            if c.set_debuff then
+                c:set_debuff(true)
+            else
+                c.debuff = true
+            end
+        end
+    end
+
     -- Randomly select
     local num_selected = math.random(0, math.min(5, num_cards))
     for i=1, num_selected do
@@ -561,6 +581,7 @@ function G.DATASET_MOD:save_labels(frame_num)
                     
                     local seal = card.seal or "None"
                     local selected = card.highlighted and true or false
+                    local debuffed = (card.debuff == true)
                     
                     local card_skin = "None"
                     local is_suit_hc = false
@@ -570,9 +591,9 @@ function G.DATASET_MOD:save_labels(frame_num)
                     end
                     
                     table.insert(json_cards, string.format(
-                        '  {"card_index": %d, "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "skin": "%s", "high_contrast": %s}',
+                        '  {"card_index": %d, "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "debuffed": %s, "skin": "%s", "high_contrast": %s}',
                         idx, nx, ny, nw, nh, clamped[1] - roi.x, clamped[2] - roi.y, clamped[3], clamped[4],
-                        rank, suit, edition, enhancement, seal, selected and "true" or "false",
+                        rank, suit, edition, enhancement, seal, selected and "true" or "false", debuffed and "true" or "false",
                         tostring(card_skin), is_suit_hc and "true" or "false"
                     ))
                 end

@@ -35,12 +35,15 @@ class CardResult:
     enhancement: str
     seal: str
     selected: bool
+    debuffed: bool
     box: list[int]  # [x1, y1, x2, y2]
     confidences: dict[str, float]
 
     @property
     def display_name(self) -> str:
         parts = []
+        if self.debuffed:
+            parts.append("[DEBUFFED]")
         if self.edition != "None":
             parts.append(self.edition)
         if self.enhancement != "None":
@@ -130,15 +133,23 @@ class CardRecognitionPipeline:
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
 
-    def predict(self, image_input, conf=0.60) -> list[CardResult]:
+        # Warm up GPU contexts & CUDA kernels
+        if self.device.type == "cuda":
+            dummy = Image.new("RGB", (CROP_WIDTH * 2, CROP_HEIGHT), (0, 0, 0))
+            _ = self.predict(dummy, conf=0.50)
+
+    def predict(self, image_input, conf=0.60, return_timing: bool = False):
         """
         Runs two-stage detection and classification.
         Args:
             image_input: PIL.Image, numpy ndarray, or file path.
             conf: Confidence threshold for Stage 1 card detector.
+            return_timing: If True, returns (list[CardResult], timing_dict).
         Returns:
-            list[CardResult] sorted left to right by x position.
+            list[CardResult] sorted left to right by x position (or (results, timing_dict)).
         """
+        import time
+
         if isinstance(image_input, (str, Path)):
             pil_img = Image.open(image_input).convert("RGB")
         elif isinstance(image_input, np.ndarray):
@@ -146,12 +157,30 @@ class CardRecognitionPipeline:
         else:
             pil_img = image_input.convert("RGB")
 
-        # 1. Stage 1: Card Detection
+        use_cuda = (self.device.type == "cuda")
+
+        # 1. Stage 1: Card Detection (YOLO)
+        if use_cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         det_results = self.detector(pil_img, conf=conf, verbose=False)
+
+        if use_cuda:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        stage1_ms = (t1 - t0) * 1000.0
+
         boxes_data = det_results[0].boxes
 
         if len(boxes_data) == 0:
-            return []
+            timings = {
+                "stage1_detector_ms": stage1_ms,
+                "stage2_classifier_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "total_inference_ms": stage1_ms
+            }
+            return ([], timings) if return_timing else []
 
         # Sort detected card bounding boxes left-to-right
         xyxy_boxes = boxes_data.xyxy.cpu().numpy()
@@ -176,9 +205,18 @@ class CardRecognitionPipeline:
 
         batched_crops = torch.stack(crop_tensors, dim=0).to(self.device)
 
-        # 3. Stage 2: Batched Attribute Classification
+        # 3. Stage 2: Batched Attribute Classification (CNN)
+        if use_cuda:
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
         with torch.no_grad():
             preds = self.classifier.predict_attributes(batched_crops)
+
+        if use_cuda:
+            torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        stage2_ms = (t3 - t2) * 1000.0
 
         # 4. Geometrically determine card selection (raised upward)
         selected_flags = determine_card_selection(valid_boxes, ih)
@@ -192,6 +230,7 @@ class CardRecognitionPipeline:
             enhancement = IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][i].item(), "None")
             seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
             selected = selected_flags[i]
+            debuffed = bool(preds["debuffed"][i].item()) if "debuffed" in preds else False
 
             confs = {
                 "rank": float(preds["rank_conf"][i].item()),
@@ -200,6 +239,7 @@ class CardRecognitionPipeline:
                 "enhancement": float(preds["enhancement_conf"][i].item()),
                 "seal": float(preds["seal_conf"][i].item()),
                 "selected": 1.0,
+                "debuffed": float(preds["debuffed_conf"][i].item()) if "debuffed_conf" in preds else 1.0,
             }
 
             results.append(CardResult(
@@ -210,8 +250,21 @@ class CardRecognitionPipeline:
                 enhancement=enhancement,
                 seal=seal,
                 selected=selected,
+                debuffed=debuffed,
                 box=valid_boxes[i],
                 confidences=confs
             ))
 
+        t4 = time.perf_counter()
+        total_ms = (t4 - t0) * 1000.0
+
+        timings = {
+            "stage1_detector_ms": stage1_ms,
+            "stage2_classifier_ms": stage2_ms,
+            "total_inference_ms": total_ms,
+            "cards_detected": len(valid_boxes)
+        }
+
+        if return_timing:
+            return results, timings
         return results

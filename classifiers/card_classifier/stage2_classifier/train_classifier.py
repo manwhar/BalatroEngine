@@ -129,6 +129,7 @@ def run_train_classifier(
 
     # Loss criteria
     criterion_ce = nn.CrossEntropyLoss()
+    criterion_bce = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -152,8 +153,9 @@ def run_train_classifier(
             l_edition = criterion_ce(logits["edition"], targets["edition"])
             l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
             l_seal = criterion_ce(logits["seal"], targets["seal"])
+            l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
 
-            loss = l_rank + l_suit + l_edition + l_enh + l_seal
+            loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(images)
@@ -164,7 +166,7 @@ def run_train_classifier(
         # 2. Validation Phase
         model.eval()
         val_loss = 0.0
-        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0}
+        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0, "debuffed": 0}
         exact_matches = 0
         total_val = len(val_dataset)
 
@@ -189,8 +191,9 @@ def run_train_classifier(
                 l_edition = criterion_ce(logits["edition"], targets["edition"])
                 l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
                 l_seal = criterion_ce(logits["seal"], targets["seal"])
+                l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
 
-                loss = l_rank + l_suit + l_edition + l_enh + l_seal
+                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb
                 val_loss += loss.item() * len(images)
 
                 p_rank = logits["rank"].argmax(dim=-1)
@@ -198,6 +201,7 @@ def run_train_classifier(
                 p_ed = logits["edition"].argmax(dim=-1)
                 p_enh = logits["enhancement"].argmax(dim=-1)
                 p_seal = logits["seal"].argmax(dim=-1)
+                p_deb = (torch.sigmoid(logits["debuffed"]) > 0.5).float()
 
                 # Correctness masks
                 m_rank = (p_rank == targets["rank"])
@@ -205,15 +209,17 @@ def run_train_classifier(
                 m_ed = (p_ed == targets["edition"])
                 m_enh = (p_enh == targets["enhancement"])
                 m_seal = (p_seal == targets["seal"])
+                m_deb = (p_deb == targets["debuffed"])
 
                 correct_counts["rank"] += m_rank.sum().item()
                 correct_counts["suit"] += m_suit.sum().item()
                 correct_counts["edition"] += m_ed.sum().item()
                 correct_counts["enhancement"] += m_enh.sum().item()
                 correct_counts["seal"] += m_seal.sum().item()
+                correct_counts["debuffed"] += m_deb.sum().item()
 
-                # Exact Card Match (all 5 core attributes simultaneously correct)
-                exact = m_rank & m_suit & m_ed & m_enh & m_seal
+                # Exact Card Match (all core attributes + debuffed simultaneously correct)
+                exact = m_rank & m_suit & m_ed & m_enh & m_seal & m_deb
                 exact_matches += exact.sum().item()
 
                 # Accumulate confusion matrices
@@ -241,7 +247,8 @@ def run_train_classifier(
             "suit_acc": accs["suit"],
             "edition_acc": accs["edition"],
             "enhancement_acc": accs["enhancement"],
-            "seal_acc": accs["seal"]
+            "seal_acc": accs["seal"],
+            "debuffed_acc": accs["debuffed"]
         }
         history.append(epoch_stats)
 
@@ -250,7 +257,7 @@ def run_train_classifier(
             f"Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f} | "
             f"Exact Match: {exact_match_acc * 100:.1f}% | "
             f"Rank: {accs['rank'] * 100:.1f}% | Suit: {accs['suit'] * 100:.1f}% | "
-            f"Ed: {accs['edition'] * 100:.1f}% | Enh: {accs['enhancement'] * 100:.1f}% | Seal: {accs['seal'] * 100:.1f}%"
+            f"Ed: {accs['edition'] * 100:.1f}% | Enh: {accs['enhancement'] * 100:.1f}% | Seal: {accs['seal'] * 100:.1f}% | Deb: {accs['debuffed'] * 100:.1f}%"
         )
 
         # Save last checkpoint

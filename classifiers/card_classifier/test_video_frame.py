@@ -26,9 +26,15 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# Ensure project root & card classifier directory are in path
-ROOT_DIR = Path(__file__).resolve().parent
-CLASSIFIER_DIR = ROOT_DIR / "classifiers" / "card_classifier"
+# Resolve project root and card classifier directory
+SCRIPT_DIR = Path(__file__).resolve().parent
+if (SCRIPT_DIR / "pipeline.py").exists():
+    CLASSIFIER_DIR = SCRIPT_DIR
+    ROOT_DIR = SCRIPT_DIR.parent.parent
+else:
+    ROOT_DIR = SCRIPT_DIR
+    CLASSIFIER_DIR = ROOT_DIR / "classifiers" / "card_classifier"
+
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 if str(CLASSIFIER_DIR) not in sys.path:
@@ -229,15 +235,19 @@ def run_test(
         classifier_path=classifier_weights
     )
 
-    # 2. Extract or load image
+    # 2. Extract or load image (resolve relative to CWD or ROOT_DIR)
     full_frame = None
     if video_path:
+        if not video_path.exists() and (ROOT_DIR / video_path).exists():
+            video_path = ROOT_DIR / video_path
         ts_sec = parse_timestamp(timestamp_str)
         print(f"Video File        : {video_path}")
         print(f"Requested Time    : {format_seconds(ts_sec)} ({ts_sec:.2f}s)")
         full_frame, actual_sec, frame_idx = extract_video_frame(video_path, ts_sec)
         print(f"Actual Extracted  : {format_seconds(actual_sec)} (Frame #{frame_idx})")
     elif image_path:
+        if not image_path.exists() and (ROOT_DIR / image_path).exists():
+            image_path = ROOT_DIR / image_path
         print(f"Image File        : {image_path}")
         full_frame = cv2.imread(str(image_path))
         if full_frame is None:
@@ -259,9 +269,15 @@ def run_test(
         hand_crop_bgr = full_frame[ry : ry + rh, rx : rx + rw].copy()
         print(f"Hand ROI Crop     : x={rx}, y={ry}, w={rw}, h={rh} (from mod boxes.lua)")
 
-    # 4. Run Pipeline Prediction
+    # 4. Run Pipeline Prediction with Precise GPU Timing
     crop_rgb = cv2.cvtColor(hand_crop_bgr, cv2.COLOR_BGR2RGB)
-    results = pipeline.predict(crop_rgb, conf=conf_thresh)
+
+    # Warm-up passes to eliminate PyTorch / CuDNN cold-start JIT overhead
+    for _ in range(3):
+        _ = pipeline.predict(crop_rgb, conf=conf_thresh)
+
+    # Steady-state benchmarked run
+    results, timings = pipeline.predict(crop_rgb, conf=conf_thresh, return_timing=True)
 
     # 5. Print Detailed Output
     print("\n" + "=" * 70)
@@ -279,8 +295,24 @@ def run_test(
             print(f"   Edition    : {c.edition:<10} (conf: {c.confidences['edition']:.3f})")
             print(f"   Enhancement: {c.enhancement:<10} (conf: {c.confidences['enhancement']:.3f})")
             print(f"   Seal       : {c.seal:<10} (conf: {c.confidences['seal']:.3f})")
+            print(f"   Debuffed   : {str(c.debuffed):<10} (conf: {c.confidences.get('debuffed', 1.0):.3f})")
             print(f"   Box [x,y]  : [{c.box[0]}, {c.box[1]}, {c.box[2]}, {c.box[3]}] | Selected: {c.selected}")
             print("-" * 55)
+
+    # GPU Inference Timing Benchmark
+    s1_ms = timings["stage1_detector_ms"]
+    s2_ms = timings["stage2_classifier_ms"]
+    tot_ms = timings["total_inference_ms"]
+    fps_equiv = (1000.0 / tot_ms) if tot_ms > 0 else 0.0
+
+    print("\n" + "=" * 70)
+    print("GPU INFERENCE BENCHMARK (Pure Model Forward Time)")
+    print("=" * 70)
+    print(f"Stage 1: YOLO Detector           : {s1_ms:6.2f} ms")
+    print(f"Stage 2: Multi-Head Classifier   : {s2_ms:6.2f} ms  ({len(results)} cards batched)")
+    print(f"----------------------------------------------------------------------")
+    print(f"Total Model GPU Inference        : {tot_ms:6.2f} ms  (~{fps_equiv:,.0f} hands/sec)")
+    print("=" * 70)
 
     # 6. Save Annotated Debug Image
     if output_path is None:

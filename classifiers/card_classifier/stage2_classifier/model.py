@@ -69,6 +69,7 @@ class MultiHeadCardClassifier(nn.Module):
         self.head_edition = nn.Linear(feat_dim, HEAD_CONFIG["edition"])
         self.head_enhancement = nn.Linear(feat_dim, HEAD_CONFIG["enhancement"])
         self.head_seal = nn.Linear(feat_dim, HEAD_CONFIG["seal"])
+        self.head_debuffed = nn.Linear(feat_dim, HEAD_CONFIG["debuffed"])
 
     def forward(self, x):
         """
@@ -89,6 +90,7 @@ class MultiHeadCardClassifier(nn.Module):
             "edition": self.head_edition(shared),
             "enhancement": self.head_enhancement(shared),
             "seal": self.head_seal(shared),
+            "debuffed": self.head_debuffed(shared).squeeze(-1),
         }
 
     def predict_attributes(self, x):
@@ -104,6 +106,7 @@ class MultiHeadCardClassifier(nn.Module):
             p_edition = torch.softmax(logits["edition"], dim=-1)
             p_enhancement = torch.softmax(logits["enhancement"], dim=-1)
             p_seal = torch.softmax(logits["seal"], dim=-1)
+            p_debuffed = torch.sigmoid(logits["debuffed"])
 
             return {
                 "rank_idx": p_rank.argmax(dim=-1),
@@ -116,4 +119,6 @@ class MultiHeadCardClassifier(nn.Module):
                 "enhancement_conf": p_enhancement.max(dim=-1).values,
                 "seal_idx": p_seal.argmax(dim=-1),
                 "seal_conf": p_seal.max(dim=-1).values,
+                "debuffed": p_debuffed > 0.5,
+                "debuffed_conf": p_debuffed,
             }
