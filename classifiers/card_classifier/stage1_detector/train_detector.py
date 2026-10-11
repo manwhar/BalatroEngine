@@ -37,10 +37,9 @@ def run_train_detector(
     compression_prob=0.5,
     cursor_prob=0.3
 ):
-    if not DATA_YAML.exists():
-        print(f"data.yaml not found at {DATA_YAML}. Preparing dataset first...")
-        from prepare_detector_data import prepare_detector_data
-        prepare_detector_data()
+    print("Preparing Stage 1 dataset split from latest dataset/labels_card...")
+    from prepare_detector_data import prepare_detector_data
+    prepare_detector_data()
 
     print("\n" + "=" * 60)
     print("Stage 1: YOLO Card Localization Training")

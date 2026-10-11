@@ -132,7 +132,9 @@ def convert_dataset(img_w=1102, img_h=330):
                 "edition": card_edition,
                 "enhancement": card_enhancement,
                 "seal": card_seal,
-                "selected": is_selected
+                "selected": is_selected,
+                "skin": "default",
+                "high_contrast": False
             })
 
             # Stage 1 YOLO label (class 0: card)

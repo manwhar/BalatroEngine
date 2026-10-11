@@ -120,16 +120,18 @@ def generate_validation_grid(
     selected_jsons = json_files[::step][:max_frames]
 
     cols, rows = grid_size
+    # Hand screenshots are 1102x330 (approx 3.34:1 aspect ratio)
     cell_w = target_res // cols
-    cell_h = target_res // rows
+    cell_h = int(cell_w * (330 / 1102))
+    total_mosaic_h = cell_h * rows
 
-    mosaic = Image.new("RGB", (target_res, target_res), (30, 30, 30))
+    mosaic = Image.new("RGB", (target_res, total_mosaic_h), (30, 30, 30))
     draw_mosaic = ImageDraw.Draw(mosaic)
 
     total_cards = 0
     correct_cards = 0
 
-    print(f"\nGenerating {target_res}px Validation Mosaic ({len(selected_jsons)} frames)...")
+    print(f"\nGenerating {target_res}x{total_mosaic_h}px Validation Mosaic ({len(selected_jsons)} frames)...")
 
     for i, jf in enumerate(selected_jsons):
         r = i // cols

@@ -2,14 +2,13 @@
 Multi-Head Card Attribute Classifier Model
 ==========================================
 Architecture:
-- Shared feature extraction backbone (MobileNetV3-Small / ResNet18)
-- 6 task-specific linear heads:
+- Shared feature extraction backbone (MobileNetV3-Small / MobileNetV3-Large / ResNet18)
+- 5 task-specific linear heads:
   1. Rank (14 classes: 2..A + Stone) -> Softmax
   2. Suit (5 classes: Hearts, Diamonds, Clubs, Spades, None) -> Softmax
   3. Edition (4 classes: None, Foil, Holo, Polychrome) -> Softmax
   4. Enhancement (9 classes: None, Bonus, Mult, Wild, Glass, Steel, Gold, Lucky, Stone) -> Softmax
   5. Seal (5 classes: None, Gold, Red, Blue, Purple) -> Softmax
-  6. Selected (1 binary logit) -> Sigmoid
 """
 
 import torch
@@ -38,6 +37,17 @@ class MultiHeadCardClassifier(nn.Module):
                 nn.Dropout(p=dropout, inplace=True)
             )
             feat_dim = 1024
+        elif backbone_name == "mobilenet_v3_large":
+            weights = models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+            base = models.mobilenet_v3_large(weights=weights)
+            self.features = base.features
+            self.avgpool = base.avgpool
+            self.fc_shared = nn.Sequential(
+                base.classifier[0],  # Linear(960, 1280)
+                base.classifier[1],  # Hardswish()
+                nn.Dropout(p=dropout, inplace=True)
+            )
+            feat_dim = 1280
         elif backbone_name == "resnet18":
             weights = models.ResNet18_Weights.DEFAULT if pretrained else None
             base = models.resnet18(weights=weights)
@@ -59,7 +69,6 @@ class MultiHeadCardClassifier(nn.Module):
         self.head_edition = nn.Linear(feat_dim, HEAD_CONFIG["edition"])
         self.head_enhancement = nn.Linear(feat_dim, HEAD_CONFIG["enhancement"])
         self.head_seal = nn.Linear(feat_dim, HEAD_CONFIG["seal"])
-        self.head_selected = nn.Linear(feat_dim, HEAD_CONFIG["selected"])
 
     def forward(self, x):
         """
@@ -80,7 +89,6 @@ class MultiHeadCardClassifier(nn.Module):
             "edition": self.head_edition(shared),
             "enhancement": self.head_enhancement(shared),
             "seal": self.head_seal(shared),
-            "selected": self.head_selected(shared).squeeze(-1)
         }
 
     def predict_attributes(self, x):
@@ -96,7 +104,6 @@ class MultiHeadCardClassifier(nn.Module):
             p_edition = torch.softmax(logits["edition"], dim=-1)
             p_enhancement = torch.softmax(logits["enhancement"], dim=-1)
             p_seal = torch.softmax(logits["seal"], dim=-1)
-            p_selected = torch.sigmoid(logits["selected"])
 
             return {
                 "rank_idx": p_rank.argmax(dim=-1),
@@ -109,6 +116,4 @@ class MultiHeadCardClassifier(nn.Module):
                 "enhancement_conf": p_enhancement.max(dim=-1).values,
                 "seal_idx": p_seal.argmax(dim=-1),
                 "seal_conf": p_seal.max(dim=-1).values,
-                "selected": p_selected > 0.5,
-                "selected_conf": p_selected
             }

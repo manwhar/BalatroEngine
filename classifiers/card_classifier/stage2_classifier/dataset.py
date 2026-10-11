@@ -127,7 +127,6 @@ class CardCropDataset(Dataset):
             "edition": torch.tensor(EDITION_TO_IDX.get(item["edition"], 0), dtype=torch.long),
             "enhancement": torch.tensor(ENHANCEMENT_TO_IDX.get(item["enhancement"], 0), dtype=torch.long),
             "seal": torch.tensor(SEAL_TO_IDX.get(item["seal"], 0), dtype=torch.long),
-            "selected": torch.tensor(1.0 if item["selected"] else 0.0, dtype=torch.float32)
         }
 
         return tensor_img, targets

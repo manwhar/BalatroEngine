@@ -29,6 +29,7 @@ sys.path.append(str(CURRENT_DIR / "stage2_classifier"))
 from stage1_detector.train_detector import run_train_detector
 from stage2_classifier.train_classifier import run_train_classifier
 from convert_legacy_dataset import convert_dataset
+from sync_dataset import sync_dataset
 
 
 def resolve_model_weights(model_name: str) -> str:
@@ -64,9 +65,14 @@ def main():
     parser.add_argument("--epochs-classifier", type=int, default=25, help="Epochs for Stage 2 classifier")
     parser.add_argument("--batch-detector", type=int, default=16, help="Batch size for Stage 1")
     parser.add_argument("--batch-classifier", type=int, default=64, help="Batch size for Stage 2")
-    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", help="Classifier backbone")
+    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Classifier backbone")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")
+    parser.add_argument("--sync", action="store_true", help="Sync latest generated images and labels from balatro_mod/dataset first")
+    parser.add_argument("--clean-sync", action="store_true", help="Clean dataset directory before syncing from balatro_mod/dataset")
     args = parser.parse_args()
+
+    if args.sync or args.clean_sync:
+        sync_dataset(clean=args.clean_sync)
 
     ensure_dataset_ready()
 

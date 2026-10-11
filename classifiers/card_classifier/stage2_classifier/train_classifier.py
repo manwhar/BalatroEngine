@@ -1,13 +1,12 @@
 """
 Train Stage 2 Multi-Head Card Attribute Classifier
 ===================================================
-Trains multi-task CNN (MobileNetV3-Small / ResNet18) to predict:
+Trains multi-task CNN (MobileNetV3-Small / MobileNetV3-Large / ResNet18) to predict:
 - Rank (14 classes)
 - Suit (5 classes)
 - Edition (4 classes)
 - Enhancement (9 classes)
 - Seal (5 classes)
-- Selected (binary)
 Guarantees mutual exclusivity per attribute via Softmax heads.
 Saves checkpoints and copies best weights to weights/classifier_best.pt.
 """
@@ -130,7 +129,6 @@ def run_train_classifier(
 
     # Loss criteria
     criterion_ce = nn.CrossEntropyLoss()
-    criterion_bce = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -154,9 +152,8 @@ def run_train_classifier(
             l_edition = criterion_ce(logits["edition"], targets["edition"])
             l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
             l_seal = criterion_ce(logits["seal"], targets["seal"])
-            l_sel = criterion_bce(logits["selected"], targets["selected"])
 
-            loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_sel
+            loss = l_rank + l_suit + l_edition + l_enh + l_seal
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(images)
@@ -167,7 +164,7 @@ def run_train_classifier(
         # 2. Validation Phase
         model.eval()
         val_loss = 0.0
-        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0, "selected": 0}
+        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0}
         exact_matches = 0
         total_val = len(val_dataset)
 
@@ -192,9 +189,8 @@ def run_train_classifier(
                 l_edition = criterion_ce(logits["edition"], targets["edition"])
                 l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
                 l_seal = criterion_ce(logits["seal"], targets["seal"])
-                l_sel = criterion_bce(logits["selected"], targets["selected"])
 
-                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_sel
+                loss = l_rank + l_suit + l_edition + l_enh + l_seal
                 val_loss += loss.item() * len(images)
 
                 p_rank = logits["rank"].argmax(dim=-1)
@@ -202,7 +198,6 @@ def run_train_classifier(
                 p_ed = logits["edition"].argmax(dim=-1)
                 p_enh = logits["enhancement"].argmax(dim=-1)
                 p_seal = logits["seal"].argmax(dim=-1)
-                p_sel = (torch.sigmoid(logits["selected"]) > 0.5).float()
 
                 # Correctness masks
                 m_rank = (p_rank == targets["rank"])
@@ -210,14 +205,12 @@ def run_train_classifier(
                 m_ed = (p_ed == targets["edition"])
                 m_enh = (p_enh == targets["enhancement"])
                 m_seal = (p_seal == targets["seal"])
-                m_sel = (p_sel == targets["selected"])
 
                 correct_counts["rank"] += m_rank.sum().item()
                 correct_counts["suit"] += m_suit.sum().item()
                 correct_counts["edition"] += m_ed.sum().item()
                 correct_counts["enhancement"] += m_enh.sum().item()
                 correct_counts["seal"] += m_seal.sum().item()
-                correct_counts["selected"] += m_sel.sum().item()
 
                 # Exact Card Match (all 5 core attributes simultaneously correct)
                 exact = m_rank & m_suit & m_ed & m_enh & m_seal
@@ -248,8 +241,7 @@ def run_train_classifier(
             "suit_acc": accs["suit"],
             "edition_acc": accs["edition"],
             "enhancement_acc": accs["enhancement"],
-            "seal_acc": accs["seal"],
-            "selected_acc": accs["selected"]
+            "seal_acc": accs["seal"]
         }
         history.append(epoch_stats)
 
@@ -320,7 +312,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "resnet18"], help="Backbone model")
+    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Backbone model")
     parser.add_argument("--name", type=str, default="card_classifier", help="Run directory name")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing run")
     args = parser.parse_args()

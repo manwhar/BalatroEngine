@@ -41,5 +41,4 @@ HEAD_CONFIG = {
     "edition": len(EDITIONS),         # 4
     "enhancement": len(ENHANCEMENTS), # 9
     "seal": len(SEALS),               # 5
-    "selected": 1                     # 1 binary logit
 }

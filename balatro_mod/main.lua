@@ -6,7 +6,8 @@ G.DATASET_MOD = {
         boxes = {
             card = {w = 1.0, h = 1.0, ox = 0, oy = 0}
         },
-        mode = 'setup' -- 'setup' or 'generation'
+        mode = 'setup', -- 'setup' or 'generation'
+        max_frames = 5000 -- threshold index to automatically stop generation
     },
     is_generating = false,
     frame_count = 0,
@@ -39,6 +40,7 @@ G.DATASET_MOD.mod_path = get_mod_path()
 function G.DATASET_MOD:save_config()
     local content = "return {\n"
     content = content .. string.format("  roi = {x=%f, y=%f, w=%f, h=%f},\n", self.config.roi.x, self.config.roi.y, self.config.roi.w, self.config.roi.h)
+    content = content .. string.format("  max_frames = %d,\n", self.config.max_frames or 5000)
     content = content .. "  boxes = {\n"
     for k,v in pairs(self.config.boxes) do
         content = content .. string.format("    %s = {w=%f, h=%f, ox=%f, oy=%f},\n", k, v.w, v.h, v.ox, v.oy)
@@ -59,6 +61,9 @@ function G.DATASET_MOD:load_config()
             if t and t.roi and t.boxes then
                 self.config.roi = t.roi
                 self.config.boxes = t.boxes
+                if t.max_frames then
+                    self.config.max_frames = tonumber(t.max_frames) or 5000
+                end
                 print("DATASET: Config loaded!")
             end
         end
@@ -211,8 +216,121 @@ function G.DATASET_MOD:randomize_background()
     end
 end
 
+-- Deck Appearance Randomization (High-Contrast & Crossover Arts)
+function G.DATASET_MOD:get_all_suits()
+    local suits = {}
+    local seen = {}
+    
+    -- 1. Query SMODS suits if registered
+    if SMODS and SMODS.Suit and SMODS.Suit.obj_buffer then
+        for _, s in ipairs(SMODS.Suit.obj_buffer) do
+            if not seen[s] then
+                seen[s] = true
+                table.insert(suits, s)
+            end
+        end
+    end
+    
+    -- 2. Query suits registered in G.COLLABS.options
+    if G.COLLABS and G.COLLABS.options then
+        for s, _ in pairs(G.COLLABS.options) do
+            if not seen[s] then
+                seen[s] = true
+                table.insert(suits, s)
+            end
+        end
+    end
+    
+    -- 3. Fallback standard suits
+    local standard = {'Spades', 'Hearts', 'Clubs', 'Diamonds'}
+    for _, s in ipairs(standard) do
+        if not seen[s] then
+            seen[s] = true
+            table.insert(suits, s)
+        end
+    end
+    
+    return suits
+end
+
+local function is_default_skin(key, suit)
+    if not key or type(key) ~= "string" then return true end
+    if key == "default" or key == ("default_" .. suit) then return true end
+    if string.sub(key, 1, 8) == "default_" then return true end
+    return false
+end
+
+function G.DATASET_MOD:get_available_crossover_arts(suit)
+    local crossover_arts = {}
+    local seen = {}
+    
+    -- 1. Query G.COLLABS.options[suit] dynamically (captures vanilla and any mod-added collabs)
+    if G.COLLABS and G.COLLABS.options and G.COLLABS.options[suit] then
+        for _, skin_key in ipairs(G.COLLABS.options[suit]) do
+            if not is_default_skin(skin_key, suit) and not seen[skin_key] then
+                seen[skin_key] = true
+                table.insert(crossover_arts, skin_key)
+            end
+        end
+    end
+    
+    -- 2. Query SMODS.DeckSkins / SMODS.DeckSkin.obj_table directly (captures mod-registered DeckSkin objects)
+    local deck_skins = (SMODS and SMODS.DeckSkins) or (SMODS and SMODS.DeckSkin and SMODS.DeckSkin.obj_table)
+    if deck_skins then
+        for key, skin_obj in pairs(deck_skins) do
+            if skin_obj and skin_obj.suit == suit then
+                local k = skin_obj.key or key
+                if not is_default_skin(k, suit) and not seen[k] then
+                    seen[k] = true
+                    table.insert(crossover_arts, k)
+                end
+            end
+        end
+    end
+    
+    return crossover_arts
+end
+
+function G.DATASET_MOD:randomize_deck_appearance()
+    G.SETTINGS = G.SETTINGS or {}
+    G.SETTINGS.CUSTOM_DECK = G.SETTINGS.CUSTOM_DECK or {}
+    G.SETTINGS.CUSTOM_DECK.Collabs = G.SETTINGS.CUSTOM_DECK.Collabs or {}
+    G.SETTINGS.colour_palettes = G.SETTINGS.colour_palettes or {}
+    
+    local suits = self:get_all_suits()
+    for _, suit in ipairs(suits) do
+        -- 1. Randomly toggle high contrast colors on/off for each suit
+        local is_hc = (math.random() > 0.5)
+        G.SETTINGS.colour_palettes[suit] = is_hc and 'hc' or 'lc'
+        
+        -- 2. Dynamically discover and pick between available custom face card arts (crossover arts)
+        local crossover_arts = self:get_available_crossover_arts(suit)
+        local chosen_skin = nil
+        if #crossover_arts > 0 then
+            chosen_skin = crossover_arts[math.random(#crossover_arts)]
+        else
+            chosen_skin = (G.COLLABS and G.COLLABS.options and G.COLLABS.options[suit] and G.COLLABS.options[suit][1]) or ('default_' .. suit) or 'default'
+        end
+        G.SETTINGS.CUSTOM_DECK.Collabs[suit] = chosen_skin
+        
+        -- 3. Update suit color palette (both SMODS hook and direct G.C.SUITS fallback)
+        if G.FUNCS and G.FUNCS.update_suit_colours then
+            G.FUNCS.update_suit_colours(suit, chosen_skin)
+        end
+        if G.C and G.C.SUITS then
+            local proto = is_hc and (G.C.SO_2 or G.C.SUITS_HC) or (G.C.SO_1 or G.C.SUITS_LC)
+            if proto and proto[suit] then
+                G.C.SUITS[suit] = proto[suit]
+            end
+        end
+    end
+end
+
 function G.DATASET_MOD:generate_random_hand()
     if not G.hand then return end
+    
+    -- Randomly toggle high contrast colors and pick available crossover face card arts for each suit
+    self:randomize_deck_appearance()
     
     -- Reset captured boxes to release all old Card references
     self.captured_boxes = setmetatable({}, {__mode = "k"})
@@ -444,10 +562,18 @@ function G.DATASET_MOD:save_labels(frame_num)
                     local seal = card.seal or "None"
                     local selected = card.highlighted and true or false
                     
+                    local card_skin = "None"
+                    local is_suit_hc = false
+                    if suit ~= "None" then
+                        card_skin = (G.SETTINGS.CUSTOM_DECK and G.SETTINGS.CUSTOM_DECK.Collabs and G.SETTINGS.CUSTOM_DECK.Collabs[suit]) or "default"
+                        is_suit_hc = (G.SETTINGS.colour_palettes and G.SETTINGS.colour_palettes[suit] == "hc") or false
+                    end
+                    
                     table.insert(json_cards, string.format(
-                        '  {"card_index": %d, "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s}',
+                        '  {"card_index": %d, "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "skin": "%s", "high_contrast": %s}',
                         idx, nx, ny, nw, nh, clamped[1] - roi.x, clamped[2] - roi.y, clamped[3], clamped[4],
-                        rank, suit, edition, enhancement, seal, selected and "true" or "false"
+                        rank, suit, edition, enhancement, seal, selected and "true" or "false",
+                        tostring(card_skin), is_suit_hc and "true" or "false"
                     ))
                 end
             end
@@ -497,13 +623,19 @@ function G.DATASET_MOD:update(dt)
             end
         end
     elseif self.config.mode == 'generation' then
+        local max_frames = self.config.max_frames or 5000
+        if self.frame_count >= max_frames then
+            self.config.mode = 'setup'
+            self.state = 'idle'
+            self.capture_flash = 3.0
+            self.capture_flash_text = string.format("REACHED TARGET CAP (%d FRAMES)! GENERATION STOPPED.", max_frames)
+            print(string.format("DATASET: Reached threshold cap of %d frames. Stopped generation.", max_frames))
+            return
+        end
+
         if self.state == 'idle' then
             self:generate_random_hand()
             self:randomize_background()
-            
-            if G.SETTINGS and G.SETTINGS.profile_events then
-                G.SETTINGS.profile_events.high_contrast = (math.random() > 0.5)
-            end
             
             self.state = 'waiting'
             self.timer = 0.25 -- Wait for animations/lerp to settle
@@ -573,9 +705,6 @@ function G.DATASET_MOD:on_keypressed(key)
             print("DATASET: Generation Mode Started")
         else
             self.config.mode = 'setup'
-            if G.SETTINGS and G.SETTINGS.profile_events then
-                G.SETTINGS.profile_events.high_contrast = false
-            end
             print("DATASET: Setup Mode Started")
         end
     elseif self.config.mode == 'setup' then
@@ -749,7 +878,7 @@ function love.draw()
         love.graphics.print("1-6: Select Box | W,A,S,D: Move Offset | Arrows: Adjust Size", 10, 50)
         love.graphics.print("TAB: Start Generation | R: Randomize Hand | T: Toggle Selected | C: Capture Test Frame", 10, 70)
         love.graphics.print(",: Save Config | .: Load Config", 10, 90)
-        love.graphics.print(string.format("Next Frame: %04d | Lua Memory: %.1f MB", G.DATASET_MOD.frame_count, collectgarbage("count") / 1024), 10, 110)
+        love.graphics.print(string.format("Next Frame: %04d / %d | Lua Memory: %.1f MB", G.DATASET_MOD.frame_count, G.DATASET_MOD.config.max_frames or 5000, collectgarbage("count") / 1024), 10, 110)
         
         if G.DATASET_MOD.capture_flash and G.DATASET_MOD.capture_flash > 0 then
             love.graphics.setColor(0, 1, 0, G.DATASET_MOD.capture_flash)

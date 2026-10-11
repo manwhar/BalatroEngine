@@ -56,8 +56,38 @@ class CardResult:
         return " ".join(parts)
 
 
+def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bool]:
+    """
+    Geometrically determines which cards are selected (raised upward) based on
+    bounding box vertical positions.
+    
+    In Balatro, unselected cards sit at y_center ~0.58 (or y1 ~67px in a 322px frame),
+    while selected cards are elevated upward by ~46px (y_center ~0.38, y1 ~21px).
+    """
+    if not boxes:
+        return []
+
+    y1s = [b[1] for b in boxes]
+    y_min, y_max = min(y1s), max(y1s)
+
+    # Scale reference threshold by image height (322px standard hand crop)
+    scale = (img_height / 322.0) if img_height > 0 else 1.0
+    spread_threshold = 28.0 * scale
+    abs_threshold = 45.0 * scale
+
+    if (y_max - y_min) > spread_threshold:
+        # A mix of selected and unselected cards is present in the hand.
+        # Natural arc variance across unselected hand is <= 22px; selected cards are raised >= 36px.
+        midpoint = (y_min + y_max) / 2.0
+        return [y < midpoint for y in y1s]
+    else:
+        # All cards are at approximately the same elevation level.
+        # Fallback to absolute elevation threshold.
+        return [y < abs_threshold for y in y1s]
+
+
 class CardRecognitionPipeline:
-    def __init__(self, detector_path=None, classifier_path=None, device=None):
+    def __init__(self, detector_path=None, classifier_path=None, backbone="mobilenet_v3_small", device=None):
         if device is None:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
@@ -86,10 +116,12 @@ class CardRecognitionPipeline:
 
         self.detector = YOLO(str(detector_path))
         
-        self.classifier = MultiHeadCardClassifier(backbone_name="mobilenet_v3_small", pretrained=False).to(self.device)
+        self.classifier = MultiHeadCardClassifier(backbone_name=backbone, pretrained=False).to(self.device)
         ckpt = torch.load(str(classifier_path), map_location=self.device)
         state_dict = ckpt["model"] if "model" in ckpt else ckpt
-        self.classifier.load_state_dict(state_dict)
+        # Filter out head_selected in case loading an older checkpoint prior to retraining
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("head_selected")}
+        self.classifier.load_state_dict(filtered_state_dict, strict=False)
         self.classifier.eval()
 
         self.crop_transform = T.Compose([
@@ -98,7 +130,7 @@ class CardRecognitionPipeline:
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
 
-    def predict(self, image_input, conf=0.25) -> list[CardResult]:
+    def predict(self, image_input, conf=0.60) -> list[CardResult]:
         """
         Runs two-stage detection and classification.
         Args:
@@ -148,7 +180,10 @@ class CardRecognitionPipeline:
         with torch.no_grad():
             preds = self.classifier.predict_attributes(batched_crops)
 
-        # 4. Assemble CardResult objects
+        # 4. Geometrically determine card selection (raised upward)
+        selected_flags = determine_card_selection(valid_boxes, ih)
+
+        # 5. Assemble CardResult objects
         results = []
         for i in range(len(valid_boxes)):
             rank = IDX_TO_RANK.get(preds["rank_idx"][i].item(), "Unknown")
@@ -156,7 +191,7 @@ class CardRecognitionPipeline:
             edition = IDX_TO_EDITION.get(preds["edition_idx"][i].item(), "None")
             enhancement = IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][i].item(), "None")
             seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
-            selected = bool(preds["selected"][i].item())
+            selected = selected_flags[i]
 
             confs = {
                 "rank": float(preds["rank_conf"][i].item()),
@@ -164,7 +199,7 @@ class CardRecognitionPipeline:
                 "edition": float(preds["edition_conf"][i].item()),
                 "enhancement": float(preds["enhancement_conf"][i].item()),
                 "seal": float(preds["seal_conf"][i].item()),
-                "selected": float(preds["selected_conf"][i].item()),
+                "selected": 1.0,
             }
 
             results.append(CardResult(
