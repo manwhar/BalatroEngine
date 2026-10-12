@@ -158,11 +158,18 @@ def draw_annotated_results(
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
 
         # Label badge
-        title = f"{c.index}. {c.rank} of {c.suit}"
-        if c.rank == "Stone":
+        if c.face_down:
+            title = f"{c.index}. Face Down"
+        elif c.rank == "Stone":
             title = f"{c.index}. Stone Card"
+        else:
+            title = f"{c.index}. {c.rank} of {c.suit}"
 
         extras = []
+        if c.face_down:
+            extras.append("[FACE DOWN]")
+        elif c.debuffed:
+            extras.append("[DEBUFFED]")
         if c.edition != "None": extras.append(c.edition)
         if c.enhancement != "None": extras.append(c.enhancement)
         if c.seal != "None": extras.append(f"{c.seal} Seal")
@@ -296,6 +303,7 @@ def run_test(
             print(f"   Enhancement: {c.enhancement:<10} (conf: {c.confidences['enhancement']:.3f})")
             print(f"   Seal       : {c.seal:<10} (conf: {c.confidences['seal']:.3f})")
             print(f"   Debuffed   : {str(c.debuffed):<10} (conf: {c.confidences.get('debuffed', 1.0):.3f})")
+            print(f"   Face Down  : {str(c.face_down):<10} (conf: {c.confidences.get('face_down', 1.0):.3f})")
             print(f"   Box [x,y]  : [{c.box[0]}, {c.box[1]}, {c.box[2]}, {c.box[3]}] | Selected: {c.selected}")
             print("-" * 55)
 

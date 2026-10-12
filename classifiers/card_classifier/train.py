@@ -61,10 +61,11 @@ def ensure_dataset_ready():
 def main():
     parser = argparse.ArgumentParser(description="Master Training Script for Two-Stage Card Classifier")
     parser.add_argument("--stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Which stage to train")
-    parser.add_argument("--epochs-detector", type=int, default=30, help="Epochs for Stage 1 detector")
-    parser.add_argument("--epochs-classifier", type=int, default=25, help="Epochs for Stage 2 classifier")
+    parser.add_argument("--epochs-detector", type=int, default=15, help="Epochs for Stage 1 detector (default: 15)")
+    parser.add_argument("--epochs-classifier", type=int, default=25, help="Epochs for Stage 2 classifier (default: 25)")
     parser.add_argument("--batch-detector", type=int, default=16, help="Batch size for Stage 1")
-    parser.add_argument("--batch-classifier", type=int, default=64, help="Batch size for Stage 2")
+    parser.add_argument("--batch-classifier", type=int, default=128, help="Batch size for Stage 2 (default: 128)")
+    parser.add_argument("--workers", type=int, default=4, help="DataLoader CPU worker processes for Stage 2 (default: 4)")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Classifier backbone")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")
     parser.add_argument("--sync", action="store_true", help="Sync latest generated images and labels from balatro_mod/dataset first")
@@ -94,7 +95,8 @@ def main():
             epochs=args.epochs_classifier,
             batch_size=args.batch_classifier,
             backbone=args.backbone,
-            exist_ok=args.exist_ok
+            exist_ok=args.exist_ok,
+            num_workers=args.workers
         )
 
     print("\n" + "=" * 60)

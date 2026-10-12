@@ -4,12 +4,12 @@ Stage 2 Multi-Head Card Classifier Configuration
 Defines classes, indices, input dimensions, and loss weights for all card attributes.
 """
 
-# 1. Card Ranks (14 classes: 13 standard ranks + Stone)
-RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace", "Stone"]
+# 1. Card Ranks (15 classes: 13 standard ranks + Stone + None for face-down)
+RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace", "Stone", "None"]
 RANK_TO_IDX = {r: i for i, r in enumerate(RANKS)}
 IDX_TO_RANK = {i: r for i, r in enumerate(RANKS)}
 
-# 2. Card Suits (5 classes: 4 suits + None for Stone)
+# 2. Card Suits (5 classes: 4 suits + None for Stone/face-down)
 SUITS = ["Hearts", "Diamonds", "Clubs", "Spades", "None"]
 SUIT_TO_IDX = {s: i for i, s in enumerate(SUITS)}
 IDX_TO_SUIT = {i: s for i, s in enumerate(SUITS)}
@@ -36,10 +36,11 @@ CROP_HEIGHT = 192
 
 # Head configuration for MultiHeadCardClassifier
 HEAD_CONFIG = {
-    "rank": len(RANKS),               # 14
+    "rank": len(RANKS),               # 15
     "suit": len(SUITS),               # 5
     "edition": len(EDITIONS),         # 4
     "enhancement": len(ENHANCEMENTS), # 9
     "seal": len(SEALS),               # 5
     "debuffed": 1,                    # 1 binary logit (BCE)
+    "face_down": 1,                   # 1 binary logit (BCE)
 }

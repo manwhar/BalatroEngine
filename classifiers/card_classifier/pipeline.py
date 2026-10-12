@@ -36,24 +36,28 @@ class CardResult:
     seal: str
     selected: bool
     debuffed: bool
+    face_down: bool
     box: list[int]  # [x1, y1, x2, y2]
     confidences: dict[str, float]
 
     @property
     def display_name(self) -> str:
         parts = []
-        if self.debuffed:
-            parts.append("[DEBUFFED]")
-        if self.edition != "None":
-            parts.append(self.edition)
-        if self.enhancement != "None":
-            parts.append(self.enhancement)
-        if self.rank == "Stone":
-            parts.append("Stone Card")
+        if self.face_down:
+            parts.append("[FACE DOWN]")
         else:
-            parts.append(f"{self.rank} of {self.suit}")
-        if self.seal != "None":
-            parts.append(f"({self.seal} Seal)")
+            if self.debuffed:
+                parts.append("[DEBUFFED]")
+            if self.edition != "None":
+                parts.append(self.edition)
+            if self.enhancement != "None":
+                parts.append(self.enhancement)
+            if self.rank == "Stone":
+                parts.append("Stone Card")
+            else:
+                parts.append(f"{self.rank} of {self.suit}")
+            if self.seal != "None":
+                parts.append(f"({self.seal} Seal)")
         if self.selected:
             parts.append("[Selected]")
         return " ".join(parts)
@@ -231,6 +235,7 @@ class CardRecognitionPipeline:
             seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
             selected = selected_flags[i]
             debuffed = bool(preds["debuffed"][i].item()) if "debuffed" in preds else False
+            face_down = bool(preds["face_down"][i].item()) if "face_down" in preds else False
 
             confs = {
                 "rank": float(preds["rank_conf"][i].item()),
@@ -240,6 +245,7 @@ class CardRecognitionPipeline:
                 "seal": float(preds["seal_conf"][i].item()),
                 "selected": 1.0,
                 "debuffed": float(preds["debuffed_conf"][i].item()) if "debuffed_conf" in preds else 1.0,
+                "face_down": float(preds["face_down_conf"][i].item()) if "face_down_conf" in preds else 1.0,
             }
 
             results.append(CardResult(
@@ -251,6 +257,7 @@ class CardRecognitionPipeline:
                 seal=seal,
                 selected=selected,
                 debuffed=debuffed,
+                face_down=face_down,
                 box=valid_boxes[i],
                 confidences=confs
             ))

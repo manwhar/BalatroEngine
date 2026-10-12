@@ -86,12 +86,12 @@ def plot_attribute_confusion_matrix(cm, class_names, title, save_path):
 
 def run_train_classifier(
     epochs=25,
-    batch_size=64,
+    batch_size=128,
     lr=1e-3,
     backbone="mobilenet_v3_small",
     run_name="card_classifier",
     exist_ok=False,
-    num_workers=0
+    num_workers=4
 ):
     print("\n" + "=" * 60)
     print("Stage 2: Multi-Head Card Attribute Classifier Training")
@@ -154,8 +154,9 @@ def run_train_classifier(
             l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
             l_seal = criterion_ce(logits["seal"], targets["seal"])
             l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
+            l_fd = criterion_bce(logits["face_down"], targets["face_down"])
 
-            loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb
+            loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(images)
@@ -166,7 +167,7 @@ def run_train_classifier(
         # 2. Validation Phase
         model.eval()
         val_loss = 0.0
-        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0, "debuffed": 0}
+        correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0, "debuffed": 0, "face_down": 0}
         exact_matches = 0
         total_val = len(val_dataset)
 
@@ -192,8 +193,9 @@ def run_train_classifier(
                 l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
                 l_seal = criterion_ce(logits["seal"], targets["seal"])
                 l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
+                l_fd = criterion_bce(logits["face_down"], targets["face_down"])
 
-                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb
+                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
                 val_loss += loss.item() * len(images)
 
                 p_rank = logits["rank"].argmax(dim=-1)
@@ -202,6 +204,7 @@ def run_train_classifier(
                 p_enh = logits["enhancement"].argmax(dim=-1)
                 p_seal = logits["seal"].argmax(dim=-1)
                 p_deb = (torch.sigmoid(logits["debuffed"]) > 0.5).float()
+                p_fd = (torch.sigmoid(logits["face_down"]) > 0.5).float()
 
                 # Correctness masks
                 m_rank = (p_rank == targets["rank"])
@@ -210,6 +213,7 @@ def run_train_classifier(
                 m_enh = (p_enh == targets["enhancement"])
                 m_seal = (p_seal == targets["seal"])
                 m_deb = (p_deb == targets["debuffed"])
+                m_fd = (p_fd == targets["face_down"])
 
                 correct_counts["rank"] += m_rank.sum().item()
                 correct_counts["suit"] += m_suit.sum().item()
@@ -217,9 +221,10 @@ def run_train_classifier(
                 correct_counts["enhancement"] += m_enh.sum().item()
                 correct_counts["seal"] += m_seal.sum().item()
                 correct_counts["debuffed"] += m_deb.sum().item()
+                correct_counts["face_down"] += m_fd.sum().item()
 
-                # Exact Card Match (all core attributes + debuffed simultaneously correct)
-                exact = m_rank & m_suit & m_ed & m_enh & m_seal & m_deb
+                # Exact Card Match (all core attributes + debuffed + face-down simultaneously correct)
+                exact = m_rank & m_suit & m_ed & m_enh & m_seal & m_deb & m_fd
                 exact_matches += exact.sum().item()
 
                 # Accumulate confusion matrices
@@ -248,7 +253,8 @@ def run_train_classifier(
             "edition_acc": accs["edition"],
             "enhancement_acc": accs["enhancement"],
             "seal_acc": accs["seal"],
-            "debuffed_acc": accs["debuffed"]
+            "debuffed_acc": accs["debuffed"],
+            "face_down_acc": accs["face_down"]
         }
         history.append(epoch_stats)
 
@@ -257,7 +263,8 @@ def run_train_classifier(
             f"Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f} | "
             f"Exact Match: {exact_match_acc * 100:.1f}% | "
             f"Rank: {accs['rank'] * 100:.1f}% | Suit: {accs['suit'] * 100:.1f}% | "
-            f"Ed: {accs['edition'] * 100:.1f}% | Enh: {accs['enhancement'] * 100:.1f}% | Seal: {accs['seal'] * 100:.1f}% | Deb: {accs['debuffed'] * 100:.1f}%"
+            f"Ed: {accs['edition'] * 100:.1f}% | Enh: {accs['enhancement'] * 100:.1f}% | "
+            f"Seal: {accs['seal'] * 100:.1f}% | Deb: {accs['debuffed'] * 100:.1f}% | FD: {accs['face_down'] * 100:.1f}%"
         )
 
         # Save last checkpoint

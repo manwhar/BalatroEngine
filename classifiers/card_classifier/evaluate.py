@@ -44,7 +44,9 @@ def evaluate_single_image(pipeline, image_path):
             ed_match = (c.edition == gt.get("edition"))
             enh_match = (c.enhancement == gt.get("enhancement"))
             seal_match = (c.seal == gt.get("seal"))
-            all_match = rank_match and suit_match and ed_match and enh_match and seal_match
+            deb_match = (c.debuffed == gt.get("debuffed", False))
+            fd_match = (c.face_down == gt.get("face_down", False))
+            all_match = rank_match and suit_match and ed_match and enh_match and seal_match and deb_match and fd_match
             match_str = " [ALL CORRECT]" if all_match else " [MISMATCH]"
 
         print(f"Card {c.index:2d}: {c.display_name}{match_str}")
@@ -53,9 +55,11 @@ def evaluate_single_image(pipeline, image_path):
         print(f"   Edition    : {c.edition:<8} (conf: {c.confidences['edition']:.2f})")
         print(f"   Enhancement: {c.enhancement:<8} (conf: {c.confidences['enhancement']:.2f})")
         print(f"   Seal       : {c.seal:<8} (conf: {c.confidences['seal']:.2f})")
+        print(f"   Debuffed   : {str(c.debuffed):<8} (conf: {c.confidences.get('debuffed', 1.0):.2f})")
+        print(f"   Face Down  : {str(c.face_down):<8} (conf: {c.confidences.get('face_down', 1.0):.2f})")
         print(f"   Selected   : {c.selected}")
         if gt and not all_match:
-            print(f"   --> Ground Truth: {gt.get('rank')} of {gt.get('suit')} | Ed: {gt.get('edition')} | Enh: {gt.get('enhancement')} | Seal: {gt.get('seal')}")
+            print(f"   --> Ground Truth: {gt.get('rank')} of {gt.get('suit')} | Ed: {gt.get('edition')} | Enh: {gt.get('enhancement')} | Seal: {gt.get('seal')} | Deb: {gt.get('debuffed', False)} | FD: {gt.get('face_down', False)}")
         print("-" * 50)
 
 
@@ -111,6 +115,8 @@ def evaluate_benchmark(pipeline, num_frames=None, split="val", conf=0.60, seed=4
         "edition": 0,
         "enhancement": 0,
         "seal": 0,
+        "debuffed": 0,
+        "face_down": 0,
         "selected": 0,
         "exact_card": 0
     }
@@ -150,14 +156,18 @@ def evaluate_benchmark(pipeline, num_frames=None, split="val", conf=0.60, seed=4
             e_m = (c.edition == g.get("edition"))
             en_m = (c.enhancement == g.get("enhancement"))
             se_m = (c.seal == g.get("seal"))
+            deb_m = (c.debuffed == g.get("debuffed", False))
+            fd_m = (c.face_down == g.get("face_down", False))
             sel_m = (c.selected == g.get("selected"))
-            all_m = r_m and s_m and e_m and en_m and se_m
+            all_m = r_m and s_m and e_m and en_m and se_m and deb_m and fd_m
 
             if r_m: attr_correct["rank"] += 1
             if s_m: attr_correct["suit"] += 1
             if e_m: attr_correct["edition"] += 1
             if en_m: attr_correct["enhancement"] += 1
             if se_m: attr_correct["seal"] += 1
+            if deb_m: attr_correct["debuffed"] += 1
+            if fd_m: attr_correct["face_down"] += 1
             if sel_m: attr_correct["selected"] += 1
             if all_m: attr_correct["exact_card"] += 1
 
@@ -166,8 +176,8 @@ def evaluate_benchmark(pipeline, num_frames=None, split="val", conf=0.60, seed=4
                 mismatches.append({
                     "frame": jf.stem,
                     "card_idx": i + 1,
-                    "pred": f"{c.rank} of {c.suit} | Ed:{c.edition} | Enh:{c.enhancement} | Seal:{c.seal}",
-                    "gt": f"{g.get('rank')} of {g.get('suit')} | Ed:{g.get('edition')} | Enh:{g.get('enhancement')} | Seal:{g.get('seal')}"
+                    "pred": f"{c.rank} of {c.suit} | Ed:{c.edition} | Enh:{c.enhancement} | Seal:{c.seal} | Deb:{c.debuffed} | FD:{c.face_down}",
+                    "gt": f"{g.get('rank')} of {g.get('suit')} | Ed:{g.get('edition')} | Enh:{g.get('enhancement')} | Seal:{g.get('seal')} | Deb:{g.get('debuffed', False)} | FD:{g.get('face_down', False)}"
                 })
 
         if frame_perfect and n_pairs == n_gt:
@@ -187,12 +197,14 @@ def evaluate_benchmark(pipeline, num_frames=None, split="val", conf=0.60, seed=4
     print("-" * 70)
 
     if evaluated_pairs > 0:
-        print(f"Exact Card Accuracy (All 5): {attr_correct['exact_card']}/{evaluated_pairs} ({attr_correct['exact_card'] / evaluated_pairs * 100:.2f}%)")
+        print(f"Exact Card Accuracy (All 7): {attr_correct['exact_card']}/{evaluated_pairs} ({attr_correct['exact_card'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Rank Accuracy           : {attr_correct['rank']}/{evaluated_pairs} ({attr_correct['rank'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Suit Accuracy           : {attr_correct['suit']}/{evaluated_pairs} ({attr_correct['suit'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Edition Accuracy        : {attr_correct['edition']}/{evaluated_pairs} ({attr_correct['edition'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Enhancement Accuracy    : {attr_correct['enhancement']}/{evaluated_pairs} ({attr_correct['enhancement'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Seal Accuracy           : {attr_correct['seal']}/{evaluated_pairs} ({attr_correct['seal'] / evaluated_pairs * 100:.2f}%)")
+        print(f"   Debuffed Accuracy       : {attr_correct['debuffed']}/{evaluated_pairs} ({attr_correct['debuffed'] / evaluated_pairs * 100:.2f}%)")
+        print(f"   Face Down Accuracy      : {attr_correct['face_down']}/{evaluated_pairs} ({attr_correct['face_down'] / evaluated_pairs * 100:.2f}%)")
         print(f"   Selected (Raised) Acc   : {attr_correct['selected']}/{evaluated_pairs} ({attr_correct['selected'] / evaluated_pairs * 100:.2f}%)")
 
     if mismatches:

@@ -92,7 +92,8 @@ class CardCropDataset(Dataset):
                         "enhancement": card.get("enhancement", "None"),
                         "seal": card.get("seal", "None"),
                         "selected": card.get("selected", False),
-                        "debuffed": card.get("debuffed", False)
+                        "debuffed": card.get("debuffed", False),
+                        "face_down": card.get("face_down", False)
                     })
             except Exception as e:
                 continue
@@ -123,12 +124,13 @@ class CardCropDataset(Dataset):
         tensor_img = self.transform(crop)
 
         targets = {
-            "rank": torch.tensor(RANK_TO_IDX.get(item["rank"], 0), dtype=torch.long),
+            "rank": torch.tensor(RANK_TO_IDX.get(item["rank"], RANK_TO_IDX.get("None", 0)), dtype=torch.long),
             "suit": torch.tensor(SUIT_TO_IDX.get(item["suit"], 4), dtype=torch.long),
             "edition": torch.tensor(EDITION_TO_IDX.get(item["edition"], 0), dtype=torch.long),
             "enhancement": torch.tensor(ENHANCEMENT_TO_IDX.get(item["enhancement"], 0), dtype=torch.long),
             "seal": torch.tensor(SEAL_TO_IDX.get(item["seal"], 0), dtype=torch.long),
             "debuffed": torch.tensor(1.0 if item["debuffed"] else 0.0, dtype=torch.float32),
+            "face_down": torch.tensor(1.0 if item["face_down"] else 0.0, dtype=torch.float32),
         }
 
         return tensor_img, targets
