@@ -4,7 +4,7 @@ Computer vision pipeline and gamestate recognition system for **Balatro**, desig
 
 ---
 
-## Architecture Overview
+## Overview
 
 1. **Synthetic Dataset Generation Mod (`balatro_mod/`)**: An in-engine Balatro mod (Steamodded / SMODS) that generates perfectly annotated screenshot datasets with pixel-accurate bounding boxes and card metadata.
 2. **Card Classifier Pipeline (`classifiers/card_classifier/`)**: A two-stage detection and classification pipeline that detects playing cards in the hand and predicts rank, suit, edition, enhancement, seal, debuff, face-down status, and collab deck skins.
@@ -13,7 +13,7 @@ Computer vision pipeline and gamestate recognition system for **Balatro**, desig
 
 ---
 
-## Primary Components & Features
+## Main Stuff
 
 ### 1. In-Game Dataset Generator Mod (`balatro_mod/`)
 A modular Steamodded mod installed into Balatro to capture synchronized, perfectly labeled CV datasets.
@@ -30,8 +30,8 @@ A modular Steamodded mod installed into Balatro to capture synchronized, perfect
 
 ---
 
-### 2. Balatro University Mod (BUMod) Art Compatibility
-High-level video data frequently features custom card art from the popular [OceanRamen/BUMod](https://github.com/OceanRamen/BUMod).
+### 2. BUMod Art Integration
+Balatro University's gameplay features custom card art from the [OceanRamen/BUMod](https://github.com/OceanRamen/BUMod).
 
 - **Historical Texture Integration**: Textures across 2+ years of BUMod commit revisions (e.g. Showman, Scholar, Space Joker, Vampire, Rocket) are extracted into `balatro_mod/assets/bu_variants/`.
 - **Dynamic In-Engine Swapping**: During dataset generation, the mod uniformly rolls between vanilla art and historical BUMod sprite revisions, ensuring editions, stickers, and debuff shaders render directly on top of all custom textures.
@@ -39,7 +39,7 @@ High-level video data frequently features custom card art from the popular [Ocea
 
 ---
 
-### 3. Two-Stage Card Classifier (`classifiers/card_classifier/`)
+### 3. Card Classifier (`classifiers/card_classifier/`)
 A dual-stage neural network architecture optimized for precision on complex card overlaps.
 
 - **Stage 1 (Card Detector)**: A YOLO-based object detector that locates bounding boxes for cards within the player's hand ROI.
