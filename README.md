@@ -1,21 +1,33 @@
 # BalatroEngine
 
-Computer vision pipeline and gamestate recognition system for **Balatro**, designed to automatically parse and extract gamestates from recorded video gameplay (e.g. YouTube runs by high-level players like Balatro University) to support imitation learning, move prediction, and Monte-Carlo Tree Search (MCTS).
+Computer vision pipeline and gamestate recognition system for **Balatro**, designed to automatically parse and extract gamestates and player actions from recorded video gameplay (e.g. YouTube runs by high-level players like Balatro University) to support imitation learning, move prediction, and Monte-Carlo Tree Search (MCTS).
 
 ---
 
 ## Overview
 
-1. **Synthetic Dataset Generation Mod (`balatro_mod/`)**: An in-engine Balatro mod (Steamodded / SMODS) that generates perfectly annotated screenshot datasets with pixel-accurate bounding boxes and card metadata.
-2. **Card Classifier Pipeline (`classifiers/card_classifier/`)**: A two-stage detection and classification pipeline that detects playing cards in the hand and predicts rank, suit, edition, enhancement, seal, debuff, face-down status, and collab deck skins.
-3. **Shop & Joker Dataset Engine (`balatro_mod/src/shop_gen.lua`)**: Generates multi-region training data across the top Joker bar, shop slots, booster packs, and consumable slots, accounting for editions, stickers, debuffs, and YouTube mod variants.
-4. **Frame Extraction & ROI Tools (`tools/` & root utilities)**: Geometry, shadow evaluation, and ROI cropping utilities to extract gameplay frames and align detection areas from YouTube videos.
+1. **Template Matching Action Classifier (`main.py`, `matcher.py`, `eval_template.py`)**: A high-speed UI state detector that locates interactive elements (buttons, blinds, shops, booster packs) and evaluates user clicks via physical shadow displacement.
+2. **Synthetic Dataset Generation Mod (`balatro_mod/`)**: An in-engine Balatro mod (Steamodded / SMODS) that generates perfectly annotated screenshot datasets with pixel-accurate bounding boxes and card metadata.
+3. **Card Classifier Pipeline (`classifiers/card_classifier/`)**: A two-stage detection and classification pipeline that detects playing cards in the hand and predicts rank, suit, edition, enhancement, seal, debuff, face-down status, and collab deck skins.
+4. **Shop & Joker Dataset Engine (`balatro_mod/src/shop_gen.lua`)**: Generates multi-region training data across the top Joker bar, shop slots, booster packs, and consumable slots, accounting for editions, stickers, debuffs, and YouTube mod variants.
+5. **Frame Extraction & Calibration Tools (`tools/` & root utilities)**: Geometry, shadow evaluation, and ROI cropping utilities to extract gameplay frames and align detection areas across video resolutions.
 
 ---
 
 ## Main Stuff
 
-### 1. In-Game Dataset Generator Mod (`balatro_mod/`)
+### 1. Template Matching & Action Classifier
+The primary pipeline for extracting player decisions directly from recorded gameplay videos.
+
+- **High-Speed Template Matching (`main.py`, `matcher.py`)**: Scans video frames within targeted Region of Interest (ROI) bounding boxes using OpenCV template matching with normalized cross-correlation and masking.
+- **Button Click Detection via Shadow Analysis (`shadow_evaluator.py`, `eval_template.py`)**: Balatro buttons render a distinct drop shadow beneath them when resting, which disappears when clicked/depressed. A Sobel horizontal edge filter and median gradient analyzer detect the presence or collapse of this shadow to register whether a button was actively clicked.
+- **Interactive Calibration & Debug Plotter (`debug_plotter.py`)**: An interactive OpenCV/matplotlib interface that renders match confidence heatmaps, ROI boundaries, and shadow analysis slices in real time, allowing hotkey-based alignment of shadow offsets (`shadow_dy`, `shadow_dw`, `shadow_dh`).
+- **Batch Multiprocessing Engine (`main.py`)**: Parallelizes video decoding and frame evaluation using Python `concurrent.futures.ProcessPoolExecutor` with configurable frame skipping (`skip_frames`) for high throughput across multi-hour videos.
+- **Resolution-Independent Geometry (`geometry.py`)**: Normalized and pixel-level bounding box primitives (`NormalizedROI`, `PixelROI`) that scale UI coordinates seamlessly across 720p, 1080p, and 1440p video sources.
+
+---
+
+### 2. In-Game Dataset Generator Mod (`balatro_mod/`)
 A modular Steamodded mod installed into Balatro to capture synchronized, perfectly labeled CV datasets.
 
 - **Operation Modes**: Configurable from the in-game mod settings menu between **Off**, **Card Classifier**, and **Shop Classifier**.
@@ -30,7 +42,7 @@ A modular Steamodded mod installed into Balatro to capture synchronized, perfect
 
 ---
 
-### 2. BUMod Art Integration
+### 3. BUMod Art Integration
 Balatro University's gameplay features custom card art from the [OceanRamen/BUMod](https://github.com/OceanRamen/BUMod).
 
 - **Historical Texture Integration**: Textures across 2+ years of BUMod commit revisions (e.g. Showman, Scholar, Space Joker, Vampire, Rocket) are extracted into `balatro_mod/assets/bu_variants/`.
@@ -39,7 +51,7 @@ Balatro University's gameplay features custom card art from the [OceanRamen/BUMo
 
 ---
 
-### 3. Card Classifier (`classifiers/card_classifier/`)
+### 4. Card Classifier (`classifiers/card_classifier/`)
 A dual-stage neural network architecture optimized for precision on complex card overlaps.
 
 - **Stage 1 (Card Detector)**: A YOLO-based object detector that locates bounding boxes for cards within the player's hand ROI.
@@ -52,15 +64,24 @@ A dual-stage neural network architecture optimized for precision on complex card
 
 ---
 
-### 4. Frame Scraping & Computer Vision Utilities (`tools/`)
+### 5. Video Scraping & Auxiliary CV Utilities (`tools/`)
 - **`tools/scrape_frame.py`**: Extracts frames from local gameplay video files at specified timestamps.
 - **`tools/adjust_rois.py` & `tools/grab_rois.py`**: Interactive visual tools to fine-tune region-of-interest coordinates across different video resolutions.
 - **`tools/assign_test_images.py`**: Tooling to curate test evaluation splits from actual YouTube gameplay footage.
-- **`frame.py`, `geometry.py`, `matcher.py`**: Foundational geometry and template matching helpers for UI alignment and button detection.
+- **`tools/crop_transparent_borders.py`**: Cleans and normalizes alpha channels on raw UI template crops.
 
 ---
 
 ## Usage Quickstart
+
+### Running the Template Matching Pipeline on Gameplay Video
+```powershell
+# Run the action classifier over an input gameplay video
+python main.py
+
+# Launch interactive calibration / debug plotting mode for template ROIs and shadows
+python main.py --setup_mode --debug_plot
+```
 
 ### Updating BUMod Textures
 ```powershell
