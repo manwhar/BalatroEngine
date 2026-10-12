@@ -55,8 +55,9 @@ end
 
 function G.DATASET_MOD:calculate_boxes_for_card(card, draw_args)
     local ox, oy = draw_args[6], draw_args[7]
-    local cw = (ox and ox > 0) and (ox * 2) or 71
-    local ch = (oy and oy > 0) and (oy * 2) or 95
+    local sprite = card.children and (card.children.center or card.children.front)
+    local cw = (sprite and sprite.scale and sprite.scale.x) or (ox and ox > 0 and ox * 2) or 71
+    local ch = (sprite and sprite.scale and sprite.scale.y) or (oy and oy > 0 and oy * 2) or 95
 
     -- Select the appropriate bounding box configuration
     local box_def = nil
@@ -66,12 +67,7 @@ function G.DATASET_MOD:calculate_boxes_for_card(card, draw_args)
         box_def = self.config.boxes.joker_bar_card
         box_name = "joker_bar_card"
     elseif card.area == G.consumeables then
-        -- In Perkeo mode with > 2 cards, use left ~half box to prevent overlapping AABB collision
-        if G.consumeables and G.consumeables.cards and #G.consumeables.cards > 2 then
-            box_def = {w = 0.55, h = 1.0, ox = -0.225, oy = 0.0}
-        else
-            box_def = self.config.boxes.consumeable_card or {w = 1.0, h = 1.0, ox = 0.0, oy = 0.0}
-        end
+        box_def = self.config.boxes.consumeable_card or {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396}
         box_name = "consumeable_card"
     elseif card.area == G.shop_jokers or card.area == G.pack_cards then
         box_def = self.config.boxes.item_card
@@ -132,26 +128,23 @@ function G.DATASET_MOD:capture_frame_card()
         cropped:paste(img, 0, 0, rx, ry, rw, rh)
         
         local filedata = cropped:encode("png")
-        local raw_bytes = filedata:getString()
-        
         local filename = string.format("Mods/gamestate_dataset_cv/dataset/images/frame_%04d.png", current_frame)
-        love.filesystem.write(filename, raw_bytes)
+        love.filesystem.write(filename, filedata)
         
         if filedata and filedata.release then filedata:release() end
         if cropped and cropped.release then cropped:release() end
         if img and img.release then img:release() end
+
+        self:save_labels_card(current_frame)
+        self.frame_counts.card = self.frame_counts.card + 1
+        self.frame_count = self.frame_counts.card
+        self.state = 'idle'
+        self.capture_flash = 0.5
+        self.capture_flash_text = string.format("CARD FRAME %04d SAVED!", current_frame)
+
+        -- Incremental GC step to keep memory flat without freezing
+        collectgarbage("step", 200)
     end)
-
-    self:save_labels_card(current_frame)
-    self.frame_counts.card = self.frame_counts.card + 1
-    self.frame_count = self.frame_counts.card
-    self.state = 'idle'
-    self.capture_flash = 1.0
-    self.capture_flash_text = string.format("CARD FRAME %04d SAVED!", current_frame)
-
-    if self.frame_count % 25 == 0 then
-        collectgarbage("collect")
-    end
 end
 
 function G.DATASET_MOD:save_labels_card(frame_num)
@@ -262,12 +255,12 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
     local rw, rh = math.max(1, math.floor(roi.w)), math.max(1, math.floor(roi.h))
     local rx, ry = math.floor(roi.x), math.floor(roi.y)
 
-    -- 1. Save Image Crop
+    -- 1. Save Image Crop (write FileData directly to avoid multi-megabyte Lua string heap bloat)
     local cropped = love.image.newImageData(rw, rh)
     cropped:paste(img, 0, 0, rx, ry, rw, rh)
     local filedata = cropped:encode("png")
     local img_path = string.format("Mods/gamestate_dataset_cv/dataset_shop/images/frame_%04d_%s.png", current_frame, file_suffix)
-    love.filesystem.write(img_path, filedata:getString())
+    love.filesystem.write(img_path, filedata)
 
     if filedata and filedata.release then filedata:release() end
     if cropped and cropped.release then cropped:release() end
@@ -357,17 +350,20 @@ function G.DATASET_MOD:capture_frame_shop()
         end
 
         if img and img.release then img:release() end
+
+        self.frame_counts.shop = self.frame_counts.shop + 1
+        self.frame_count = self.frame_counts.shop
+        self.state = 'idle'
+        self.capture_flash = 0.5
+        self.capture_flash_text = string.format("SHOP FRAME %04d SAVED (%s)!", current_frame, string.upper(current_phase))
+
+        -- Run full cleanup and collection cycle to keep memory completely flat
+        if self.ShopGen and self.ShopGen.cleanup_cycle then
+            self.ShopGen.cleanup_cycle()
+        else
+            collectgarbage("collect")
+        end
     end)
-
-    self.frame_counts.shop = self.frame_counts.shop + 1
-    self.frame_count = self.frame_counts.shop
-    self.state = 'idle'
-    self.capture_flash = 1.0
-    self.capture_flash_text = string.format("SHOP FRAME %04d SAVED (%s)!", current_frame, string.upper(current_phase))
-
-    if self.frame_count % 25 == 0 then
-        collectgarbage("collect")
-    end
 end
 
 -- Top-level capture dispatcher

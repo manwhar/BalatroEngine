@@ -64,12 +64,84 @@ function UI.init_callbacks(mod)
         mod.capture_flash = 1.5
         mod.capture_flash_text = "CONFIG LOADED FROM BOXES.LUA!"
     end
+
+    G.FUNCS.gdcv_clear_dataset = function(e)
+        if not mod.clear_confirm then
+            mod.clear_confirm = true
+            mod.clear_confirm_timer = 5.0
+            mod.clear_button_text = "CONFIRM CLEAR?"
+            mod.capture_flash = 1.0
+            mod.capture_flash_text = "CLICK AGAIN WITHIN 5s TO ERASE ALL FRAMES!"
+        else
+            mod.clear_confirm = false
+            mod.clear_confirm_timer = 0
+            local count = mod:clear_all_dataset_data()
+            mod.clear_button_text = "DATASET CLEARED!"
+            mod.clear_reset_timer = 2.5
+            mod.capture_flash = 2.0
+            mod.capture_flash_text = string.format("CLEARED %d DATASET FILES!", count)
+        end
+    end
+
+    G.FUNCS.gdcv_reload_mod = function(e)
+        if mod.reload then
+            mod:reload()
+        else
+            local ok, err = pcall(function()
+                local function load_sub(rel)
+                    if SMODS and SMODS.load_file then
+                        local c = SMODS.load_file(rel, "gamestate_dataset_cv") or SMODS.load_file(rel)
+                        if c then return c() end
+                    end
+                    if love.filesystem.getInfo("Mods/gamestate_dataset_cv/" .. rel) then
+                        local content = love.filesystem.read("Mods/gamestate_dataset_cv/" .. rel)
+                        local c = (loadstring or load)(content)
+                        if c then return c() end
+                    end
+                end
+                load_sub("src/config.lua")
+                load_sub("src/cards_gen.lua")
+                load_sub("src/shop_gen.lua")
+                load_sub("src/capture.lua")
+                local ui_m = load_sub("src/ui.lua")
+                if ui_m then
+                    ui_m.init_callbacks(mod)
+                    if SMODS and SMODS.current_mod then SMODS.current_mod.config_tab = ui_m.create_config_tab end
+                    if SMODS and SMODS.Mods and SMODS.Mods["gamestate_dataset_cv"] then
+                        SMODS.Mods["gamestate_dataset_cv"].config_tab = ui_m.create_config_tab
+                    end
+                end
+            end)
+            if ok then
+                mod.capture_flash = 1.5
+                mod.capture_flash_text = "MOD HOT-RELOADED!"
+            else
+                mod.capture_flash = 2.0
+                mod.capture_flash_text = "RELOAD FAILED: " .. tostring(err):sub(1, 40)
+            end
+        end
+    end
+
+    G.FUNCS.gdcv_restart_game = function(e)
+        if SMODS and SMODS.restart_game then
+            SMODS.restart_game()
+        else
+            love.event.quit("restart")
+        end
+    end
 end
 
 function UI.create_config_tab()
     local mod = G.DATASET_MOD
+    mod.clear_confirm = false
+    mod.clear_confirm_timer = 0
+    mod.clear_button_text = "Clear Dataset"
+    mod.stats_text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
+        mod.frame_counts and mod.frame_counts.card or 0,
+        mod.frame_counts and mod.frame_counts.shop or 0,
+        string.upper(mod.shop_phase or 'shop'))
+
     local current_mode_idx = (mod.config.mode == 'card_classifier' and 2) or (mod.config.mode == 'shop_classifier' and 3) or 1
-    local current_calib_idx = (mod.config.calibration_mode == 'generation' and 2) or 1
 
     local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
     local current_mf_str = tostring(mod.config.max_frames or 10000)
@@ -89,123 +161,179 @@ function UI.create_config_tab()
         n = G.UIT.ROOT,
         config = {
             r = 0.1,
-            minw = 8.5,
+            minw = 6.8,
             align = "cm",
-            padding = 0.2,
+            padding = 0.08,
             colour = G.C.BLACK
         },
         nodes = {
             -- Title
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
+                config = {align = "cm", padding = 0.04},
                 nodes = {
-                    {n = G.UIT.T, config = {text = "GameState Dataset CV - Settings", scale = 0.6, colour = G.C.GOLD}}
+                    {n = G.UIT.T, config = {text = "GameState Dataset CV - Settings", scale = 0.42, colour = G.C.GOLD}}
                 }
             },
             -- Mode Selector Cycle
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
+                config = {align = "cr", padding = 0.02},
                 nodes = {
-                    {n = G.UIT.T, config = {text = "Classifier Mode: ", scale = 0.45, colour = G.C.UI.TEXT_LIGHT}},
-                    create_option_cycle({
-                        id = 'gdcv_mode_cycle',
-                        options = {'Off', 'Card Classifier', 'Shop Classifier'},
-                        current_option = current_mode_idx,
-                        opt_callback = 'gdcv_change_mode',
-                        w = 4.5,
-                        scale = 0.8
-                    })
-                }
-            },
-            -- Calibration / Generation Cycle
-            {
-                n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
-                nodes = {
-                    {n = G.UIT.T, config = {text = "Operation State: ", scale = 0.45, colour = G.C.UI.TEXT_LIGHT}},
-                    create_option_cycle({
-                        id = 'gdcv_state_cycle',
-                        options = {'Setup Mode', 'Generation Mode'},
-                        current_option = current_calib_idx,
-                        opt_callback = 'gdcv_change_calib_state',
-                        w = 4.5,
-                        scale = 0.8
-                    })
+                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
+                        {n = G.UIT.T, config = {text = "Classifier Mode", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
+                    }},
+                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                        create_option_cycle({
+                            id = 'gdcv_mode_cycle',
+                            options = {'Off', 'Card Classifier', 'Shop Classifier'},
+                            current_option = current_mode_idx,
+                            opt_callback = 'gdcv_change_mode',
+                            w = 2.8,
+                            h = 0.6,
+                            scale = 0.65
+                        })
+                    }}
                 }
             },
             -- Target Frames Cap Cycle
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
+                config = {align = "cr", padding = 0.02},
                 nodes = {
-                    {n = G.UIT.T, config = {text = "Target Frame Cap: ", scale = 0.45, colour = G.C.UI.TEXT_LIGHT}},
-                    create_option_cycle({
-                        id = 'gdcv_mf_cycle',
-                        options = max_frames_options,
-                        current_option = current_mf_idx,
-                        opt_callback = 'gdcv_change_max_frames',
-                        w = 4.5,
-                        scale = 0.8
-                    })
+                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
+                        {n = G.UIT.T, config = {text = "Target Frame Cap", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
+                    }},
+                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                        create_option_cycle({
+                            id = 'gdcv_mf_cycle',
+                            options = max_frames_options,
+                            current_option = current_mf_idx,
+                            opt_callback = 'gdcv_change_max_frames',
+                            w = 2.8,
+                            h = 0.6,
+                            scale = 0.65
+                        })
+                    }}
                 }
             },
             -- Perkeo Max Consumables Cycle
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
+                config = {align = "cr", padding = 0.02},
                 nodes = {
-                    {n = G.UIT.T, config = {text = "Perkeo Max Consumables: ", scale = 0.45, colour = G.C.UI.TEXT_LIGHT}},
-                    create_option_cycle({
-                        id = 'gdcv_pm_cycle',
-                        options = perkeo_max_options,
-                        current_option = current_pm_idx,
-                        opt_callback = 'gdcv_change_perkeo_max',
-                        w = 4.5,
-                        scale = 0.8
-                    })
+                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
+                        {n = G.UIT.T, config = {text = "Perkeo Max Consumables", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
+                    }},
+                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                        create_option_cycle({
+                            id = 'gdcv_pm_cycle',
+                            options = perkeo_max_options,
+                            current_option = current_pm_idx,
+                            opt_callback = 'gdcv_change_perkeo_max',
+                            w = 2.8,
+                            h = 0.6,
+                            scale = 0.65
+                        })
+                    }}
                 }
             },
             -- Stats & Info Row
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.1},
+                config = {align = "cm", padding = 0.03},
                 nodes = {
                     {
                         n = G.UIT.T,
                         config = {
-                            text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
-                                mod.frame_counts.card or 0,
-                                mod.frame_counts.shop or 0,
-                                string.upper(mod.shop_phase or 'shop')),
-                            scale = 0.38,
+                            ref_table = mod,
+                            ref_value = "stats_text",
+                            text = mod.stats_text,
+                            scale = 0.30,
                             colour = G.C.UI.TEXT_INACTIVE
                         }
                     }
                 }
             },
-            -- Buttons Row: Save & Load Config
+            -- Buttons Row 1: Save, Load, Hot Reload
             {
                 n = G.UIT.R,
-                config = {align = "cm", padding = 0.15},
+                config = {align = "cm", padding = 0.03},
                 nodes = {
                     UIBox_button({
                         button = 'gdcv_save_config',
                         label = {'Save Config'},
-                        minw = 2.4,
-                        minh = 0.7,
-                        scale = 0.38,
+                        minw = 1.9,
+                        minh = 0.55,
+                        scale = 0.32,
                         colour = G.C.GREEN
                     }),
-                    {n = G.UIT.B, config = {w = 0.3, h = 0.1}},
+                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
                     UIBox_button({
                         button = 'gdcv_load_config',
                         label = {'Load Config'},
-                        minw = 2.4,
-                        minh = 0.7,
-                        scale = 0.38,
+                        minw = 1.9,
+                        minh = 0.55,
+                        scale = 0.32,
                         colour = G.C.ORANGE
+                    }),
+                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
+                    UIBox_button({
+                        button = 'gdcv_reload_mod',
+                        label = {'Hot Reload'},
+                        minw = 1.9,
+                        minh = 0.55,
+                        scale = 0.32,
+                        colour = G.C.BLUE
+                    })
+                }
+            },
+            -- Buttons Row 2: Clear Dataset (Confirmation) & Restart Game
+            {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.03},
+                nodes = {
+                    {
+                        n = G.UIT.C,
+                        config = {
+                            align = "cm",
+                            padding = 0.05,
+                            r = 0.1,
+                            hover = true,
+                            colour = G.C.RED,
+                            button = 'gdcv_clear_dataset',
+                            minw = 2.9,
+                            minh = 0.55,
+                            shadow = true,
+                        },
+                        nodes = {
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0},
+                                nodes = {
+                                    {
+                                        n = G.UIT.T,
+                                        config = {
+                                            ref_table = mod,
+                                            ref_value = "clear_button_text",
+                                            text = mod.clear_button_text,
+                                            scale = 0.32,
+                                            colour = G.C.UI.TEXT_LIGHT,
+                                            shadow = true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {n = G.UIT.B, config = {w = 0.2, h = 0.1}},
+                    UIBox_button({
+                        button = 'gdcv_restart_game',
+                        label = {'Restart Game'},
+                        minw = 2.9,
+                        minh = 0.55,
+                        scale = 0.32,
+                        colour = G.C.PURPLE
                     })
                 }
             }
@@ -242,18 +370,57 @@ function G.DATASET_MOD:draw_debug()
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
         draw_roi_box(self.config.rois.consumeables, "[ROI: CONSUMABLES (TOP RIGHT)]", sel == 'roi_consumeables', 1.0, 0.4, 0.9)
 
-        if (self.shop_phase or 'shop') == 'shop' then
+        if (self.shop_phase or 'shop') == 'shop' or sel == 'roi_shop' then
             draw_roi_box(self.config.rois.shop, "[ROI: SHOP SLOTS (UPPER RIGHT)]", sel == 'roi_shop', 1, 0.8, 0.2)
-        else
+        end
+        if (self.shop_phase or 'shop') == 'pack' or sel == 'roi_pack' then
             local p_name = string.format("[ROI: %s PACK]", string.upper(self.current_pack_kind or 'PACK'))
             draw_roi_box(self.config.rois.pack, p_name, sel == 'roi_pack', 1, 0.3, 0.8)
         end
     end
 
     -- 2. Draw Card Bounding Boxes Polygons
+    local function is_card_active(card)
+        if not card or card.REMOVED then return false end
+        if self.config.mode == 'card_classifier' then
+            if G.hand and G.hand.cards then
+                for _, c in ipairs(G.hand.cards) do
+                    if c == card then return true end
+                end
+            end
+        elseif self.config.mode == 'shop_classifier' then
+            if G.jokers and G.jokers.cards then
+                for _, c in ipairs(G.jokers.cards) do
+                    if c == card then return true end
+                end
+            end
+            if (self.shop_phase or 'shop') == 'shop' then
+                if G.shop_jokers and G.shop_jokers.cards then
+                    for _, c in ipairs(G.shop_jokers.cards) do
+                        if c == card then return true end
+                    end
+                end
+            else
+                if G.pack_cards and G.pack_cards.cards then
+                    for _, c in ipairs(G.pack_cards.cards) do
+                        if c == card then return true end
+                    end
+                end
+            end
+            if G.consumeables and G.consumeables.cards then
+                for _, c in ipairs(G.consumeables.cards) do
+                    if c == card then return true end
+                end
+            end
+        end
+        return false
+    end
+
     if self.captured_boxes then
         for card, box in pairs(self.captured_boxes) do
-            if box and box.points then
+            if not is_card_active(card) then
+                self.captured_boxes[card] = nil
+            elseif box and box.points then
                 local pts = box.points
                 local is_sel_box = (self.selected_target == 'box_joker_bar' and box.box_name == 'joker_bar_card') or
                                    (self.selected_target == 'box_item' and box.box_name == 'item_card') or
@@ -303,7 +470,7 @@ function G.DATASET_MOD:draw_debug()
 
     love.graphics.setColor(0.3, 0.9, 1, 1)
     if self.config.mode == 'shop_classifier' then
-        love.graphics.print("Keys: 1: Joker Bar | 2: Shop | 3: Pack | 4: Consumables | 5: Box Joker | 6: Box Item | 7: Box Consumable", 18, 58)
+        love.graphics.print("Keys: 1-4: ROIs | 5: Box Joker | 6: Box Item | 7: Box Consumable", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card", 18, 58)
     end
@@ -324,6 +491,14 @@ function G.DATASET_MOD:draw_debug()
 
     love.graphics.setColor(1, 1, 0.4, 1)
     love.graphics.print(string.format("Next Frame: %04d / %d%s | Lua Mem: %.1f MB", cur_frame, self.config.max_frames or 10000, phase_extra, collectgarbage("count") / 1024), 18, 146)
+
+    local stg_cnt = (G.STAGE_OBJECTS and G.STAGE_OBJECTS[G.STAGE] and #G.STAGE_OBJECTS[G.STAGE]) or 0
+    local mov_cnt = (G.MOVEABLES and #G.MOVEABLES) or 0
+    local crd_cnt = (G.I and G.I.CARD and #G.I.CARD) or 0
+    local spr_cnt = (G.I and G.I.SPRITE and #G.I.SPRITE) or 0
+    local uib_cnt = (G.I and G.I.UIBOX and #G.I.UIBOX) or 0
+    love.graphics.setColor(0.6, 0.8, 1, 0.8)
+    love.graphics.print(string.format("Nodes: %d | Moveables: %d | Cards: %d | Sprites: %d | UIBoxes: %d", stg_cnt, mov_cnt, crd_cnt, spr_cnt, uib_cnt), 18, 168)
 
     -- Flash message
     if self.capture_flash and self.capture_flash > 0 then
@@ -382,6 +557,12 @@ function G.DATASET_MOD:on_keypressed(key)
                     self:setup_pack_screen()
                 end
             end
+            if self.ShopGen and self.ShopGen.cleanup_cycle then
+                self.ShopGen.cleanup_cycle()
+            else
+                collectgarbage("collect")
+                collectgarbage("collect")
+            end
         elseif key == 'p' and self.config.mode == 'shop_classifier' then
             self:toggle_shop_screen_mode()
         elseif key == 't' and self.config.mode == 'card_classifier' then
@@ -404,18 +585,37 @@ end
 -- UPDATE HOOK (NUDGING & GENERATION)
 -- ==========================================
 function G.DATASET_MOD:update(dt)
-    if self.config.mode == 'off' then return end
-
     if self.capture_flash and self.capture_flash > 0 then
         self.capture_flash = math.max(0, self.capture_flash - dt)
     end
+
+    if self.clear_confirm then
+        self.clear_confirm_timer = (self.clear_confirm_timer or 0) - dt
+        if self.clear_confirm_timer <= 0 then
+            self.clear_confirm = false
+            self.clear_button_text = "Clear Dataset"
+        end
+    elseif self.clear_reset_timer then
+        self.clear_reset_timer = self.clear_reset_timer - dt
+        if self.clear_reset_timer <= 0 then
+            self.clear_reset_timer = nil
+            self.clear_button_text = "Clear Dataset"
+        end
+    end
+
+    self.stats_text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
+        self.frame_counts and self.frame_counts.card or 0,
+        self.frame_counts and self.frame_counts.shop or 0,
+        string.upper(self.shop_phase or 'shop'))
+
+    if not self.config or self.config.mode == 'off' then return end
 
     if self.config.calibration_mode == 'setup' then
         local obj, obj_type = self:get_selected_object()
         if not obj then return end
 
         if obj_type == 'roi' then
-            local roi_step = love.keyboard.isDown('lshift', 'rshift') and (500 * dt) or (150 * dt)
+            local roi_step = love.keyboard.isDown('lshift', 'rshift') and (2500 * dt) or (750 * dt)
             if love.keyboard.isDown('w') then obj.y = obj.y - roi_step end
             if love.keyboard.isDown('s') then obj.y = obj.y + roi_step end
             if love.keyboard.isDown('a') then obj.x = obj.x - roi_step end
@@ -425,15 +625,19 @@ function G.DATASET_MOD:update(dt)
             if love.keyboard.isDown('left') then obj.w = obj.w - roi_step end
             if love.keyboard.isDown('right') then obj.w = obj.w + roi_step end
         elseif obj_type == 'box' then
-            local step = love.keyboard.isDown('lshift', 'rshift') and (0.5 * dt) or (0.1 * dt)
-            if love.keyboard.isDown('w') then obj.oy = obj.oy - step end
-            if love.keyboard.isDown('s') then obj.oy = obj.oy + step end
-            if love.keyboard.isDown('a') then obj.ox = obj.ox - step end
-            if love.keyboard.isDown('d') then obj.ox = obj.ox + step end
-            if love.keyboard.isDown('up') then obj.h = obj.h - step end
-            if love.keyboard.isDown('down') then obj.h = obj.h + step end
-            if love.keyboard.isDown('left') then obj.w = obj.w - step end
-            if love.keyboard.isDown('right') then obj.w = obj.w + step end
+            local step = love.keyboard.isDown('lshift', 'rshift') and (2.0 * dt) or (0.5 * dt)
+            local moved = false
+            if love.keyboard.isDown('w') then obj.oy = obj.oy - step; moved = true end
+            if love.keyboard.isDown('s') then obj.oy = obj.oy + step; moved = true end
+            if love.keyboard.isDown('a') then obj.ox = obj.ox - step; moved = true end
+            if love.keyboard.isDown('d') then obj.ox = obj.ox + step; moved = true end
+            if love.keyboard.isDown('up') then obj.h = obj.h - step; moved = true end
+            if love.keyboard.isDown('down') then obj.h = obj.h + step; moved = true end
+            if love.keyboard.isDown('left') then obj.w = obj.w - step; moved = true end
+            if love.keyboard.isDown('right') then obj.w = obj.w + step; moved = true end
+            if moved then
+                self.captured_boxes = setmetatable({}, {__mode = "k"})
+            end
         end
     elseif self.config.calibration_mode == 'generation' then
         local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
@@ -457,7 +661,7 @@ function G.DATASET_MOD:update(dt)
             end
 
             self.state = 'waiting'
-            self.timer = 0.25 -- Wait for animations/lerp to settle
+            self.timer = 0.08 -- Reduced from 0.25 since animations are instantly snapped
         elseif self.state == 'waiting' then
             self.timer = self.timer - dt
             if self.timer <= 0 then

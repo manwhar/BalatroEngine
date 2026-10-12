@@ -70,6 +70,8 @@ local ShopGenModule  = load_submodule("src/shop_gen.lua")
 local CaptureModule  = load_submodule("src/capture.lua")
 local UIModule       = load_submodule("src/ui.lua")
 
+G.DATASET_MOD.ShopGen = ShopGenModule
+
 -- Initialize configuration, counters, and directories
 ConfigModule.init(G.DATASET_MOD)
 
@@ -193,8 +195,7 @@ function Card:draw(layer)
 
         if tracked then
             G.DATASET_MOD.current_card = self
-            G.DATASET_MOD.captured_boxes = G.DATASET_MOD.captured_boxes or {}
-            G.DATASET_MOD.captured_boxes[self] = nil
+            G.DATASET_MOD.captured_boxes = G.DATASET_MOD.captured_boxes or setmetatable({}, {__mode = "k"})
         else
             G.DATASET_MOD.current_card = nil
         end
@@ -207,11 +208,37 @@ function Card:draw(layer)
     end
 end
 
--- 3. love.update hook
+-- 3. Card:remove hook: clean up captured box when card is deleted
+local orig_card_remove = Card.remove
+function Card:remove()
+    if G.DATASET_MOD and G.DATASET_MOD.captured_boxes then
+        G.DATASET_MOD.captured_boxes[self] = nil
+    end
+    return orig_card_remove(self)
+end
+
+-- Hook nuGC globally to prevent Balatro from disabling automatic GC via collectgarbage('stop')
+local orig_nuGC = nuGC
+function nuGC(time_budget, memory_ceiling, disable_otherwise)
+    if G.DATASET_MOD and G.DATASET_MOD.config and G.DATASET_MOD.config.mode ~= 'off' then
+        collectgarbage("step", 200)
+        return
+    end
+    if orig_nuGC then
+        return orig_nuGC(time_budget, memory_ceiling, disable_otherwise)
+    end
+end
+
+-- 4. love.update hook
 local orig_love_update = love.update
 function love.update(dt)
     if orig_love_update then orig_love_update(dt) end
-    if G.DATASET_MOD then G.DATASET_MOD:update(dt) end
+    if G.DATASET_MOD then
+        G.DATASET_MOD:update(dt)
+        if G.DATASET_MOD.config and G.DATASET_MOD.config.mode ~= 'off' then
+            collectgarbage("step", 200)
+        end
+    end
 end
 
 -- 4. love.draw hook

@@ -97,7 +97,19 @@ python classifiers/card_classifier/prepare_dataset.py
 python classifiers/card_classifier/train.py
 
 # Or launch continuous background retrainer:
-python auto_retrain.py
+python auto_retrain.py --model card
+```
+
+### Training Shop & Item Classifier
+```powershell
+# Sync latest shop dataset from mod and inspect statistics
+python classifiers/shop_classifier/prepare_dataset.py
+
+# Run Stage 1 detector (YOLO) and Stage 2 multi-head item classifier
+python classifiers/shop_classifier/train.py --sync --stage all
+
+# Or launch continuous background retrainer (monitors dataset_shop and auto-trains):
+python auto_retrain.py --model shop --target 10000
 ```
 
 ### Running Pipeline on Video Frames

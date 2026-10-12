@@ -233,12 +233,20 @@ function G.DATASET_MOD:generate_random_hand()
     self.captured_boxes = setmetatable({}, {__mode = "k"})
     
     -- Clear current hand
+    local ShopGen = G.DATASET_MOD and G.DATASET_MOD.ShopGen
     for i = #G.hand.cards, 1, -1 do
         local c = G.hand.cards[i]
-        c:remove()
+        if ShopGen and ShopGen.fully_remove_card then
+            ShopGen.fully_remove_card(c)
+        else
+            c:remove()
+        end
     end
     G.hand.cards = {}
     G.hand.highlighted = {}
+    if ShopGen and ShopGen.cleanup_cycle then
+        ShopGen.cleanup_cycle()
+    end
     
     local num_cards = math.max(1, math.min(15, math.floor(self:normal_dist(8, 2))))
     G.hand.config.card_limit = num_cards

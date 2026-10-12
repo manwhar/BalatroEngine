@@ -5,9 +5,10 @@ local Config = {}
 local DEFAULT_CONFIG = {
     mode = 'off', -- 'off', 'card_classifier', 'shop_classifier'
     calibration_mode = 'setup', -- 'setup' or 'generation'
-    max_frames = 10000,
+    max_frames = 20000,
     frames_per_phase = 100, -- 100 shop screens, then 100 pack screens
     perkeo_max_consumables = 10, -- Max consumables in perkeo mode (configurable)
+    show_shop_prices = false, -- Synchronously render price labels below shop items (disabled for fast animation-free generation)
     rois = {
         card_hand    = {x = 508.319934, y = 567.839093, w = 1071.056521, h = 322.734447},
         joker_bar    = {x = 320.0,      y = 10.0,       w = 1280.0,      h = 260.0},
@@ -17,9 +18,9 @@ local DEFAULT_CONFIG = {
     },
     boxes = {
         card             = {w = 0.465890, h = 1.040970, ox = -0.240265, oy = 0.020829},
-        joker_bar_card   = {w = 0.550000, h = 1.000000, ox = -0.225000, oy = 0.000000},
-        item_card        = {w = 1.000000, h = 1.000000, ox = 0.000000,  oy = 0.000000},
-        consumeable_card = {w = 1.000000, h = 1.000000, ox = 0.000000,  oy = 0.000000},
+        joker_bar_card   = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
+        item_card        = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
+        consumeable_card = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
     }
 }
 
@@ -30,6 +31,7 @@ function Config.init(mod)
         max_frames = DEFAULT_CONFIG.max_frames,
         frames_per_phase = DEFAULT_CONFIG.frames_per_phase,
         perkeo_max_consumables = DEFAULT_CONFIG.perkeo_max_consumables,
+        show_shop_prices = DEFAULT_CONFIG.show_shop_prices,
         rois = {},
         boxes = {}
     }
@@ -110,13 +112,50 @@ function Config.init_classes(mod)
     end
 end
 
+function Config.clear_all_dataset_data(mod)
+    local dirs = {
+        "Mods/gamestate_dataset_cv/dataset/images",
+        "Mods/gamestate_dataset_cv/dataset/labels",
+        "Mods/gamestate_dataset_cv/dataset_shop/images",
+        "Mods/gamestate_dataset_cv/dataset_shop/labels"
+    }
+    local removed_count = 0
+    for _, dir in ipairs(dirs) do
+        if love.filesystem.getInfo(dir) then
+            local files = love.filesystem.getDirectoryItems(dir)
+            for _, f in ipairs(files) do
+                local file_path = dir .. "/" .. f
+                if love.filesystem.remove(file_path) then
+                    removed_count = removed_count + 1
+                end
+            end
+        end
+    end
+
+    mod.frame_counts = mod.frame_counts or {}
+    mod.frame_counts.card = 0
+    mod.frame_counts.shop = 0
+    mod.frame_count = 0
+    mod.phase_step = 0
+    mod.stats_text = string.format("Card Frames: 0  |  Shop Frames: 0  |  Phase: %s",
+        string.upper(mod.shop_phase or 'shop'))
+
+    print(string.format("DATASET: Cleared %d files from dataset directories.", removed_count))
+    return removed_count
+end
+
+function G.DATASET_MOD:clear_all_dataset_data()
+    return Config.clear_all_dataset_data(self)
+end
+
 function G.DATASET_MOD:save_config()
     local content = "return {\n"
     content = content .. string.format("  mode = %q,\n", self.config.mode or 'off')
     content = content .. string.format("  calibration_mode = %q,\n", self.config.calibration_mode or 'setup')
-    content = content .. string.format("  max_frames = %d,\n", self.config.max_frames or 10000)
+    content = content .. string.format("  max_frames = %d,\n", self.config.max_frames or 20000)
     content = content .. string.format("  frames_per_phase = %d,\n", self.config.frames_per_phase or 100)
     content = content .. string.format("  perkeo_max_consumables = %d,\n", self.config.perkeo_max_consumables or 10)
+    content = content .. string.format("  show_shop_prices = %s,\n", self.config.show_shop_prices ~= false and "true" or "false")
     
     content = content .. "  rois = {\n"
     for k, v in pairs(self.config.rois) do
@@ -145,9 +184,10 @@ function G.DATASET_MOD:load_config()
             if type(t) == "table" then
                 if t.mode then self.config.mode = t.mode end
                 if t.calibration_mode then self.config.calibration_mode = t.calibration_mode end
-                if t.max_frames then self.config.max_frames = tonumber(t.max_frames) or 10000 end
+                if t.max_frames then self.config.max_frames = tonumber(t.max_frames) or 20000 end
                 if t.frames_per_phase then self.config.frames_per_phase = tonumber(t.frames_per_phase) or 100 end
                 if t.perkeo_max_consumables then self.config.perkeo_max_consumables = tonumber(t.perkeo_max_consumables) or 10 end
+                if t.show_shop_prices ~= nil then self.config.show_shop_prices = (t.show_shop_prices == true) end
 
                 -- Backwards compatibility: single 'roi' table
                 if t.roi and type(t.roi) == "table" and not t.rois then

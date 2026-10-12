@@ -85,9 +85,19 @@ function ShopGen.get_variant_image(filename)
         local img_data = love.image.newImageData(path)
         local img = love.graphics.newImage(img_data)
         ShopGen.loaded_images[filename] = img
+        if img_data and img_data.release then img_data:release() end
         return img
     end
     return nil
+end
+
+ShopGen.cached_quads = {}
+function ShopGen.get_quad(x, y, w, h, sw, sh)
+    local k = string.format("%d_%d_%d_%d_%d_%d", x, y, w, h, sw, sh)
+    if not ShopGen.cached_quads[k] then
+        ShopGen.cached_quads[k] = love.graphics.newQuad(x, y, w, h, sw, sh)
+    end
+    return ShopGen.cached_quads[k]
 end
 
 function G.DATASET_MOD:get_joker_pools()
@@ -113,7 +123,6 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
         {
             bypass_discovery_center = true,
             bypass_discovery_ui = true,
-            discover = true,
             bypass_back = G.GAME and G.GAME.selected_back and G.GAME.selected_back.pos
         }
     )
@@ -166,9 +175,9 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
                 -- Set quad to entire 142x190 texture (or 1st/2nd half if jokers_trans)
                 local w, h = img:getDimensions()
                 if c_key == 'j_banner' and w > 200 then
-                    card.children.center.quad = love.graphics.newQuad(71 * 2, 0, 71 * 2, 95 * 2, w, h)
+                    card.children.center.quad = ShopGen.get_quad(71 * 2, 0, 71 * 2, 95 * 2, w, h)
                 else
-                    card.children.center.quad = love.graphics.newQuad(0, 0, 71 * 2, 95 * 2, w, h)
+                    card.children.center.quad = ShopGen.get_quad(0, 0, 71 * 2, 95 * 2, w, h)
                 end
                 card.custom_art_variant = string.format("bumod_v%d_%s", chosen_var.version or 1, chosen_var.commit or "hist")
             end
@@ -192,21 +201,181 @@ function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_cent
         {
             bypass_discovery_center = true,
             bypass_discovery_ui = true,
-            discover = true,
             bypass_back = G.GAME and G.GAME.selected_back and G.GAME.selected_back.pos
         }
     )
     return card
 end
 
--- Helper to safely remove all cards from a CardArea
+-- Helper to attach shop card price and buy tags synchronously without queuing delayed events in G.E_MANAGER
+local function attach_shop_card_ui_sync(card)
+    if not card then return end
+    local cost_str = card.cost and tostring(card.cost) or "4"
+    local t1 = {
+        n=G.UIT.ROOT, config = {minw = 0.6, align = 'tm', colour = darken(G.C.BLACK, 0.2), shadow = true, r = 0.05, padding = 0.05, minh = 1}, nodes={
+            {n=G.UIT.R, config={align = "cm", colour = lighten(G.C.BLACK, 0.1), r = 0.1, minw = 1, minh = 0.55, emboss = 0.05, padding = 0.03}, nodes={
+                {n=G.UIT.T, config={text = "$" .. cost_str, colour = G.C.MONEY, scale = 0.4}}
+            }}
+        }
+    }
+    local t2 = {
+        n=G.UIT.ROOT, config = {minw = 1.1, maxw = 1.3, padding = 0.1, align = 'bm', colour = G.C.GOLD, shadow = true, r = 0.08, minh = 0.94}, nodes={
+            {n=G.UIT.T, config={text = "BUY", colour = G.C.WHITE, scale = 0.45}}
+        }
+    }
+    card.children.price = UIBox{
+        definition = t1,
+        config = {align="tm", offset = {x=0, y=1.5}, major = card, bond = 'Weak', parent = card}
+    }
+    card.children.buy_button = UIBox{
+        definition = t2,
+        config = {align="bm", offset = {x=0, y=-0.3}, major = card, bond = 'Weak', parent = card}
+    }
+end
+
+-- Helper to safely and completely sever all references to a Card and its child objects
+local function fully_remove_card(card)
+    if not card then return end
+    if G.DATASET_MOD and G.DATASET_MOD.captured_boxes then
+        G.DATASET_MOD.captured_boxes[card] = nil
+    end
+    if card.area then
+        card:remove_from_area()
+    end
+    if card.children then
+        for k, child in pairs(card.children) do
+            if child then
+                if child.remove then
+                    pcall(function() child:remove() end)
+                end
+                card.children[k] = nil
+            end
+        end
+    end
+    pcall(function() card:remove() end)
+    card.children = nil
+end
+ShopGen.fully_remove_card = fully_remove_card
+
+-- Helper to safely remove all cards from a CardArea and clean up their bounding boxes
 local function clear_card_area(area)
     if area and area.cards then
         for i = #area.cards, 1, -1 do
             local c = area.cards[i]
-            c:remove()
+            fully_remove_card(c)
         end
         area.cards = {}
+    end
+    if area and area.highlighted then
+        area.highlighted = {}
+    end
+end
+ShopGen.clear_card_area = clear_card_area
+
+-- Sweep through all engine tracking tables and remove any dead objects
+local function prune_engine_tables()
+    if G.MOVEABLES then
+        for i = #G.MOVEABLES, 1, -1 do
+            if G.MOVEABLES[i] and G.MOVEABLES[i].REMOVED then
+                table.remove(G.MOVEABLES, i)
+            end
+        end
+    end
+    if G.I then
+        for _, tbl in pairs(G.I) do
+            if type(tbl) == 'table' then
+                for i = #tbl, 1, -1 do
+                    if tbl[i] and tbl[i].REMOVED then
+                        table.remove(tbl, i)
+                    end
+                end
+            end
+        end
+    end
+    if G.STAGE_OBJECTS then
+        for _, stage_tbl in pairs(G.STAGE_OBJECTS) do
+            if type(stage_tbl) == 'table' then
+                for i = #stage_tbl, 1, -1 do
+                    if stage_tbl[i] and stage_tbl[i].REMOVED then
+                        table.remove(stage_tbl, i)
+                    end
+                end
+            end
+        end
+    end
+    if G.ANIMATIONS then
+        for i = #G.ANIMATIONS, 1, -1 do
+            if G.ANIMATIONS[i] and G.ANIMATIONS[i].REMOVED then
+                table.remove(G.ANIMATIONS, i)
+            end
+        end
+    end
+end
+ShopGen.prune_engine_tables = prune_engine_tables
+
+-- Clear any lingering controller targets pointing to removed objects
+local function clear_controller_targets()
+    if G.CONTROLLER then
+        if G.CONTROLLER.hovering then
+            if G.CONTROLLER.hovering.target and G.CONTROLLER.hovering.target.REMOVED then
+                G.CONTROLLER.hovering.target = nil
+            end
+            if G.CONTROLLER.hovering.prev_target and G.CONTROLLER.hovering.prev_target.REMOVED then
+                G.CONTROLLER.hovering.prev_target = nil
+            end
+        end
+        if G.CONTROLLER.focused and G.CONTROLLER.focused.target and G.CONTROLLER.focused.target.REMOVED then
+            G.CONTROLLER.focused.target = nil
+        end
+        if G.CONTROLLER.clicked and G.CONTROLLER.clicked.target and G.CONTROLLER.clicked.target.REMOVED then
+            G.CONTROLLER.clicked.target = nil
+        end
+        if G.CONTROLLER.dragging and G.CONTROLLER.dragging.target and G.CONTROLLER.dragging.target.REMOVED then
+            G.CONTROLLER.dragging.target = nil
+        end
+    end
+end
+ShopGen.clear_controller_targets = clear_controller_targets
+
+-- Clear all event queues across all categories
+local function clear_all_event_queues()
+    if G.E_MANAGER and G.E_MANAGER.queues then
+        for _, q in pairs(G.E_MANAGER.queues) do
+            if type(q) == 'table' then
+                for i = #q, 1, -1 do
+                    if not q[i].no_delete then
+                        table.remove(q, i)
+                    end
+                end
+            end
+        end
+    end
+end
+ShopGen.clear_all_event_queues = clear_all_event_queues
+
+-- Full sweep & GC cycle
+function ShopGen.cleanup_cycle()
+    prune_engine_tables()
+    clear_controller_targets()
+    clear_all_event_queues()
+    collectgarbage("collect")
+    collectgarbage("collect")
+end
+
+-- Helper to immediately snap cards and areas to avoid easing/sliding delays
+local function snap_card_area(area)
+    if not area then return end
+    if area.align_cards then area:align_cards() end
+    if area.hard_set_VT then area:hard_set_VT() end
+    if area.cards then
+        for _, card in ipairs(area.cards) do
+            if card.hard_set_VT then card:hard_set_VT() end
+            if card.children then
+                for _, child in pairs(card.children) do
+                    if child and child.hard_set_VT then child:hard_set_VT() end
+                end
+            end
+        end
     end
 end
 
@@ -378,6 +547,8 @@ function G.DATASET_MOD:populate_consumables_area()
     end
 end
 
+
+
 -- =========================================================
 -- SETUP SHOP SCREEN
 -- =========================================================
@@ -387,6 +558,8 @@ function G.DATASET_MOD:setup_shop_screen()
     if G.booster_pack then
         G.booster_pack:remove()
         G.booster_pack = nil
+        G.pack_cards = nil
+        prune_engine_tables()
     end
 
     -- Cycle shop slots: 2 (no voucher) -> 3 (overstock tier 1) -> 4 (overstock tier 2)
@@ -396,20 +569,31 @@ function G.DATASET_MOD:setup_shop_screen()
     G.GAME.shop = G.GAME.shop or {}
     G.GAME.shop.joker_max = num_slots
 
-    -- Rebuild G.shop UIBox to match the slot width
-    if G.shop then
-        G.shop:remove()
-        G.shop = nil
+    -- Build G.shop UIBox ONCE to prevent leaking G.SHOP_SIGN, AnimatedSprites, and duplicate CardAreas
+    if not G.shop then
+        if G.UIDEF and G.UIDEF.shop then
+            G.shop = UIBox{
+                definition = G.UIDEF.shop(),
+                config = {align = 'tmi', offset = {x = 0, y = -5.3}, major = G.hand, bond = 'Weak'}
+            }
+        end
+    else
+        -- Update slot limits dynamically without destroying and rebuilding G.shop or leaking G.SHOP_SIGN!
+        if G.shop_jokers then
+            G.shop_jokers.config.card_limit = num_slots
+            G.shop_jokers.T.w = num_slots * 1.01 * G.CARD_W
+        end
+        if G.shop.recalculate then
+            G.shop:recalculate()
+        end
     end
 
-    if G.UIDEF and G.UIDEF.shop then
-        G.shop = UIBox{
-            definition = G.UIDEF.shop(),
-            config = {align = 'tmi', offset = {x = 0, y = G.ROOM.T.y + 11}, major = G.hand, bond = 'Weak'}
-        }
+    -- Unconditionally snap shop offset and state so it is NEVER left offscreen after pack phase
+    if G.shop then
         G.shop.alignment.offset.y = -5.3
-        G.STATE = G.STATES.SHOP
+        if G.shop.hard_set_VT then G.shop:hard_set_VT() end
     end
+    G.STATE = G.STATES.SHOP
 
     if G.shop_jokers then
         clear_card_area(G.shop_jokers)
@@ -476,9 +660,7 @@ function G.DATASET_MOD:setup_shop_screen()
             end
 
             if card then
-                if create_shop_card_ui then
-                    create_shop_card_ui(card, card_type, G.shop_jokers)
-                end
+                attach_shop_card_ui_sync(card)
                 G.shop_jokers:emplace(card)
             end
         end
@@ -495,6 +677,11 @@ function G.DATASET_MOD:setup_shop_screen()
     self:populate_consumables_area()
 
     self:randomize_background()
+
+    -- Snap all cards and areas immediately to eliminate sliding animations
+    snap_card_area(G.shop_jokers)
+    snap_card_area(G.jokers)
+    snap_card_area(G.consumeables)
 end
 
 -- =========================================================
@@ -505,10 +692,13 @@ function G.DATASET_MOD:setup_pack_screen()
 
     if G.shop then
         G.shop.alignment.offset.y = G.ROOM.T.y + 11
+        if G.shop.hard_set_VT then G.shop:hard_set_VT() end
     end
     if G.booster_pack then
         G.booster_pack:remove()
         G.booster_pack = nil
+        G.pack_cards = nil
+        prune_engine_tables()
     end
 
     -- 80% Buffoon pack, 20% evenly split between Tarot (Arcana), Spectral, and Planet (Celestial)
@@ -596,9 +786,10 @@ function G.DATASET_MOD:setup_pack_screen()
     if uibox_fn then
         G.booster_pack = UIBox{
             definition = uibox_fn(),
-            config = {align = "tmi", offset = {x = 0, y = G.ROOM.T.y + 9}, major = G.hand, bond = 'Weak'}
+            config = {align = "tmi", offset = {x = 0, y = -2.2}, major = G.hand, bond = 'Weak'}
         }
         G.booster_pack.alignment.offset.y = -2.2
+        if G.booster_pack.hard_set_VT then G.booster_pack:hard_set_VT() end
         G.STATE = pack_state
     end
 
@@ -650,6 +841,11 @@ function G.DATASET_MOD:setup_pack_screen()
     self:populate_consumables_area()
 
     self:randomize_background()
+
+    -- Snap all cards and areas immediately to eliminate sliding animations
+    snap_card_area(G.pack_cards)
+    snap_card_area(G.jokers)
+    snap_card_area(G.consumeables)
 end
 
 -- Step alternating generator: 100 on shop screen, then 100 on pack screen
@@ -674,6 +870,7 @@ function G.DATASET_MOD:generate_shop_step()
             print("DATASET: Completed 100 pack screens, switching to SHOP phase")
         end
     end
+    ShopGen.cleanup_cycle()
 end
 
 -- Toggle screen between Shop and Pack for manual testing/calibration (press 'P')
