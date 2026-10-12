@@ -141,8 +141,10 @@ function love.graphics.draw(drawable, arg1, arg2, arg3, arg4, arg5, arg6, arg7, 
         -- Skip the shadow quad (drawn with low alpha or dark colour)
         if ca > 0.9 and (cr > 0.1 or cg > 0.1 or cb > 0.1) then
             is_front = true
-            G.DATASET_MOD.captured_boxes = G.DATASET_MOD.captured_boxes or {}
-            if not G.DATASET_MOD.captured_boxes[card] then
+            G.DATASET_MOD.captured_boxes = G.DATASET_MOD.captured_boxes or setmetatable({}, {__mode = "k"})
+            local current_frame = (G.FRAMES and G.FRAMES.DRAW) or 0
+            if card._last_box_frame ~= current_frame then
+                card._last_box_frame = current_frame
                 local draw_args = {}
                 if type(arg1) == "userdata" and arg1.typeOf and arg1:typeOf("Quad") then
                     draw_args = {arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10}
@@ -188,6 +190,16 @@ function Card:draw(layer)
             end
             if not tracked and G.pack_cards and G.pack_cards.cards then
                 for _, c in ipairs(G.pack_cards.cards) do
+                    if c == self then tracked = true; break end
+                end
+            end
+            if not tracked and G.shop_vouchers and G.shop_vouchers.cards then
+                for _, c in ipairs(G.shop_vouchers.cards) do
+                    if c == self then tracked = true; break end
+                end
+            end
+            if not tracked and G.shop_booster and G.shop_booster.cards then
+                for _, c in ipairs(G.shop_booster.cards) do
                     if c == self then tracked = true; break end
                 end
             end

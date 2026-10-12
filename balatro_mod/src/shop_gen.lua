@@ -9,6 +9,42 @@ ShopGen.cached_non_legendary_jokers = nil
 ShopGen.cached_tarots = nil
 ShopGen.cached_spectrals = nil
 ShopGen.cached_planets = nil
+ShopGen.cached_vouchers = nil
+ShopGen.cached_boosters = nil
+
+function ShopGen.get_all_vouchers()
+    if ShopGen.cached_vouchers and #ShopGen.cached_vouchers > 0 then
+        return ShopGen.cached_vouchers
+    end
+    local list = {}
+    if G.P_CENTERS then
+        for k, v in pairs(G.P_CENTERS) do
+            if v.set == 'Voucher' and k ~= 'v_undiscovered' and k ~= 'v_locked' then
+                table.insert(list, v)
+            end
+        end
+        table.sort(list, function(a, b) return (a.key or "") < (b.key or "") end)
+    end
+    ShopGen.cached_vouchers = list
+    return list
+end
+
+function ShopGen.get_all_boosters()
+    if ShopGen.cached_boosters and #ShopGen.cached_boosters > 0 then
+        return ShopGen.cached_boosters
+    end
+    local list = {}
+    if G.P_CENTERS then
+        for k, v in pairs(G.P_CENTERS) do
+            if v.set == 'Booster' and k ~= 'p_undiscovered' and k ~= 'p_up' and k ~= 'p_profile' then
+                table.insert(list, v)
+            end
+        end
+        table.sort(list, function(a, b) return (a.key or "") < (b.key or "") end)
+    end
+    ShopGen.cached_boosters = list
+    return list
+end
 
 function ShopGen.get_all_jokers(allow_legendary)
     if allow_legendary == nil then allow_legendary = true end
@@ -36,6 +72,21 @@ function ShopGen.get_all_jokers(allow_legendary)
     ShopGen.cached_non_legendary_jokers = non_leg_j
 
     return allow_legendary and all_j or non_leg_j
+end
+
+function ShopGen.get_copyable_jokers()
+    if ShopGen.cached_copyable_jokers and #ShopGen.cached_copyable_jokers > 0 then
+        return ShopGen.cached_copyable_jokers
+    end
+    local list = {}
+    local all_j = ShopGen.get_all_jokers(true)
+    for _, center in ipairs(all_j) do
+        if center.blueprint_compat and center.key ~= 'j_blueprint' and center.key ~= 'j_brainstorm' then
+            table.insert(list, center)
+        end
+    end
+    ShopGen.cached_copyable_jokers = list
+    return list
 end
 
 function ShopGen.get_all_consumables(set_type, include_hidden)
@@ -110,14 +161,36 @@ function G.DATASET_MOD:get_joker_pools()
 end
 
 -- Create a fully randomized Joker card
-function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legendary)
+function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legendary, spawn_x, spawn_y, boost_blueprint_odds)
     if allow_legendary == nil then allow_legendary = true end
     local jokers = ShopGen.get_all_jokers(allow_legendary)
     if #jokers == 0 then return nil end
-    local center = forced_center or jokers[math.random(#jokers)]
+
+    local center = forced_center
+    if not center then
+        if boost_blueprint_odds then
+            -- 10x relative odds for j_blueprint and j_brainstorm
+            local bp_center = G.P_CENTERS and G.P_CENTERS['j_blueprint']
+            local bs_center = G.P_CENTERS and G.P_CENTERS['j_brainstorm']
+            local total_weight = #jokers + 18
+            local roll = math.random() * total_weight
+            if roll < 10 and bp_center then
+                center = bp_center
+            elseif roll < 20 and bs_center then
+                center = bs_center
+            else
+                center = jokers[math.random(#jokers)]
+            end
+        else
+            center = jokers[math.random(#jokers)]
+        end
+    end
+
+    local sx = spawn_x or (area.T.x + area.T.w / 2)
+    local sy = spawn_y or area.T.y
 
     local card = Card(
-        area.T.x + area.T.w / 2, area.T.y,
+        sx, sy,
         G.CARD_W, G.CARD_H,
         nil, center,
         {
@@ -184,18 +257,55 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
         end
     end
 
+    -- Blueprint Mod appearance effect:
+    -- If this card is Blueprint or Brainstorm on the joker bar, apply the copying shader effect
+    -- to mimic a random copyable joker ~70% of the time, and keep vanilla textures ~30% of the time.
+    if (center.key == 'j_blueprint' or center.key == 'j_brainstorm') and area == G.jokers then
+        if math.random() < 0.70 then
+            local copyables = ShopGen.get_copyable_jokers()
+            if copyables and #copyables > 0 then
+                local chosen_target = copyables[math.random(#copyables)]
+                local dummy = Card(
+                    0, 0, G.CARD_W, G.CARD_H,
+                    nil, chosen_target,
+                    {bypass_discovery_center = true, bypass_discovery_ui = true}
+                )
+                card.dataset_mimic_target = dummy
+                card.dataset_mimic_dummy = dummy
+                card.custom_art_variant = "mimic_" .. chosen_target.key
+
+                if Blueprint then
+                    if center.key == 'j_brainstorm' and Blueprint.apply_brainstorm_sprite and Blueprint.brainstorm_enabled then
+                        Blueprint.apply_brainstorm_sprite(card, dummy)
+                    elseif center.key == 'j_blueprint' and Blueprint.apply_blueprint_sprite then
+                        Blueprint.apply_blueprint_sprite(card, dummy)
+                    end
+                end
+            end
+        else
+            card.dataset_mimic_target = false
+            card.custom_art_variant = "vanilla"
+            if Blueprint and Blueprint.restore_card_sprite then
+                Blueprint.restore_card_sprite(card)
+            end
+        end
+    end
+
     return card
 end
 
 -- Create a consumable card (Tarot, Spectral, Planet)
-function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_center)
+function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_center, spawn_x, spawn_y)
     local _, tarots, spectrals, planets = self:get_joker_pools()
     local pool = (set_type == 'Tarot' and tarots) or (set_type == 'Spectral' and spectrals) or planets
     if not pool or #pool == 0 then return nil end
     local center = forced_center or pool[math.random(#pool)]
 
+    local sx = spawn_x or (area.T.x + area.T.w / 2)
+    local sy = spawn_y or area.T.y
+
     local card = Card(
-        area.T.x + area.T.w / 2, area.T.y,
+        sx, sy,
         G.CARD_W, G.CARD_H,
         nil, center,
         {
@@ -207,30 +317,121 @@ function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_cent
     return card
 end
 
--- Helper to attach shop card price and buy tags synchronously without queuing delayed events in G.E_MANAGER
+-- Create a voucher card
+function G.DATASET_MOD:create_random_voucher_card(area, forced_center, spawn_x, spawn_y)
+    local vouchers = ShopGen.get_all_vouchers()
+    if #vouchers == 0 then return nil end
+    local center = forced_center or vouchers[math.random(#vouchers)]
+
+    local sx = spawn_x or (area.T.x + area.T.w / 2)
+    local sy = spawn_y or area.T.y
+
+    local card = Card(
+        sx, sy,
+        G.CARD_W, G.CARD_H,
+        G.P_CARDS.empty, center,
+        {
+            bypass_discovery_center = true,
+            bypass_discovery_ui = true
+        }
+    )
+    card.shop_voucher = true
+    card.custom_art_variant = "default"
+
+    -- BUMod v_hone variant integration if v_hone rolled
+    if center.key == 'v_hone' and math.random() < 0.50 then
+        local img = ShopGen.get_variant_image("v_hone.png")
+        if img and card.children and card.children.center then
+            card.children.center.image = img
+            card.children.center.quad = ShopGen.get_quad(0, 0, 71 * 2, 95 * 2, 142, 190)
+            card.custom_art_variant = "bumod_v_hone"
+        end
+    end
+
+    return card
+end
+
+local spectral_frame_map = {
+    p_spectral_normal_1 = 0,
+    p_spectral_normal_2 = 1,
+    p_spectral_jumbo_1 = 2,
+    p_spectral_mega_1 = 3
+}
+
+-- Create a booster pack card
+function G.DATASET_MOD:create_random_booster_card(area, forced_center, spawn_x, spawn_y, booster_pos)
+    local boosters = ShopGen.get_all_boosters()
+    if #boosters == 0 then return nil end
+    local center = forced_center or boosters[math.random(#boosters)]
+
+    local sx = spawn_x or (area.T.x + area.T.w / 2)
+    local sy = spawn_y or area.T.y
+
+    local card = Card(
+        sx, sy,
+        G.CARD_W * 1.27, G.CARD_H * 1.27,
+        G.P_CARDS.empty, center,
+        {
+            bypass_discovery_center = true,
+            bypass_discovery_ui = true
+        }
+    )
+    if booster_pos then
+        card.ability.booster_pos = booster_pos
+    end
+    card.custom_art_variant = "default"
+
+    -- Mix in Balatro University custom spectral pack arts (~50% chance for spectral packs)
+    local spec_idx = spectral_frame_map[center.key]
+    if spec_idx ~= nil and math.random() < 0.50 then
+        local img = ShopGen.get_variant_image("spectral_trans.png")
+        if img and card.children and card.children.center then
+            card.children.center.image = img
+            card.children.center.quad = ShopGen.get_quad(spec_idx * 142, 0, 142, 190, 568, 190)
+            card.custom_art_variant = "bumod_spectral_trans"
+        end
+    end
+
+    return card
+end
+
+-- Helper to attach shop card price tag synchronously without queuing delayed events in G.E_MANAGER
 local function attach_shop_card_ui_sync(card)
     if not card then return end
-    local cost_str = card.cost and tostring(card.cost) or "4"
+    if card.set_cost then card:set_cost() end
+
+    if card.children and card.children.price then
+        pcall(function() card.children.price:remove() end)
+        card.children.price = nil
+    end
+
     local t1 = {
         n=G.UIT.ROOT, config = {minw = 0.6, align = 'tm', colour = darken(G.C.BLACK, 0.2), shadow = true, r = 0.05, padding = 0.05, minh = 1}, nodes={
             {n=G.UIT.R, config={align = "cm", colour = lighten(G.C.BLACK, 0.1), r = 0.1, minw = 1, minh = 0.55, emboss = 0.05, padding = 0.03}, nodes={
-                {n=G.UIT.T, config={text = "$" .. cost_str, colour = G.C.MONEY, scale = 0.4}}
+                {n=G.UIT.O, config={object = DynaText({
+                    string = {{prefix = localize('$'), ref_table = card, ref_value = 'cost'}},
+                    colours = {G.C.MONEY},
+                    shadow = true,
+                    silent = true,
+                    bump = false,
+                    scale = 0.5,
+                    min_cycle_time = 0
+                })}},
             }}
         }
     }
-    local t2 = {
-        n=G.UIT.ROOT, config = {minw = 1.1, maxw = 1.3, padding = 0.1, align = 'bm', colour = G.C.GOLD, shadow = true, r = 0.08, minh = 0.94}, nodes={
-            {n=G.UIT.T, config={text = "BUY", colour = G.C.WHITE, scale = 0.45}}
-        }
-    }
+
+    local target_offset_y = (card.ability and card.ability.set == 'Booster') and 0.5 or 0.38
+
     card.children.price = UIBox{
         definition = t1,
-        config = {align="tm", offset = {x=0, y=1.5}, major = card, bond = 'Weak', parent = card}
+        config = {align = "tm", offset = {x = 0, y = target_offset_y}, major = card, bond = 'Strong', parent = card}
     }
-    card.children.buy_button = UIBox{
-        definition = t2,
-        config = {align="bm", offset = {x=0, y=-0.3}, major = card, bond = 'Weak', parent = card}
-    }
+    if card.children.price then
+        card.children.price.alignment.offset.y = target_offset_y
+        if card.children.price.align_to_major then card.children.price:align_to_major() end
+        if card.children.price.hard_set_VT then card.children.price:hard_set_VT() end
+    end
 end
 
 -- Helper to safely and completely sever all references to a Card and its child objects
@@ -238,6 +439,15 @@ local function fully_remove_card(card)
     if not card then return end
     if G.DATASET_MOD and G.DATASET_MOD.captured_boxes then
         G.DATASET_MOD.captured_boxes[card] = nil
+    end
+    if card.dataset_mimic_dummy then
+        fully_remove_card(card.dataset_mimic_dummy)
+        card.dataset_mimic_dummy = nil
+        card.dataset_mimic_target = nil
+    end
+    if card.blueprint_sprite_copy then
+        pcall(function() card.blueprint_sprite_copy:remove() end)
+        card.blueprint_sprite_copy = nil
     end
     if card.area then
         card:remove_from_area()
@@ -372,7 +582,10 @@ local function snap_card_area(area)
             if card.hard_set_VT then card:hard_set_VT() end
             if card.children then
                 for _, child in pairs(card.children) do
-                    if child and child.hard_set_VT then child:hard_set_VT() end
+                    if child then
+                        if child.align_to_major then child:align_to_major() end
+                        if child.hard_set_VT then child:hard_set_VT() end
+                    end
                 end
             end
         end
@@ -420,8 +633,11 @@ function G.DATASET_MOD:populate_joker_bar()
         end
     end
 
+    -- 50% chance for each shop generation to boost Blueprint / Brainstorm spawn odds by 10x
+    local boost_blueprint = (math.random() < 0.50)
+
     for i = 1, num_jokers do
-        local card = self:create_random_joker_card(G.jokers, nil, true)
+        local card = self:create_random_joker_card(G.jokers, nil, true, nil, nil, boost_blueprint)
         if card then
             if debuff_indices[i] then
                 if card.set_debuff then
@@ -571,33 +787,51 @@ function G.DATASET_MOD:setup_shop_screen()
 
     -- Build G.shop UIBox ONCE to prevent leaking G.SHOP_SIGN, AnimatedSprites, and duplicate CardAreas
     if not G.shop then
+        local saved_joker_max = G.GAME.shop.joker_max
+        G.GAME.shop.joker_max = 2
         if G.UIDEF and G.UIDEF.shop then
             G.shop = UIBox{
                 definition = G.UIDEF.shop(),
                 config = {align = 'tmi', offset = {x = 0, y = -5.3}, major = G.hand, bond = 'Weak'}
             }
         end
-    else
-        -- Update slot limits dynamically without destroying and rebuilding G.shop or leaking G.SHOP_SIGN!
-        if G.shop_jokers then
-            G.shop_jokers.config.card_limit = num_slots
-            G.shop_jokers.T.w = num_slots * 1.01 * G.CARD_W
-        end
-        if G.shop.recalculate then
-            G.shop:recalculate()
-        end
+        G.GAME.shop.joker_max = saved_joker_max
     end
 
-    -- Unconditionally snap shop offset and state so it is NEVER left offscreen after pack phase
+    -- Update slot limits dynamically using vanilla base game sizing so cards are never squished
+    if G.shop_jokers then
+        G.shop_jokers.config.card_limit = num_slots
+        G.shop_jokers.T.w = num_slots * 1.02 * G.CARD_W
+    end
+    if G.shop and G.shop.recalculate then
+        G.shop:recalculate()
+    end
+
+    -- Instantly snap shop offset, alignment, and entire internal UI tree so position shifts happen immediately without sliding lag
     if G.shop then
         G.shop.alignment.offset.y = -5.3
+        if G.shop.align_to_major then G.shop:align_to_major() end
         if G.shop.hard_set_VT then G.shop:hard_set_VT() end
+        if G.shop.velocity then G.shop.velocity.x = 0; G.shop.velocity.y = 0 end
+        if G.shop.UIRoot then
+            local function snap_node(n)
+                if not n then return end
+                if n.hard_set_VT then n:hard_set_VT() end
+                if n.children then
+                    for _, child in pairs(n.children) do
+                        snap_node(child)
+                    end
+                end
+            end
+            snap_node(G.shop.UIRoot)
+        end
     end
     G.STATE = G.STATES.SHOP
 
     if G.shop_jokers then
         clear_card_area(G.shop_jokers)
         G.shop_jokers.config.card_limit = num_slots
+        G.shop_jokers.config.temp_limit = num_slots
 
         -- 10% chance for Showman effect (allows duplicate cards in shop)
         local has_showman = (math.random() < 0.10)
@@ -612,6 +846,9 @@ function G.DATASET_MOD:setup_shop_screen()
             local roll = math.random()
             local card = nil
             local card_type = 'Joker'
+
+            local slot_x = G.shop_jokers.T.x + (G.shop_jokers.T.w - G.shop_jokers.card_w) * ((i - 1) / math.max(num_slots - 1, 1)) + 0.5 * (G.shop_jokers.card_w - G.CARD_W)
+            local slot_y = G.shop_jokers.T.y + G.shop_jokers.T.h / 2 - G.CARD_H / 2
 
             if roll < 0.70 then
                 card_type = 'Joker'
@@ -630,7 +867,7 @@ function G.DATASET_MOD:setup_shop_screen()
                         used_shop_keys[chosen_center.key] = true
                     end
                 end
-                card = self:create_random_joker_card(G.shop_jokers, chosen_center, false)
+                card = self:create_random_joker_card(G.shop_jokers, chosen_center, false, slot_x, slot_y)
             else
                 local pool
                 if roll < 0.80 then
@@ -656,17 +893,171 @@ function G.DATASET_MOD:setup_shop_screen()
                         used_shop_keys[chosen_center.key] = true
                     end
                 end
-                card = self:create_random_consumable_card(G.shop_jokers, card_type, chosen_center)
+                card = self:create_random_consumable_card(G.shop_jokers, card_type, chosen_center, slot_x, slot_y)
             end
 
             if card then
-                attach_shop_card_ui_sync(card)
-                G.shop_jokers:emplace(card)
+                table.insert(G.shop_jokers.cards, card)
+                card:set_card_area(G.shop_jokers)
             end
         end
 
+        G.shop_jokers:set_ranks()
         if G.shop_jokers.align_cards then
             G.shop_jokers:align_cards()
+        end
+
+        snap_card_area(G.shop_jokers)
+
+        if G.shop_jokers.cards then
+            for _, c in ipairs(G.shop_jokers.cards) do
+                attach_shop_card_ui_sync(c)
+            end
+        end
+    end
+
+    -- Populate Vouchers (G.shop_vouchers):
+    -- Distribution: 90% 1 voucher, 3% 2 vouchers, 2% 3-4 vouchers, 5% 0 vouchers
+    local v_roll = math.random()
+    local num_vouchers = 1
+    if v_roll < 0.90 then
+        num_vouchers = 1
+    elseif v_roll < 0.93 then
+        num_vouchers = 2
+    elseif v_roll < 0.95 then
+        num_vouchers = math.random(3, 4)
+    else
+        num_vouchers = 0
+    end
+
+    if G.shop_vouchers then
+        clear_card_area(G.shop_vouchers)
+        G.shop_vouchers.config.card_limit = math.max(1, num_vouchers)
+        G.shop_vouchers.config.temp_limit = math.max(1, num_vouchers)
+
+        if num_vouchers > 0 then
+            local all_vouchers = ShopGen.get_all_vouchers()
+            local used_v_keys = {}
+
+            for i = 1, num_vouchers do
+                local chosen_v = nil
+                for attempt = 1, 30 do
+                    local cand = all_vouchers[math.random(#all_vouchers)]
+                    if not used_v_keys[cand.key] then
+                        chosen_v = cand
+                        break
+                    end
+                end
+                chosen_v = chosen_v or all_vouchers[math.random(#all_vouchers)]
+                used_v_keys[chosen_v.key] = true
+
+                local slot_x
+                if num_vouchers == 1 then
+                    slot_x = G.shop_vouchers.T.x + 0.5 * (G.shop_vouchers.T.w - G.CARD_W)
+                else
+                    slot_x = G.shop_vouchers.T.x + (G.shop_vouchers.T.w - G.CARD_W) * ((i - 1) / (num_vouchers - 1))
+                end
+                local slot_y = G.shop_vouchers.T.y + G.shop_vouchers.T.h / 2 - G.CARD_H / 2
+
+                local card = self:create_random_voucher_card(G.shop_vouchers, chosen_v, slot_x, slot_y)
+                if card then
+                    table.insert(G.shop_vouchers.cards, card)
+                    card:set_card_area(G.shop_vouchers)
+                end
+            end
+
+            G.shop_vouchers:set_ranks()
+            if G.shop_vouchers.align_cards then
+                G.shop_vouchers:align_cards()
+            end
+            snap_card_area(G.shop_vouchers)
+
+            if G.shop_vouchers.cards then
+                for _, c in ipairs(G.shop_vouchers.cards) do
+                    attach_shop_card_ui_sync(c)
+                end
+            end
+        end
+    end
+
+    -- Populate Booster Packs (G.shop_booster):
+    -- Distribution: 49.9% 2 packs, 49.9% 1 pack, 0.2% empty (0 packs)
+    local p_roll = math.random()
+    local num_packs = 2
+    if p_roll < 0.499 then
+        num_packs = 2
+    elseif p_roll < 0.998 then
+        num_packs = 1
+    else
+        num_packs = 0
+    end
+
+    if G.shop_booster then
+        clear_card_area(G.shop_booster)
+        G.shop_booster.config.card_limit = 2
+        G.shop_booster.config.temp_limit = 2
+
+        if not G.shop_booster._gdcv_align_hooked then
+            G.shop_booster._gdcv_align_hooked = true
+            local orig_booster_align = G.shop_booster.align_cards
+            G.shop_booster.align_cards = function(area)
+                orig_booster_align(area)
+                if area.cards and #area.cards == 1 and area.cards[1].ability and area.cards[1].ability.booster_pos == 2 then
+                    area.cards[1].T.x = area.T.x + (area.T.w - area.card_w)
+                end
+            end
+        end
+
+        if num_packs > 0 then
+            local all_boosters = ShopGen.get_all_boosters()
+            local used_p_keys = {}
+
+            if num_packs == 2 then
+                for i = 1, 2 do
+                    local chosen_b = nil
+                    for attempt = 1, 30 do
+                        local cand = all_boosters[math.random(#all_boosters)]
+                        if not used_p_keys[cand.key] then
+                            chosen_b = cand
+                            break
+                        end
+                    end
+                    chosen_b = chosen_b or all_boosters[math.random(#all_boosters)]
+                    used_p_keys[chosen_b.key] = true
+
+                    local slot_x = (i == 1) and G.shop_booster.T.x or (G.shop_booster.T.x + G.shop_booster.T.w - G.shop_booster.card_w)
+                    local slot_y = G.shop_booster.T.y + G.shop_booster.T.h / 2 - (1.27 * G.CARD_H) / 2
+
+                    local card = self:create_random_booster_card(G.shop_booster, chosen_b, slot_x, slot_y, i)
+                    if card then
+                        table.insert(G.shop_booster.cards, card)
+                        card:set_card_area(G.shop_booster)
+                    end
+                end
+            elseif num_packs == 1 then
+                local chosen_slot = (math.random() < 0.5) and 1 or 2
+                local chosen_b = all_boosters[math.random(#all_boosters)]
+                local slot_x = (chosen_slot == 1) and G.shop_booster.T.x or (G.shop_booster.T.x + G.shop_booster.T.w - G.shop_booster.card_w)
+                local slot_y = G.shop_booster.T.y + G.shop_booster.T.h / 2 - (1.27 * G.CARD_H) / 2
+
+                local card = self:create_random_booster_card(G.shop_booster, chosen_b, slot_x, slot_y, chosen_slot)
+                if card then
+                    table.insert(G.shop_booster.cards, card)
+                    card:set_card_area(G.shop_booster)
+                end
+            end
+
+            G.shop_booster:set_ranks()
+            if G.shop_booster.align_cards then
+                G.shop_booster:align_cards()
+            end
+            snap_card_area(G.shop_booster)
+
+            if G.shop_booster.cards then
+                for _, c in ipairs(G.shop_booster.cards) do
+                    attach_shop_card_ui_sync(c)
+                end
+            end
         end
     end
 
@@ -680,6 +1071,8 @@ function G.DATASET_MOD:setup_shop_screen()
 
     -- Snap all cards and areas immediately to eliminate sliding animations
     snap_card_area(G.shop_jokers)
+    snap_card_area(G.shop_vouchers)
+    snap_card_area(G.shop_booster)
     snap_card_area(G.jokers)
     snap_card_area(G.consumeables)
 end
@@ -796,6 +1189,7 @@ function G.DATASET_MOD:setup_pack_screen()
     if G.pack_cards then
         clear_card_area(G.pack_cards)
         G.pack_cards.config.card_limit = pack_size
+        G.pack_cards.config.temp_limit = pack_size
 
         local used_pack_keys = {}
 
@@ -816,19 +1210,24 @@ function G.DATASET_MOD:setup_pack_screen()
                 end
             end
 
+            local slot_x = G.pack_cards.T.x + (G.pack_cards.T.w - G.pack_cards.card_w) * ((i - 1) / math.max(pack_size - 1, 1)) + 0.5 * (G.pack_cards.card_w - G.CARD_W)
+            local slot_y = G.pack_cards.T.y + G.pack_cards.T.h / 2 - G.CARD_H / 2
+
             local card
             if card_type == 'Joker' then
-                card = self:create_random_joker_card(G.pack_cards, chosen_center, false)
+                card = self:create_random_joker_card(G.pack_cards, chosen_center, false, slot_x, slot_y)
             else
                 local set_name = (chosen_center and chosen_center.set) or card_type
-                card = self:create_random_consumable_card(G.pack_cards, set_name, chosen_center)
+                card = self:create_random_consumable_card(G.pack_cards, set_name, chosen_center, slot_x, slot_y)
             end
 
             if card then
-                G.pack_cards:emplace(card)
+                table.insert(G.pack_cards.cards, card)
+                card:set_card_area(G.pack_cards)
             end
         end
 
+        G.pack_cards:set_ranks()
         if G.pack_cards.align_cards then
             G.pack_cards:align_cards()
         end

@@ -21,6 +21,8 @@ local DEFAULT_CONFIG = {
         joker_bar_card   = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
         item_card        = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
         consumeable_card = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
+        voucher_card     = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
+        booster_card     = {w = 1.000000, h = 1.000000, ox = 0.000000,  oy = 0.000000},
     }
 }
 
@@ -222,6 +224,11 @@ function G.DATASET_MOD:load_config()
                                 oy = tonumber(v.oy) or (DEFAULT_CONFIG.boxes[k] and DEFAULT_CONFIG.boxes[k].oy or 0)
                             }
                         end
+                    end
+                end
+                for k, v in pairs(DEFAULT_CONFIG.boxes) do
+                    if not self.config.boxes[k] then
+                        self.config.boxes[k] = {w = v.w, h = v.h, ox = v.ox, oy = v.oy}
                     end
                 end
                 print("DATASET: Config loaded from boxes.lua!")

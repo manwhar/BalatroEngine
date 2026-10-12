@@ -52,9 +52,9 @@ class ShopItemResult:
         if self.rental:
             parts.append("[Rental]")
 
-        # Clean key to readable title (e.g. j_half_joker -> Half Joker)
+        # Clean key to readable title (e.g. j_half_joker -> Half Joker, v_hone -> Hone, p_arcana_mega_1 -> Arcana Mega 1)
         clean_key = self.key
-        if clean_key.startswith("j_") or clean_key.startswith("c_"):
+        if clean_key.startswith("j_") or clean_key.startswith("c_") or clean_key.startswith("v_") or clean_key.startswith("p_"):
             clean_key = clean_key[2:]
         readable_title = clean_key.replace("_", " ").title()
         parts.append(readable_title)
@@ -97,7 +97,9 @@ class ShopRecognitionPipeline:
             0: "Joker",
             1: "Tarot",
             2: "Spectral",
-            3: "Planet"
+            3: "Planet",
+            4: "Voucher",
+            5: "Booster"
         }
 
     def predict(self, image_input, conf_threshold=0.35, iou_threshold=0.45) -> list[ShopItemResult]:

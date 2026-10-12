@@ -72,6 +72,12 @@ function G.DATASET_MOD:calculate_boxes_for_card(card, draw_args)
     elseif card.area == G.shop_jokers or card.area == G.pack_cards then
         box_def = self.config.boxes.item_card
         box_name = "item_card"
+    elseif card.area == G.shop_vouchers then
+        box_def = self.config.boxes.voucher_card or {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396}
+        box_name = "voucher_card"
+    elseif card.area == G.shop_booster then
+        box_def = self.config.boxes.booster_card or {w = 1.0, h = 1.0, ox = 0.0, oy = 0.0}
+        box_name = "booster_card"
     else
         box_def = self.config.boxes.card
         box_name = "card"
@@ -273,7 +279,9 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
         ['Joker'] = 0,
         ['Tarot'] = 1,
         ['Spectral'] = 2,
-        ['Planet'] = 3
+        ['Planet'] = 3,
+        ['Voucher'] = 4,
+        ['Booster'] = 5
     }
 
     if card_list then
@@ -341,7 +349,16 @@ function G.DATASET_MOD:capture_frame_shop()
         -- 3. Capture active screen ROI (Shop or Pack)
         if current_phase == 'shop' then
             local roi_shop = self.config.rois.shop
-            local shop_cards = (G.shop_jokers and G.shop_jokers.cards) or {}
+            local shop_cards = {}
+            if G.shop_jokers and G.shop_jokers.cards then
+                for _, c in ipairs(G.shop_jokers.cards) do table.insert(shop_cards, c) end
+            end
+            if G.shop_vouchers and G.shop_vouchers.cards then
+                for _, c in ipairs(G.shop_vouchers.cards) do table.insert(shop_cards, c) end
+            end
+            if G.shop_booster and G.shop_booster.cards then
+                for _, c in ipairs(G.shop_booster.cards) do table.insert(shop_cards, c) end
+            end
             export_roi_dataset(self, img, roi_shop, shop_cards, "shop", current_frame, "shop")
         else
             local roi_pack = self.config.rois.pack

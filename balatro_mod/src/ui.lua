@@ -13,6 +13,8 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
     elseif t == 'box_item' then return self.config.boxes.item_card, 'box', "Box: Shop/Pack Item"
     elseif t == 'box_consumeable' then return self.config.boxes.consumeable_card, 'box', "Box: Consumable Card"
+    elseif t == 'box_voucher' then return self.config.boxes.voucher_card, 'box', "Box: Voucher Card"
+    elseif t == 'box_booster' then return self.config.boxes.booster_card, 'box', "Box: Booster Pack"
     elseif t == 'box_card' then return self.config.boxes.card, 'box', "Box: Hand Card"
     end
     return nil, nil, "None"
@@ -400,6 +402,16 @@ function G.DATASET_MOD:draw_debug()
                         if c == card then return true end
                     end
                 end
+                if G.shop_vouchers and G.shop_vouchers.cards then
+                    for _, c in ipairs(G.shop_vouchers.cards) do
+                        if c == card then return true end
+                    end
+                end
+                if G.shop_booster and G.shop_booster.cards then
+                    for _, c in ipairs(G.shop_booster.cards) do
+                        if c == card then return true end
+                    end
+                end
             else
                 if G.pack_cards and G.pack_cards.cards then
                     for _, c in ipairs(G.pack_cards.cards) do
@@ -425,6 +437,8 @@ function G.DATASET_MOD:draw_debug()
                 local is_sel_box = (self.selected_target == 'box_joker_bar' and box.box_name == 'joker_bar_card') or
                                    (self.selected_target == 'box_item' and box.box_name == 'item_card') or
                                    (self.selected_target == 'box_consumeable' and box.box_name == 'consumeable_card') or
+                                   (self.selected_target == 'box_voucher' and box.box_name == 'voucher_card') or
+                                   (self.selected_target == 'box_booster' and box.box_name == 'booster_card') or
                                    (self.selected_target == 'box_card' and box.box_name == 'card')
 
                 if box.box_name == 'joker_bar_card' then
@@ -433,6 +447,10 @@ function G.DATASET_MOD:draw_debug()
                     love.graphics.setColor(1, 0.4, 1, is_sel_box and 1.0 or 0.6)
                 elseif box.box_name == 'item_card' then
                     love.graphics.setColor(1, 1, 0, is_sel_box and 1.0 or 0.6)
+                elseif box.box_name == 'voucher_card' then
+                    love.graphics.setColor(0.3, 1, 0.3, is_sel_box and 1.0 or 0.6)
+                elseif box.box_name == 'booster_card' then
+                    love.graphics.setColor(1, 0.6, 0.1, is_sel_box and 1.0 or 0.6)
                 else
                     love.graphics.setColor(0, 1, 1, is_sel_box and 1.0 or 0.6)
                 end
@@ -470,7 +488,7 @@ function G.DATASET_MOD:draw_debug()
 
     love.graphics.setColor(0.3, 0.9, 1, 1)
     if self.config.mode == 'shop_classifier' then
-        love.graphics.print("Keys: 1-4: ROIs | 5: Box Joker | 6: Box Item | 7: Box Consumable", 18, 58)
+        love.graphics.print("Keys: 1-4: ROIs | 5: Box Joker | 6: Box Item | 7: Box Consumable | 8: Box Voucher | 9: Box Booster", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card", 18, 58)
     end
@@ -543,6 +561,8 @@ function G.DATASET_MOD:on_keypressed(key)
             elseif key == '5' then self.selected_target = 'box_joker_bar'
             elseif key == '6' then self.selected_target = 'box_item'
             elseif key == '7' then self.selected_target = 'box_consumeable'
+            elseif key == '8' then self.selected_target = 'box_voucher'
+            elseif key == '9' then self.selected_target = 'box_booster'
             end
         end
 

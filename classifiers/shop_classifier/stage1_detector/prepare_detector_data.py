@@ -77,6 +77,8 @@ names:
   1: Tarot
   2: Spectral
   3: Planet
+  4: Voucher
+  5: Booster
 """
     with open(DATA_YAML, "w", encoding="utf-8") as f:
         f.write(yaml_content)
