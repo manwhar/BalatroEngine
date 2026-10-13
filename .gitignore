@@ -10,5 +10,4 @@ dataset
 dataset_shop
 runs
 weights
-*.pt
 balatro_source
