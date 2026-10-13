@@ -14,7 +14,7 @@ from config import Config
 from template import template_loader
 from matcher import find_element
 from shadow_evaluator import analyze_shadow_presence
-from geometry import PixelROI, crop_image_to_roi
+from geometry import ImageSize, PixelROI, crop_image_to_roi
 from debug_plotter import plot
 
 # Set to True to only visualize/show failed tests. Set to False to view all tests.
@@ -58,9 +58,13 @@ def run_visual_tests(show_only_failures: bool = SHOW_ONLY_FAILURES):
             best_roi_bounds = None
             best_image = None
             
+            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
             # We bypass eval_template.eval here so we can keep the highest match 
             # even if it fails the threshold check (which eval_template throws away)
-            for image, px_roi in product(template.images, template.px_rois):
+            for (image, image_gray, mask), px_roi in product(
+                zip(template.images, template.images_gray, template.masks), template.px_rois
+            ):
                 h_inp, w_inp = image.shape[:2]
                 img_h, img_w = img.shape[:2]
                 expanded_x1, expanded_y1, expanded_x2, expanded_y2 = px_roi.expanded_bounds(config.expand_roi_factor)
@@ -86,8 +90,19 @@ def run_visual_tests(show_only_failures: bool = SHOW_ONLY_FAILURES):
                 if (y2 - y1) < h_inp or (x2 - x1) < w_inp:
                     continue
                     
+                roi_img_gray = img_gray[y1:y2, x1:x2]
                 roi_img = img[y1:y2, x1:x2]
-                match = find_element(roi_img, image, config.matching_method, px_roi, config.elem_conf_thresh)
+                match = find_element(
+                    roi_img_gray,
+                    image_gray,
+                    mask,
+                    roi_img,
+                    image[:, :, :3],
+                    ImageSize(width=w_inp, height=h_inp),
+                    config.matching_method,
+                    px_roi,
+                    config.elem_conf_thresh,
+                )
                 abs_top_left = (match.top_left[0] + x1, match.top_left[1] + y1)
                 
                 if match.confidence > best_confidence:

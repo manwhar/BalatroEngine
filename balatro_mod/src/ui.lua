@@ -5,9 +5,11 @@ local UI = {}
 
 function G.DATASET_MOD:get_selected_object()
     local t = self.selected_target or 'roi_joker_bar'
-    if t == 'roi_joker_bar' then return self.config.rois.joker_bar, 'roi', "ROI: Joker Bar"
-    elseif t == 'roi_shop' then return self.config.rois.shop, 'roi', "ROI: Shop Area"
-    elseif t == 'roi_pack' then return self.config.rois.pack, 'roi', "ROI: Pack Area"
+    if t == 'roi_joker_bar' then return self.config.rois.joker_bar, 'roi', "ROI: Joker Bar (Top)"
+    elseif t == 'roi_shop' then return self.config.rois.shop, 'roi', "ROI: Shop Items (Jokers/Cards)"
+    elseif t == 'roi_voucher' then return self.config.rois.voucher, 'roi', "ROI: Voucher Shelf"
+    elseif t == 'roi_booster' then return self.config.rois.booster, 'roi', "ROI: Booster Packs (Shelf)"
+    elseif t == 'roi_pack' then return self.config.rois.pack, 'roi', "ROI: Booster Opening Screen"
     elseif t == 'roi_consumeables' then return self.config.rois.consumeables, 'roi', "ROI: Consumables (Top Right)"
     elseif t == 'roi_card_hand' then return self.config.rois.card_hand, 'roi', "ROI: Card Hand"
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
@@ -373,10 +375,17 @@ function G.DATASET_MOD:draw_debug()
         draw_roi_box(self.config.rois.consumeables, "[ROI: CONSUMABLES (TOP RIGHT)]", sel == 'roi_consumeables', 1.0, 0.4, 0.9)
 
         if (self.shop_phase or 'shop') == 'shop' or sel == 'roi_shop' then
-            draw_roi_box(self.config.rois.shop, "[ROI: SHOP SLOTS (UPPER RIGHT)]", sel == 'roi_shop', 1, 0.8, 0.2)
+            draw_roi_box(self.config.rois.shop, "[ROI: SHOP ITEMS]", sel == 'roi_shop', 1, 0.8, 0.2)
+        end
+        if (self.shop_phase or 'shop') == 'shop' or sel == 'roi_voucher' then
+            draw_roi_box(self.config.rois.voucher, "[ROI: VOUCHER SHELF]", sel == 'roi_voucher', 0.3, 1.0, 0.4)
+        end
+        if (self.shop_phase or 'shop') == 'shop' or sel == 'roi_booster' then
+            draw_roi_box(self.config.rois.booster, "[ROI: BOOSTER PACKS (SHELF)]", sel == 'roi_booster', 0.9, 0.6, 0.2)
         end
         if (self.shop_phase or 'shop') == 'pack' or sel == 'roi_pack' then
-            local p_name = string.format("[ROI: %s PACK]", string.upper(self.current_pack_kind or 'PACK'))
+            local kind_name = (self.current_pack_kind and self.current_pack_kind ~= 'Pack' and self.current_pack_kind) or 'BOOSTER'
+            local p_name = string.format("[ROI: %s OPENING SCREEN]", string.upper(kind_name))
             draw_roi_box(self.config.rois.pack, p_name, sel == 'roi_pack', 1, 0.3, 0.8)
         end
     end
@@ -488,7 +497,11 @@ function G.DATASET_MOD:draw_debug()
 
     love.graphics.setColor(0.3, 0.9, 1, 1)
     if self.config.mode == 'shop_classifier' then
-        love.graphics.print("Keys: 1-4: ROIs | 5: Box Joker | 6: Box Item | 7: Box Consumable | 8: Box Voucher | 9: Box Booster", 18, 58)
+        if (self.shop_phase or 'shop') == 'pack' then
+            love.graphics.print("Keys: 1: ROI Jokers | 3/0: ROI Pack Open | 4: ROI Consumables | 5: Box Joker | 6: Box Item", 18, 58)
+        else
+            love.graphics.print("Keys: 1: ROI Jokers | 2: ROI Shop | 3: ROI Boosters | 4: ROI Consumables | V: ROI Vouchers | 5-9: Boxes", 18, 58)
+        end
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card", 18, 58)
     end
@@ -556,8 +569,15 @@ function G.DATASET_MOD:on_keypressed(key)
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'
             elseif key == '2' then self.selected_target = 'roi_shop'
-            elseif key == '3' then self.selected_target = 'roi_pack'
+            elseif key == '3' then
+                if self.shop_phase == 'pack' then
+                    self.selected_target = 'roi_pack'
+                else
+                    self.selected_target = 'roi_booster'
+                end
             elseif key == '4' then self.selected_target = 'roi_consumeables'
+            elseif key == 'v' then self.selected_target = 'roi_voucher'
+            elseif key == '0' then self.selected_target = 'roi_pack'
             elseif key == '5' then self.selected_target = 'box_joker_bar'
             elseif key == '6' then self.selected_target = 'box_item'
             elseif key == '7' then self.selected_target = 'box_consumeable'

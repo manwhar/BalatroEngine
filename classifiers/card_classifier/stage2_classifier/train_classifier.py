@@ -86,7 +86,7 @@ def plot_attribute_confusion_matrix(cm, class_names, title, save_path):
 
 def run_train_classifier(
     epochs=25,
-    batch_size=128,
+    batch_size=256,
     lr=1e-3,
     backbone="mobilenet_v3_small",
     run_name="card_classifier",

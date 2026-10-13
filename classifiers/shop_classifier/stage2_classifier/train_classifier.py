@@ -25,11 +25,14 @@ WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
 
 try:
     from .config import ITEM_KEYS, EDITIONS
+    # pyrefly: ignore [missing-import]
     from .dataset import ItemCropDataset
+    # pyrefly: ignore [missing-import]
     from .model import MultiHeadItemClassifier
 except ImportError:
     from config import ITEM_KEYS, EDITIONS
     from dataset import ItemCropDataset
+    # pyrefly: ignore [missing-import]
     from model import MultiHeadItemClassifier
 
 
@@ -50,7 +53,7 @@ def get_next_run_dir(base_name="shop_classifier", exist_ok=False) -> Path:
 
 def run_train_classifier(
     epochs=25,
-    batch_size=128,
+    batch_size=256,
     lr=1e-3,
     backbone="mobilenet_v3_small",
     run_name="shop_classifier",
@@ -249,8 +252,8 @@ def run_train_classifier(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stage 2 Multi-Head Shop Item Classifier")
-    parser.add_argument("--epochs", type=int, default=25, help="Epoch count (default: 25)")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (default: 128)")
+    parser.add_argument("--epochs", type=int, default=15, help="Epoch count (default: 15)")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (default: 256)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"])
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")

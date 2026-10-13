@@ -25,7 +25,16 @@ except ImportError:
         CROP_WIDTH, CROP_HEIGHT
     )
 
-# ImageNet normalization
+import sys
+
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# pyrefly: ignore [missing-import]
+from classifiers.augmentations import BalatroStreamAugmentation
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
@@ -36,6 +45,7 @@ def get_transforms(is_train: bool = True):
             T.Resize((CROP_HEIGHT, CROP_WIDTH), interpolation=T.InterpolationMode.BILINEAR),
             T.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15),
             T.ToTensor(),
+            BalatroStreamAugmentation(compression_prob=0.5, cursor_prob=0.3),
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
     else:

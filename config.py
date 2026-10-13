@@ -24,8 +24,8 @@ class Config:
     shadow_threshold: float = 52.0
     skip_frames: int = 2  # skip n frames then use 1
 
-    start_timestamp: float = 0
-    end_timestamp: float = 1
+    start_timestamp: float = 30
+    end_timestamp: float = 100
 
     debug_plot: bool = False
     setup_mode: bool = False

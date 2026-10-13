@@ -21,6 +21,11 @@ PROJECT_ROOT = CURRENT_DIR.parent.parent
 DATASET_DIR = CURRENT_DIR / "dataset"
 WEIGHTS_DIR = CURRENT_DIR / "weights"
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
 # Ensure submodules are in python path
 sys.path.append(str(CURRENT_DIR / "stage1_detector"))
 sys.path.append(str(CURRENT_DIR / "stage2_classifier"))
@@ -51,9 +56,9 @@ def main():
     parser = argparse.ArgumentParser(description="Master Training Script for Two-Stage Shop Classifier")
     parser.add_argument("--stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Which stage to train")
     parser.add_argument("--epochs-detector", type=int, default=15, help="Epochs for Stage 1 detector (default: 15)")
-    parser.add_argument("--epochs-classifier", type=int, default=25, help="Epochs for Stage 2 classifier (default: 25)")
+    parser.add_argument("--epochs-classifier", type=int, default=15, help="Epochs for Stage 2 classifier (default: 15)")
     parser.add_argument("--batch-detector", type=int, default=16, help="Batch size for Stage 1")
-    parser.add_argument("--batch-classifier", type=int, default=128, help="Batch size for Stage 2 (default: 128)")
+    parser.add_argument("--batch-classifier", type=int, default=256, help="Batch size for Stage 2 (default: 256)")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader CPU workers for Stage 2")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"])
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")

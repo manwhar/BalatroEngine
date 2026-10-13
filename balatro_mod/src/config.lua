@@ -13,6 +13,8 @@ local DEFAULT_CONFIG = {
         card_hand    = {x = 508.319934, y = 567.839093, w = 1071.056521, h = 322.734447},
         joker_bar    = {x = 320.0,      y = 10.0,       w = 1280.0,      h = 260.0},
         shop         = {x = 360.0,      y = 140.0,      w = 1200.0,      h = 380.0},
+        voucher      = {x = 880.0,      y = 355.0,      w = 340.0,       h = 300.0},
+        booster      = {x = 1540.0,     y = 355.0,      w = 360.0,       h = 300.0},
         pack         = {x = 300.0,      y = 260.0,      w = 1320.0,      h = 500.0},
         consumeables = {x = 1250.0,     y = 10.0,       w = 420.0,       h = 260.0},
     },
@@ -211,6 +213,11 @@ function G.DATASET_MOD:load_config()
                                 h = tonumber(v.h) or (DEFAULT_CONFIG.rois[k] and DEFAULT_CONFIG.rois[k].h or 100)
                             }
                         end
+                    end
+                end
+                for k, v in pairs(DEFAULT_CONFIG.rois) do
+                    if not self.config.rois[k] then
+                        self.config.rois[k] = {x = v.x, y = v.y, w = v.w, h = v.h}
                     end
                 end
 

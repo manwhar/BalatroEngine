@@ -17,12 +17,20 @@ from ultralytics import YOLO
 CURRENT_DIR = Path(__file__).resolve().parent
 WEIGHTS_DIR = CURRENT_DIR / "weights"
 
-from stage2_classifier.config import (
-    IDX_TO_KEY, IDX_TO_EDITION,
-    CROP_WIDTH, CROP_HEIGHT
-)
-from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-from stage2_classifier.model import MultiHeadItemClassifier
+try:
+    from classifiers.shop_classifier.stage2_classifier.config import (
+        IDX_TO_KEY, IDX_TO_EDITION,
+        CROP_WIDTH, CROP_HEIGHT
+    )
+    from classifiers.shop_classifier.stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
+    from classifiers.shop_classifier.stage2_classifier.model import MultiHeadItemClassifier
+except ImportError:
+    from stage2_classifier.config import (
+        IDX_TO_KEY, IDX_TO_EDITION,
+        CROP_WIDTH, CROP_HEIGHT
+    )
+    from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
+    from stage2_classifier.model import MultiHeadItemClassifier
 
 
 @dataclass

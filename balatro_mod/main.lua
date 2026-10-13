@@ -137,9 +137,24 @@ function love.graphics.draw(drawable, arg1, arg2, arg3, arg4, arg5, arg6, arg7, 
     local card = nil
     if G.DATASET_MOD and G.DATASET_MOD.config and G.DATASET_MOD.config.mode ~= 'off' and G.DATASET_MOD.current_card then
         card = G.DATASET_MOD.current_card
+        -- Only capture bounding box if drawing the card's center or front sprite (not price tag UI or DynaText)
+        local is_card_sprite = false
+        if card.children then
+            if card.children.center and card.children.center.atlas and card.children.center.atlas.image == drawable then
+                is_card_sprite = true
+            elseif card.children.front and card.children.front.atlas and card.children.front.atlas.image == drawable then
+                is_card_sprite = true
+            elseif card.children.back and card.children.back.atlas and card.children.back.atlas.image == drawable then
+                is_card_sprite = true
+            elseif not card.children.center and not card.children.front then
+                is_card_sprite = true
+            end
+        else
+            is_card_sprite = true
+        end
+
         local cr, cg, cb, ca = love.graphics.getColor()
-        -- Skip the shadow quad (drawn with low alpha or dark colour)
-        if ca > 0.9 and (cr > 0.1 or cg > 0.1 or cb > 0.1) then
+        if is_card_sprite and ca > 0.9 and (cr > 0.1 or cg > 0.1 or cb > 0.1) then
             is_front = true
             G.DATASET_MOD.captured_boxes = G.DATASET_MOD.captured_boxes or setmetatable({}, {__mode = "k"})
             local current_frame = (G.FRAMES and G.FRAMES.DRAW) or 0

@@ -154,6 +154,46 @@
       }
     ]
   },
+  "Next Round": {
+    "label": "Next Round",
+    "filenames": [
+      "next_round.png"
+    ],
+    "rois": [
+      [
+        0.299,
+        0.3519,
+        0.4271,
+        0.4833
+      ]
+    ],
+    "shadow_dy": 6,
+    "shadow_dw": -13,
+    "test_frames": [
+      {
+        "path": "assets/testing/next_round/frame_3459_pressed_true.jpg",
+        "pressed": false,
+        "frame_idx": 3459
+      },
+      {
+        "path": "assets/testing/next_round/frame_4202_pressed_false.jpg",
+        "pressed": false,
+        "frame_idx": 4202
+      },
+      {
+        "path": "assets/testing/next_round/frame_4213_pressed_true.jpg",
+        "pressed": true,
+        "frame_idx": 4213
+      },
+      {
+        "path": "assets/testing/next_round/frame_4206_pressed_false.jpg",
+        "pressed": false,
+        "frame_idx": 4206
+      }
+    ],
+    "shadow_dh": -6,
+    "adjusted": true
+  },
   "Open Pack": {
     "label": "Open Pack",
     "filenames": [

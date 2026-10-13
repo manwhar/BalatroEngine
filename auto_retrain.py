@@ -79,10 +79,30 @@ def resolve_images_directory(model_type: str = "shop") -> tuple[Path, str, Path]
     return active_dir, model_type, train_script
 
 
-def count_images_in_dir(directory: Path) -> int:
+import re
+
+FRAME_REGEX = re.compile(r"frame_(\d+)", re.IGNORECASE)
+
+
+def get_dataset_counts(directory: Path) -> tuple[int, int]:
+    """
+    Returns (unique_frames_count, total_images_count).
+    Extracts frame numbers using regex 'frame_(\\d+)' so that multiple crop files
+    per frame (e.g. joker, consumables, shop/pack) map to 1 unique frame.
+    """
     if not directory.exists():
-        return 0
-    return len(list(directory.glob("*.png"))) + len(list(directory.glob("*.jpg")))
+        return 0, 0
+    frame_ids = set()
+    total_images = 0
+    for p in directory.iterdir():
+        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg"):
+            total_images += 1
+            m = FRAME_REGEX.search(p.name)
+            if m:
+                frame_ids.add(int(m.group(1)))
+            else:
+                frame_ids.add(p.name)
+    return len(frame_ids), total_images
 
 
 def wait_for_images(images_dir: Path, model_type: str, target_count: int = 10000, check_interval: int = 5):
@@ -91,7 +111,7 @@ def wait_for_images(images_dir: Path, model_type: str, target_count: int = 10000
     print("=" * 70)
     print(f"Target Model         : {model_type.upper()} CLASSIFIER")
     print(f"Monitoring Directory : {images_dir}")
-    print(f"Target Frame Count   : {target_count:,} images")
+    print(f"Target Frame Count   : {target_count:,} frames")
     print(f"Polling Interval     : Every {check_interval} seconds")
     print(f"Start Time           : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70 + "\n")
@@ -99,39 +119,42 @@ def wait_for_images(images_dir: Path, model_type: str, target_count: int = 10000
     images_dir.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
-    last_count = -1
+    last_frames = -1
     consecutive_done_checks = 0
 
     while True:
-        # Count images in monitored directory
-        count = count_images_in_dir(images_dir)
+        # Count unique frames and total images in monitored directory
+        frames, total_imgs = get_dataset_counts(images_dir)
 
         # If AppData is empty but repo has files (or vice versa), check both
         alt_dir = REPO_MOD_DIR / images_dir.parent.name / "images" if "AppData" in str(images_dir) else APPDATA_MOD_DIR / images_dir.parent.name / "images"
-        alt_count = count_images_in_dir(alt_dir)
-        total_detected = max(count, alt_count)
+        alt_frames, alt_imgs = get_dataset_counts(alt_dir)
+
+        total_frames = max(frames, alt_frames)
+        total_crops = max(total_imgs, alt_imgs)
 
         elapsed = time.time() - start_time
 
-        if total_detected != last_count:
-            pct = (total_detected / target_count) * 100.0 if target_count > 0 else 0.0
-            rate = total_detected / elapsed if elapsed > 0 else 0.0
-            remaining_secs = (target_count - total_detected) / rate if rate > 0 and total_detected < target_count else 0
-            eta_str = format_elapsed(remaining_secs) if total_detected < target_count else "Complete"
+        if total_frames != last_frames:
+            pct = (total_frames / target_count) * 100.0 if target_count > 0 else 0.0
+            rate = total_frames / elapsed if elapsed > 0 else 0.0
+            remaining_secs = (target_count - total_frames) / rate if rate > 0 and total_frames < target_count else 0
+            eta_str = format_elapsed(remaining_secs) if total_frames < target_count else "Complete"
 
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"Progress: {total_detected:5,d} / {target_count:,d} ({pct:5.1f}%) | "
-                f"Speed: {rate:4.1f} img/s | "
+                f"Frames: {total_frames:5,d} / {target_count:,d} ({pct:5.1f}%) | "
+                f"Crops: {total_crops:5,d} | "
+                f"Speed: {rate:4.1f} frames/s | "
                 f"Elapsed: {format_elapsed(elapsed)} | "
                 f"ETA: {eta_str}"
             )
-            last_count = total_detected
+            last_frames = total_frames
 
-        if total_detected >= target_count:
+        if total_frames >= target_count:
             consecutive_done_checks += 1
             if consecutive_done_checks >= 2:
-                print(f"\n[TARGET REACHED] Detected {total_detected:,} images in {format_elapsed(elapsed)}!")
+                print(f"\n[TARGET REACHED] Generated {total_frames:,} frames ({total_crops:,} crop images) in {format_elapsed(elapsed)}!")
                 break
         else:
             consecutive_done_checks = 0
@@ -150,7 +173,7 @@ def launch_training(train_script: Path, model_type: str, epochs_det: int = 15, e
         "--stage", "all",
         "--epochs-detector", str(epochs_det),
         "--epochs-classifier", str(epochs_cls),
-        "--batch-classifier", "128",
+        "--batch-classifier", "256",
         "--workers", "4"
     ]
     print(f"Executing: {' '.join(cmd)}\n" + "=" * 70 + "\n")
@@ -174,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--target", type=int, default=10000, help="Target image count (default: 10000)")
     parser.add_argument("--interval", type=int, default=5, help="Poll interval in seconds (default: 5)")
     parser.add_argument("--epochs-detector", type=int, default=15, help="Stage 1 detector epochs (default: 15)")
-    parser.add_argument("--epochs-classifier", type=int, default=25, help="Stage 2 classifier epochs (default: 25)")
+    parser.add_argument("--epochs-classifier", type=int, default=15, help="Stage 2 classifier epochs (default: 15)")
     args = parser.parse_args()
 
     images_dir, model_type, train_script = resolve_images_directory(args.model)

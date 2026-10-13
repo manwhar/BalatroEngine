@@ -53,9 +53,13 @@ def run_train_detector(
     print(f"Batch size   : {batch}")
     print(f"Data config  : {DATA_YAML}")
     print(f"Output dir   : {RUNS_DIR}")
-    print("=" * 60 + "\n")
-
     model = YOLO(model_name)
+
+    try:
+        from classifiers.augmentations import attach_batch_augmentations
+        attach_batch_augmentations(model, compression_prob=0.5, cursor_prob=0.3)
+    except Exception as e:
+        print(f"[Notice] Could not attach YOLO batch augmentations: {e}")
 
     results = model.train(
         data=str(DATA_YAML),

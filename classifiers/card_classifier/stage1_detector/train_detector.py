@@ -19,13 +19,12 @@ DATA_YAML = CURRENT_DIR / "data.yaml"
 RUNS_DIR = CURRENT_DIR / "runs"
 WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
 
-# Import augmentations from parent classifier train.py if available
-sys.path.append(str(CLASSIFIER_ROOT))
 try:
-    from train import attach_batch_augmentations, resolve_model_weights
+    from classifiers.augmentations import attach_batch_augmentations
 except ImportError:
     attach_batch_augmentations = None
-    resolve_model_weights = lambda m: m
+
+resolve_model_weights = lambda m: m
 
 def run_train_detector(
     model_name="yolov8n.pt",

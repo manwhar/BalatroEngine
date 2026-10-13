@@ -348,18 +348,29 @@ function G.DATASET_MOD:capture_frame_shop()
 
         -- 3. Capture active screen ROI (Shop or Pack)
         if current_phase == 'shop' then
+            -- 3a. Shop Items (Jokers, Consumables)
             local roi_shop = self.config.rois.shop
             local shop_cards = {}
             if G.shop_jokers and G.shop_jokers.cards then
                 for _, c in ipairs(G.shop_jokers.cards) do table.insert(shop_cards, c) end
             end
-            if G.shop_vouchers and G.shop_vouchers.cards then
-                for _, c in ipairs(G.shop_vouchers.cards) do table.insert(shop_cards, c) end
-            end
-            if G.shop_booster and G.shop_booster.cards then
-                for _, c in ipairs(G.shop_booster.cards) do table.insert(shop_cards, c) end
-            end
             export_roi_dataset(self, img, roi_shop, shop_cards, "shop", current_frame, "shop")
+
+            -- 3b. Dedicated Voucher Shelf
+            local roi_voucher = self.config.rois.voucher
+            local voucher_cards = {}
+            if G.shop_vouchers and G.shop_vouchers.cards then
+                for _, c in ipairs(G.shop_vouchers.cards) do table.insert(voucher_cards, c) end
+            end
+            export_roi_dataset(self, img, roi_voucher, voucher_cards, "shop_voucher", current_frame, "voucher")
+
+            -- 3c. Dedicated Booster Pack Area (Shelf)
+            local roi_booster = self.config.rois.booster
+            local booster_cards = {}
+            if G.shop_booster and G.shop_booster.cards then
+                for _, c in ipairs(G.shop_booster.cards) do table.insert(booster_cards, c) end
+            end
+            export_roi_dataset(self, img, roi_booster, booster_cards, "shop_booster", current_frame, "booster")
         else
             local roi_pack = self.config.rois.pack
             local pack_cards = (G.pack_cards and G.pack_cards.cards) or {}

@@ -572,19 +572,40 @@ function ShopGen.cleanup_cycle()
     collectgarbage("collect")
 end
 
--- Helper to immediately snap cards and areas to avoid easing/sliding delays
+-- Helper to immediately snap cards and areas to avoid easing/sliding delays and eliminate tilt/rotation
 local function snap_card_area(area)
     if not area then return end
     if area.align_cards then area:align_cards() end
     if area.hard_set_VT then area:hard_set_VT() end
     if area.cards then
         for _, card in ipairs(area.cards) do
+            -- Keep cards completely upright without ambient wobbling or fan-tilt
+            card.T.r = 0
+            card.ambient_tilt = 0
+            if card.tilt_var then
+                card.tilt_var.mx = 0
+                card.tilt_var.my = 0
+                card.tilt_var.dx = 0
+                card.tilt_var.dy = 0
+                card.tilt_var.amt = 0
+            end
+            if card.velocity then
+                card.velocity.x = 0
+                card.velocity.y = 0
+                card.velocity.r = 0
+                card.velocity.scale = 0
+            end
             if card.hard_set_VT then card:hard_set_VT() end
+            if card.VT then card.VT.r = 0 end
+
             if card.children then
                 for _, child in pairs(card.children) do
                     if child then
+                        if child.T then child.T.r = 0 end
+                        if child.velocity then child.velocity.r = 0 end
                         if child.align_to_major then child:align_to_major() end
                         if child.hard_set_VT then child:hard_set_VT() end
+                        if child.VT then child.VT.r = 0 end
                     end
                 end
             end
@@ -967,8 +988,15 @@ function G.DATASET_MOD:setup_shop_screen()
             end
 
             G.shop_vouchers:set_ranks()
-            if G.shop_vouchers.align_cards then
-                G.shop_vouchers:align_cards()
+            for k, c in ipairs(G.shop_vouchers.cards) do
+                c.T.r = 0
+                c.ambient_tilt = 0
+                if num_vouchers == 1 then
+                    c.T.x = G.shop_vouchers.T.x + 0.5 * (G.shop_vouchers.T.w - G.CARD_W)
+                else
+                    c.T.x = G.shop_vouchers.T.x + (G.shop_vouchers.T.w - G.CARD_W) * ((k - 1) / (num_vouchers - 1))
+                end
+                c.T.y = G.shop_vouchers.T.y + G.shop_vouchers.T.h / 2 - G.CARD_H / 2
             end
             snap_card_area(G.shop_vouchers)
 
@@ -997,15 +1025,9 @@ function G.DATASET_MOD:setup_shop_screen()
         G.shop_booster.config.card_limit = 2
         G.shop_booster.config.temp_limit = 2
 
-        if not G.shop_booster._gdcv_align_hooked then
-            G.shop_booster._gdcv_align_hooked = true
-            local orig_booster_align = G.shop_booster.align_cards
-            G.shop_booster.align_cards = function(area)
-                orig_booster_align(area)
-                if area.cards and #area.cards == 1 and area.cards[1].ability and area.cards[1].ability.booster_pos == 2 then
-                    area.cards[1].T.x = area.T.x + (area.T.w - area.card_w)
-                end
-            end
+        if G.shop_booster._gdcv_align_hooked then
+            G.shop_booster.align_cards = CardArea.align_cards
+            G.shop_booster._gdcv_align_hooked = nil
         end
 
         if num_packs > 0 then
@@ -1025,7 +1047,7 @@ function G.DATASET_MOD:setup_shop_screen()
                     chosen_b = chosen_b or all_boosters[math.random(#all_boosters)]
                     used_p_keys[chosen_b.key] = true
 
-                    local slot_x = (i == 1) and G.shop_booster.T.x or (G.shop_booster.T.x + G.shop_booster.T.w - G.shop_booster.card_w)
+                    local slot_x = (i == 1) and G.shop_booster.T.x or (G.shop_booster.T.x + G.shop_booster.T.w - 1.27 * G.CARD_W)
                     local slot_y = G.shop_booster.T.y + G.shop_booster.T.h / 2 - (1.27 * G.CARD_H) / 2
 
                     local card = self:create_random_booster_card(G.shop_booster, chosen_b, slot_x, slot_y, i)
@@ -1035,12 +1057,11 @@ function G.DATASET_MOD:setup_shop_screen()
                     end
                 end
             elseif num_packs == 1 then
-                local chosen_slot = (math.random() < 0.5) and 1 or 2
                 local chosen_b = all_boosters[math.random(#all_boosters)]
-                local slot_x = (chosen_slot == 1) and G.shop_booster.T.x or (G.shop_booster.T.x + G.shop_booster.T.w - G.shop_booster.card_w)
+                local slot_x = G.shop_booster.T.x + 0.5 * (G.shop_booster.T.w - 1.27 * G.CARD_W)
                 local slot_y = G.shop_booster.T.y + G.shop_booster.T.h / 2 - (1.27 * G.CARD_H) / 2
 
-                local card = self:create_random_booster_card(G.shop_booster, chosen_b, slot_x, slot_y, chosen_slot)
+                local card = self:create_random_booster_card(G.shop_booster, chosen_b, slot_x, slot_y, 1)
                 if card then
                     table.insert(G.shop_booster.cards, card)
                     card:set_card_area(G.shop_booster)
@@ -1277,9 +1298,15 @@ function G.DATASET_MOD:toggle_shop_screen_mode()
     if self.shop_phase == 'shop' then
         self.shop_phase = 'pack'
         self:setup_pack_screen()
+        if self.selected_target == 'roi_shop' or self.selected_target == 'roi_voucher' or self.selected_target == 'roi_booster' then
+            self.selected_target = 'roi_pack'
+        end
     else
         self.shop_phase = 'shop'
         self:setup_shop_screen()
+        if self.selected_target == 'roi_pack' then
+            self.selected_target = 'roi_shop'
+        end
     end
     self.capture_flash = 1.0
     self.capture_flash_text = "SWITCHED TO " .. string.upper(self.shop_phase) .. " VIEW (" .. (self.current_pack_kind or 'SHOP') .. ")"

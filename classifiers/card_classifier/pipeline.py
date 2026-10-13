@@ -18,12 +18,20 @@ from ultralytics import YOLO
 CURRENT_DIR = Path(__file__).resolve().parent
 WEIGHTS_DIR = CURRENT_DIR / "weights"
 
-from stage2_classifier.config import (
-    IDX_TO_RANK, IDX_TO_SUIT, IDX_TO_EDITION, IDX_TO_ENHANCEMENT, IDX_TO_SEAL,
-    CROP_WIDTH, CROP_HEIGHT
-)
-from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-from stage2_classifier.model import MultiHeadCardClassifier
+try:
+    from classifiers.card_classifier.stage2_classifier.config import (
+        IDX_TO_RANK, IDX_TO_SUIT, IDX_TO_EDITION, IDX_TO_ENHANCEMENT, IDX_TO_SEAL,
+        CROP_WIDTH, CROP_HEIGHT
+    )
+    from classifiers.card_classifier.stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
+    from classifiers.card_classifier.stage2_classifier.model import MultiHeadCardClassifier
+except ImportError:
+    from stage2_classifier.config import (
+        IDX_TO_RANK, IDX_TO_SUIT, IDX_TO_EDITION, IDX_TO_ENHANCEMENT, IDX_TO_SEAL,
+        CROP_WIDTH, CROP_HEIGHT
+    )
+    from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
+    from stage2_classifier.model import MultiHeadCardClassifier
 
 
 @dataclass

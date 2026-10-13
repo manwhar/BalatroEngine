@@ -37,10 +37,8 @@ else:
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-if str(CLASSIFIER_DIR) not in sys.path:
-    sys.path.insert(0, str(CLASSIFIER_DIR))
-
-from pipeline import CardRecognitionPipeline
+# pyrefly: ignore [missing-import]
+from classifiers.card_classifier.pipeline import CardRecognitionPipeline
 
 # Hand ROI in 1920x1080 Balatro space (from balatro_mod/dataset/boxes.lua)
 BASE_WIDTH = 1920.0
@@ -53,69 +51,13 @@ MOD_ROI = {
 }
 
 
-def parse_timestamp(ts_str: str) -> float:
-    """Parses timestamps like '04:00', '1:23:45', or '240.5' into float seconds."""
-    ts_str = str(ts_str).strip()
-    if ":" in ts_str:
-        parts = [float(p) for p in ts_str.split(":")]
-        if len(parts) == 2:
-            return parts[0] * 60 + parts[1]
-        elif len(parts) == 3:
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        else:
-            raise ValueError(f"Invalid timestamp format: {ts_str}")
-    return float(ts_str)
-
-
-def format_seconds(seconds: float) -> str:
-    """Formats float seconds into HH:MM:SS.mmm string."""
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
-    return f"{int(m):02d}:{s:06.3f}"
+# pyrefly: ignore [missing-import]
+from classifiers.common import parse_timestamp, format_seconds, extract_video_frame, scale_roi_pixels
 
 
 def get_hand_roi_pixels(frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
     """Calculates pixel ROI coordinates scaled to the frame's actual resolution."""
-    scale_x = frame_w / BASE_WIDTH
-    scale_y = frame_h / BASE_HEIGHT
-
-    rx = int(round(MOD_ROI["x"] * scale_x))
-    ry = int(round(MOD_ROI["y"] * scale_y))
-    rw = int(round(MOD_ROI["w"] * scale_x))
-    rh = int(round(MOD_ROI["h"] * scale_y))
-
-    # Clamp bounds inside frame
-    rx = max(0, min(frame_w - 1, rx))
-    ry = max(0, min(frame_h - 1, ry))
-    rw = min(frame_w - rx, rw)
-    rh = min(frame_h - ry, rh)
-
-    return rx, ry, rw, rh
-
-
-def extract_video_frame(video_path: Path, timestamp_sec: float) -> tuple[np.ndarray, float, int]:
-    """Extracts a single BGR frame from a video at the closest timestamp."""
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video file: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    target_frame = int(round(timestamp_sec * fps))
-    target_frame = max(0, min(total_frames - 1, target_frame))
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-    ret, frame = cap.read()
-    actual_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
-    actual_sec = actual_msec / 1000.0 if actual_msec >= 0 else timestamp_sec
-    cap.release()
-
-    if not ret or frame is None:
-        raise RuntimeError(f"Failed to read frame at {timestamp_sec:.2f}s from {video_path}")
-
-    return frame, actual_sec, target_frame
+    return scale_roi_pixels(MOD_ROI, frame_w, frame_h, BASE_WIDTH, BASE_HEIGHT)
 
 
 def draw_annotated_results(

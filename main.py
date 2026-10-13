@@ -245,3 +245,4 @@ if __name__ == "__main__":
         os.makedirs(config.output_dir, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output_payload, f, indent=2)
+            f.close()
