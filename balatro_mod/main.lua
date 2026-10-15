@@ -69,11 +69,17 @@ local CardsGenModule = load_submodule("src/cards_gen.lua")
 local ShopGenModule  = load_submodule("src/shop_gen.lua")
 local CaptureModule  = load_submodule("src/capture.lua")
 local UIModule       = load_submodule("src/ui.lua")
+local RunTracker     = load_submodule("src/run_tracker.lua")
 
 G.DATASET_MOD.ShopGen = ShopGenModule
+G.DATASET_MOD.RunTracker = RunTracker
 
 -- Initialize configuration, counters, and directories
 ConfigModule.init(G.DATASET_MOD)
+
+-- Initialize RunTracker
+RunTracker.init()
+RunTracker.hook_actions()
 
 -- Initialize SMODS callbacks and config tab
 UIModule.init_callbacks(G.DATASET_MOD)

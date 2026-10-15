@@ -4,6 +4,7 @@ Evaluates a given template for a given frame.
 
 import json
 import logging
+from dataclasses import dataclass
 from itertools import product
 
 import cv2
@@ -12,12 +13,21 @@ import cv2.mat_wrapper
 from config import Config
 from debug_plotter import plot
 from geometry import PixelROI, crop_image_to_roi
-from matcher import find_element
-from models import EvaluationResult
+from matcher import TemplateMatch, find_element
 from shadow_evaluator import analyze_shadow_presence
 from template import Template
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationResult:
+    template_name: str
+    found: bool
+    match: TemplateMatch | None
+    clicked: bool | None
+    template_filename: str | None = None
+    plot_kwargs: dict | None = None
 
 
 def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
