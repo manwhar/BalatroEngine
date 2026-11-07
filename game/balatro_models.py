@@ -545,70 +545,6 @@ class Spectral(Consumable):
 
 
 @dataclass(frozen=True, slots=True)
-class JokerFunctions:
-    """
-    Joker functionality; each field is a potential in-game trigger.
-    2 types of possible functions:
-        1) Directly update a game value triggered by a certain action
-           OR event  (action ~ player input; event ~ glass breaking);
-           i.e., playing a hand increases green joker. Closed-loop.
-
-        2) Some value is updated, but we need to queue a CV query to
-           determine what the result is (usually due to randomness).
-           i.e., cartomancer/perkeo creates a consumable card -> CV
-           query to re-document consumables
-           NOTE: If this is triggered by an action, that action was
-                 made without the updated value already existing, so
-                 we can queue the CV re-check for the next action.
-                 For instance: Clicking Select Blind with Cartomancer
-                 is done without the resultant tarot card in
-                 inventory. However, we don't care about what that
-                 tarot card is until the NEXT action, so add "re-index
-                 consumables" to the list of things to scan at the
-                 time of next action.
-
-                 If the value is triggered by a random event (i.e.
-                 glass breaking), same thing. Queue CV check for the
-                 *next* action.
-    We don't care about jokers that statically update the score, like
-    The Trio, since they don't modify the game state more than playing
-    a hand / performing any action without them would.
-        ex: With/without The Trio, when we receive the "Play Hand"
-        action, we need to:
-            - Check how many hands are remaining
-            - Check the current blind score
-            - Check how much money we have
-            ...etc (nothing changes by having The Trio)
-
-
-    """
-
-    discard: list[
-        Callable
-    ]  # castle, ramen, trading card, green joker, yorick, burnt joker, hit the road,
-
-    # ride the bus, lucky cat, seltzer, midas mask, obelisk, vagabond, vampire, seance, square joker,
-    # superposition, green joker, hiker, sixth sense, DNA, runner, matador, space joker, 8 ball, loyalty card,
-    play_hand: list[Callable]
-
-    next_round: list[Callable]  # perkeo
-
-    # madness, riff-raff, burglar, cartomancer, certificate, ceremonial dagger, marble joker
-    select_blind: list[Callable]
-    use_planet: list[Callable]  # satellite, constellation,
-    sell_card: list[Callable]  # campfire, cola, luchador, invisible joker,
-    end_round: list[Callable]  # gift card, egg, hit the road
-    end_ante: list[Callable]  # campfire, rocket
-    add_card: list[Callable]  # hologram
-    glass_broken: list[Callable]  # glass joker
-    reroll: list[Callable]  # flashcard
-    open_pack: list[Callable]  # hallucation
-    skip_pack: list[Callable]  # red card
-    remove_card: list[Callable]  # canio
-    deck_change: list[Callable]  # stone joker, steel joker
-
-
-@dataclass(frozen=True, slots=True)
 class JokerInfo:
     """Static metadata for a Joker."""
 
@@ -616,6 +552,7 @@ class JokerInfo:
     rarity: JokerRarity
     base_cost: int
     base_sell_value: int
+    funcs: "JokerFunctions | None" = None
     blueprint_compat: bool = True
 
 
@@ -769,6 +706,71 @@ class Inventory:
     def can_add_consumable(self) -> bool:
         return len(self.consumables) < self.max_consumables
 
+
+@dataclass(frozen=True, slots=True)
+class JokerFunctions:
+    """
+    Joker functionality; each field is a potential in-game trigger.
+    2 types of possible functions:
+        1) Directly update a game value triggered by a certain action
+           OR event  (action ~ player input; event ~ glass breaking);
+           i.e., playing a hand increases green joker. Closed-loop.
+
+        2) Some value is updated, but we need to queue a CV query to
+           determine what the result is (usually due to randomness).
+           i.e., cartomancer/perkeo creates a consumable card -> CV
+           query to re-document consumables
+           NOTE: If this is triggered by an action, that action was
+                 made without the updated value already existing, so
+                 we can queue the CV re-check for the next action.
+                 For instance: Clicking Select Blind with Cartomancer
+                 is done without the resultant tarot card in
+                 inventory. However, we don't care about what that
+                 tarot card is until the NEXT action, so add "re-index
+                 consumables" to the list of things to scan at the
+                 time of next action.
+
+                 If the value is triggered by a random event (i.e.
+                 glass breaking), same thing. Queue CV check for the
+                 *next* action.
+    We don't care about jokers that statically update the score, like
+    The Trio, since they don't modify the game state more than playing
+    a hand / performing any action without them would.
+        ex: With/without The Trio, when we receive the "Play Hand"
+        action, we need to:
+            - Check how many hands are remaining
+            - Check the current blind score
+            - Check how much money we have
+            ...etc (nothing changes by having The Trio)
+
+
+    """
+
+    discard: list[
+        Callable
+    ]  # castle, ramen, trading card, green joker, yorick, burnt joker, hit the road,
+
+    # ride the bus, lucky cat, seltzer, midas mask, obelisk, vagabond, vampire, seance, square joker,
+    # superposition, green joker, hiker, sixth sense, DNA, runner, matador, space joker, 8 ball, loyalty card,
+    play_hand: list[Callable]
+
+    next_round: list[Callable]  # perkeo
+
+    # madness, riff-raff, burglar, cartomancer, certificate, ceremonial dagger, marble joker
+    select_blind: list[Callable]
+    use_planet: list[Callable]  # satellite, constellation,
+    sell_card: list[Callable]  # campfire, cola, luchador, invisible joker,
+    end_round: list[Callable]  # gift card, egg, hit the road
+    end_ante: list[Callable]  # campfire, rocket
+    add_card: list[Callable]  # hologram
+    glass_broken: list[Callable]  # glass joker
+    reroll: list[Callable]  # flashcard
+    open_pack: list[Callable]  # hallucation
+    skip_pack: list[Callable]  # red card
+    remove_card: list[Callable]  # canio
+    deck_change: list[Callable]  # stone joker, steel joker
+
+def play_hand_green()
 
 # ---------------------------------------------------------
 # Static Data Tables & Registries (Keep at bottom)
