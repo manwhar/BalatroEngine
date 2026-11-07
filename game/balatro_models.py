@@ -1,12 +1,12 @@
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Sequence
-
 
 # ---------------------------------------------------------
 # Core Game Enums
 # ---------------------------------------------------------
+
 
 class Location(StrEnum):
     BLIND = "blind"
@@ -342,6 +342,7 @@ class Action:
 # Card Models & Dynamic Pricing Hierarchy
 # ---------------------------------------------------------
 
+
 @dataclass(kw_only=True)
 class Card:
     type: CardType
@@ -413,7 +414,7 @@ class PlayingCard(Card):
                 return 10
             case _:
                 return int(self.rank.value)
-    
+
     @property
     def chips(self) -> int:
         """Total base chip yield when scored (including Bonus enhancement and Hiker)."""
@@ -440,7 +441,9 @@ class Hand:
     def unselected_cards(self) -> list[PlayingCard]:
         return [c.card for c in self.cards if not c.selected]
 
-    def get_scoring_cards(self, jokers: Sequence["Joker"] | None = None) -> list[PlayingCard]:
+    def get_scoring_cards(
+        self, jokers: Sequence["Joker"] | None = None
+    ) -> list[PlayingCard]:
         """Returns only the cards in the current selection that actively score."""
         try:
             from game.engine.poker_hands import get_scoring_cards
@@ -459,7 +462,7 @@ class Hand:
             if not self.cards[index].selected and len(self.selected_cards) >= 5:
                 return
             self.cards[index].selected = not self.cards[index].selected
-            
+
     def clear_selection(self) -> None:
         for c in self.cards:
             c.selected = False
@@ -495,8 +498,73 @@ class Spectral(Consumable):
 
 
 @dataclass(frozen=True, slots=True)
+class JokerFunctions:
+    """
+    Joker functionality; each field is a potential in-game trigger.
+    2 types of possible functions:
+        1) Directly update a game value triggered by a certain action
+           OR event  (action ~ player input; event ~ glass breaking);
+           i.e., playing a hand increases green joker. Closed-loop.
+
+        2) Some value is updated, but we need to queue a CV query to
+           determine what the result is (usually due to randomness).
+           i.e., cartomancer/perkeo creates a consumable card -> CV
+           query to re-document consumables
+           NOTE: If this is triggered by an action, that action was
+                 made without the updated value already existing, so
+                 we can queue the CV re-check for the next action.
+                 For instance: Clicking Select Blind with Cartomancer
+                 is done without the resultant tarot card in
+                 inventory. However, we don't care about what that
+                 tarot card is until the NEXT action, so add "re-index
+                 consumables" to the list of things to scan at the
+                 time of next action.
+
+                 If the value is triggered by a random event (i.e.
+                 glass breaking), same thing. Queue CV check for the
+                 *next* action.
+    We don't care about jokers that statically update the score, like
+    The Trio, since they don't modify the game state more than playing
+    a hand / performing any action without them would.
+        ex: With/without The Trio, when we receive the "Play Hand"
+        action, we need to:
+            - Check how many hands are remaining
+            - Check the current blind score
+            - Check how much money we have
+            ...etc (nothing changes by having The Trio)
+
+
+    """
+
+    discard: list[
+        Callable
+    ]  # castle, ramen, trading card, green joker, yorick, burnt joker, hit the road,
+
+    # ride the bus, lucky cat, seltzer, midas mask, obelisk, vagabond, vampire, seance, square joker,
+    # superposition, green joker, hiker, sixth sense, DNA, runner, matador, space joker, 8 ball, loyalty card,
+    play_hand: list[Callable]
+
+    next_round: list[Callable]  # perkeo
+
+    # madness, riff-raff, burglar, cartomancer, certificate, ceremonial dagger, marble joker
+    select_blind: list[Callable]
+    use_planet: list[Callable]  # satellite, constellation,
+    sell_card: list[Callable]  # campfire, cola, luchador, invisible joker,
+    end_round: list[Callable]  # gift card, egg, hit the road
+    end_ante: list[Callable]  # campfire, rocket
+    add_card: list[Callable]  # hologram
+    glass_broken: list[Callable]  # glass joker
+    reroll: list[Callable]  # flashcard
+    open_pack: list[Callable]  # hallucation
+    skip_pack: list[Callable]  # red card
+    remove_card: list[Callable]  # canio
+    deck_change: list[Callable]  # stone joker, steel joker
+
+
+@dataclass(frozen=True, slots=True)
 class JokerInfo:
     """Static metadata for a Joker."""
+
     name: "JokerName"
     rarity: JokerRarity
     base_cost: int
@@ -507,6 +575,7 @@ class JokerInfo:
 @dataclass(kw_only=True)
 class Joker(Card):
     """Runtime instance of a Joker in a run."""
+
     name: "JokerName" = field(default=None)  # type: ignore
     type: CardType = CardType.JOKER
     edition: Edition = Edition.NONE
@@ -583,18 +652,46 @@ class PokerHandLevel:
 
 
 POKER_HAND_DEFAULTS: dict[PokerHand, PokerHandLevel] = {
-    PokerHand.HIGH_CARD: PokerHandLevel(hand=PokerHand.HIGH_CARD, base_chips=5, base_mult=1, l_chips=10, l_mult=1),
-    PokerHand.PAIR: PokerHandLevel(hand=PokerHand.PAIR, base_chips=10, base_mult=2, l_chips=15, l_mult=1),
-    PokerHand.TWO_PAIR: PokerHandLevel(hand=PokerHand.TWO_PAIR, base_chips=20, base_mult=2, l_chips=20, l_mult=1),
-    PokerHand.THREE_OF_A_KIND: PokerHandLevel(hand=PokerHand.THREE_OF_A_KIND, base_chips=30, base_mult=3, l_chips=20, l_mult=2),
-    PokerHand.STRAIGHT: PokerHandLevel(hand=PokerHand.STRAIGHT, base_chips=30, base_mult=4, l_chips=30, l_mult=3),
-    PokerHand.FLUSH: PokerHandLevel(hand=PokerHand.FLUSH, base_chips=35, base_mult=4, l_chips=15, l_mult=2),
-    PokerHand.FULL_HOUSE: PokerHandLevel(hand=PokerHand.FULL_HOUSE, base_chips=40, base_mult=4, l_chips=25, l_mult=2),
-    PokerHand.FOUR_OF_A_KIND: PokerHandLevel(hand=PokerHand.FOUR_OF_A_KIND, base_chips=60, base_mult=7, l_chips=30, l_mult=3),
-    PokerHand.STRAIGHT_FLUSH: PokerHandLevel(hand=PokerHand.STRAIGHT_FLUSH, base_chips=100, base_mult=8, l_chips=40, l_mult=4),
-    PokerHand.FIVE_OF_A_KIND: PokerHandLevel(hand=PokerHand.FIVE_OF_A_KIND, base_chips=120, base_mult=12, l_chips=35, l_mult=3),
-    PokerHand.FLUSH_HOUSE: PokerHandLevel(hand=PokerHand.FLUSH_HOUSE, base_chips=140, base_mult=14, l_chips=40, l_mult=4),
-    PokerHand.FLUSH_FIVE: PokerHandLevel(hand=PokerHand.FLUSH_FIVE, base_chips=160, base_mult=16, l_chips=50, l_mult=3),
+    PokerHand.HIGH_CARD: PokerHandLevel(
+        hand=PokerHand.HIGH_CARD, base_chips=5, base_mult=1, l_chips=10, l_mult=1
+    ),
+    PokerHand.PAIR: PokerHandLevel(
+        hand=PokerHand.PAIR, base_chips=10, base_mult=2, l_chips=15, l_mult=1
+    ),
+    PokerHand.TWO_PAIR: PokerHandLevel(
+        hand=PokerHand.TWO_PAIR, base_chips=20, base_mult=2, l_chips=20, l_mult=1
+    ),
+    PokerHand.THREE_OF_A_KIND: PokerHandLevel(
+        hand=PokerHand.THREE_OF_A_KIND, base_chips=30, base_mult=3, l_chips=20, l_mult=2
+    ),
+    PokerHand.STRAIGHT: PokerHandLevel(
+        hand=PokerHand.STRAIGHT, base_chips=30, base_mult=4, l_chips=30, l_mult=3
+    ),
+    PokerHand.FLUSH: PokerHandLevel(
+        hand=PokerHand.FLUSH, base_chips=35, base_mult=4, l_chips=15, l_mult=2
+    ),
+    PokerHand.FULL_HOUSE: PokerHandLevel(
+        hand=PokerHand.FULL_HOUSE, base_chips=40, base_mult=4, l_chips=25, l_mult=2
+    ),
+    PokerHand.FOUR_OF_A_KIND: PokerHandLevel(
+        hand=PokerHand.FOUR_OF_A_KIND, base_chips=60, base_mult=7, l_chips=30, l_mult=3
+    ),
+    PokerHand.STRAIGHT_FLUSH: PokerHandLevel(
+        hand=PokerHand.STRAIGHT_FLUSH, base_chips=100, base_mult=8, l_chips=40, l_mult=4
+    ),
+    PokerHand.FIVE_OF_A_KIND: PokerHandLevel(
+        hand=PokerHand.FIVE_OF_A_KIND,
+        base_chips=120,
+        base_mult=12,
+        l_chips=35,
+        l_mult=3,
+    ),
+    PokerHand.FLUSH_HOUSE: PokerHandLevel(
+        hand=PokerHand.FLUSH_HOUSE, base_chips=140, base_mult=14, l_chips=40, l_mult=4
+    ),
+    PokerHand.FLUSH_FIVE: PokerHandLevel(
+        hand=PokerHand.FLUSH_FIVE, base_chips=160, base_mult=16, l_chips=50, l_mult=3
+    ),
 }
 
 
@@ -612,7 +709,9 @@ class Inventory:
 
     @property
     def max_consumables(self) -> int:
-        negative_count = sum(1 for c in self.consumables if c.edition == Edition.NEGATIVE)
+        negative_count = sum(
+            1 for c in self.consumables if c.edition == Edition.NEGATIVE
+        )
         return self.consumable_slots + negative_count
 
     @property
@@ -627,6 +726,7 @@ class Inventory:
 # ---------------------------------------------------------
 # Static Data Tables & Registries (Keep at bottom)
 # ---------------------------------------------------------
+
 
 class JokerName(StrEnum):
     JOKER = "Joker"
@@ -785,8 +885,12 @@ JOKER_REGISTRY: dict[JokerName, JokerInfo] = {
     JokerName.JOKER: JokerInfo(JokerName.JOKER, JokerRarity.COMMON, 2, 1),
     JokerName.GREEDY_JOKER: JokerInfo(JokerName.GREEDY_JOKER, JokerRarity.COMMON, 5, 2),
     JokerName.LUSTY_JOKER: JokerInfo(JokerName.LUSTY_JOKER, JokerRarity.COMMON, 5, 2),
-    JokerName.WRATHFUL_JOKER: JokerInfo(JokerName.WRATHFUL_JOKER, JokerRarity.COMMON, 5, 2),
-    JokerName.GLUTTONOUS_JOKER: JokerInfo(JokerName.GLUTTONOUS_JOKER, JokerRarity.COMMON, 5, 2),
+    JokerName.WRATHFUL_JOKER: JokerInfo(
+        JokerName.WRATHFUL_JOKER, JokerRarity.COMMON, 5, 2
+    ),
+    JokerName.GLUTTONOUS_JOKER: JokerInfo(
+        JokerName.GLUTTONOUS_JOKER, JokerRarity.COMMON, 5, 2
+    ),
     JokerName.JOLLY_JOKER: JokerInfo(JokerName.JOLLY_JOKER, JokerRarity.COMMON, 3, 1),
     JokerName.ZANY_JOKER: JokerInfo(JokerName.ZANY_JOKER, JokerRarity.COMMON, 4, 2),
     JokerName.MAD_JOKER: JokerInfo(JokerName.MAD_JOKER, JokerRarity.COMMON, 4, 2),
@@ -795,52 +899,94 @@ JOKER_REGISTRY: dict[JokerName, JokerInfo] = {
     JokerName.SLY_JOKER: JokerInfo(JokerName.SLY_JOKER, JokerRarity.COMMON, 3, 1),
     JokerName.WILY_JOKER: JokerInfo(JokerName.WILY_JOKER, JokerRarity.COMMON, 4, 2),
     JokerName.CLEVER_JOKER: JokerInfo(JokerName.CLEVER_JOKER, JokerRarity.COMMON, 4, 2),
-    JokerName.DEVIOUS_JOKER: JokerInfo(JokerName.DEVIOUS_JOKER, JokerRarity.COMMON, 4, 2),
+    JokerName.DEVIOUS_JOKER: JokerInfo(
+        JokerName.DEVIOUS_JOKER, JokerRarity.COMMON, 4, 2
+    ),
     JokerName.CRAFTY_JOKER: JokerInfo(JokerName.CRAFTY_JOKER, JokerRarity.COMMON, 4, 2),
     JokerName.HALF_JOKER: JokerInfo(JokerName.HALF_JOKER, JokerRarity.COMMON, 5, 2),
-    JokerName.JOKER_STENCIL: JokerInfo(JokerName.JOKER_STENCIL, JokerRarity.UNCOMMON, 8, 4),
-    JokerName.FOUR_FINGERS: JokerInfo(JokerName.FOUR_FINGERS, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
+    JokerName.JOKER_STENCIL: JokerInfo(
+        JokerName.JOKER_STENCIL, JokerRarity.UNCOMMON, 8, 4
+    ),
+    JokerName.FOUR_FINGERS: JokerInfo(
+        JokerName.FOUR_FINGERS, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
     JokerName.MIME: JokerInfo(JokerName.MIME, JokerRarity.UNCOMMON, 5, 2),
-    JokerName.CREDIT_CARD: JokerInfo(JokerName.CREDIT_CARD, JokerRarity.COMMON, 1, 1, blueprint_compat=False),
-    JokerName.CEREMONIAL_DAGGER: JokerInfo(JokerName.CEREMONIAL_DAGGER, JokerRarity.UNCOMMON, 6, 3),
+    JokerName.CREDIT_CARD: JokerInfo(
+        JokerName.CREDIT_CARD, JokerRarity.COMMON, 1, 1, blueprint_compat=False
+    ),
+    JokerName.CEREMONIAL_DAGGER: JokerInfo(
+        JokerName.CEREMONIAL_DAGGER, JokerRarity.UNCOMMON, 6, 3
+    ),
     JokerName.BANNER: JokerInfo(JokerName.BANNER, JokerRarity.COMMON, 5, 2),
-    JokerName.MYSTIC_SUMMIT: JokerInfo(JokerName.MYSTIC_SUMMIT, JokerRarity.COMMON, 5, 2),
-    JokerName.MARBLE_JOKER: JokerInfo(JokerName.MARBLE_JOKER, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.LOYALTY_CARD: JokerInfo(JokerName.LOYALTY_CARD, JokerRarity.UNCOMMON, 5, 2),
+    JokerName.MYSTIC_SUMMIT: JokerInfo(
+        JokerName.MYSTIC_SUMMIT, JokerRarity.COMMON, 5, 2
+    ),
+    JokerName.MARBLE_JOKER: JokerInfo(
+        JokerName.MARBLE_JOKER, JokerRarity.UNCOMMON, 6, 3
+    ),
+    JokerName.LOYALTY_CARD: JokerInfo(
+        JokerName.LOYALTY_CARD, JokerRarity.UNCOMMON, 5, 2
+    ),
     JokerName.EIGHT_BALL: JokerInfo(JokerName.EIGHT_BALL, JokerRarity.COMMON, 5, 2),
     JokerName.MISPRINT: JokerInfo(JokerName.MISPRINT, JokerRarity.COMMON, 4, 2),
     JokerName.DUSK: JokerInfo(JokerName.DUSK, JokerRarity.UNCOMMON, 5, 2),
     JokerName.RAISED_FIST: JokerInfo(JokerName.RAISED_FIST, JokerRarity.COMMON, 5, 2),
-    JokerName.CHAOS_THE_CLOWN: JokerInfo(JokerName.CHAOS_THE_CLOWN, JokerRarity.COMMON, 4, 2, blueprint_compat=False),
+    JokerName.CHAOS_THE_CLOWN: JokerInfo(
+        JokerName.CHAOS_THE_CLOWN, JokerRarity.COMMON, 4, 2, blueprint_compat=False
+    ),
     JokerName.FIBONACCI: JokerInfo(JokerName.FIBONACCI, JokerRarity.UNCOMMON, 8, 4),
     JokerName.STEEL_JOKER: JokerInfo(JokerName.STEEL_JOKER, JokerRarity.UNCOMMON, 7, 3),
     JokerName.SCARY_FACE: JokerInfo(JokerName.SCARY_FACE, JokerRarity.COMMON, 4, 2),
-    JokerName.ABSTRACT_JOKER: JokerInfo(JokerName.ABSTRACT_JOKER, JokerRarity.COMMON, 4, 2),
-    JokerName.DELAYED_GRATIFICATION: JokerInfo(JokerName.DELAYED_GRATIFICATION, JokerRarity.COMMON, 4, 2, blueprint_compat=False),
+    JokerName.ABSTRACT_JOKER: JokerInfo(
+        JokerName.ABSTRACT_JOKER, JokerRarity.COMMON, 4, 2
+    ),
+    JokerName.DELAYED_GRATIFICATION: JokerInfo(
+        JokerName.DELAYED_GRATIFICATION,
+        JokerRarity.COMMON,
+        4,
+        2,
+        blueprint_compat=False,
+    ),
     JokerName.HACK: JokerInfo(JokerName.HACK, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.PAREIDOLIA: JokerInfo(JokerName.PAREIDOLIA, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False),
+    JokerName.PAREIDOLIA: JokerInfo(
+        JokerName.PAREIDOLIA, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False
+    ),
     JokerName.GROS_MICHEL: JokerInfo(JokerName.GROS_MICHEL, JokerRarity.COMMON, 5, 2),
     JokerName.EVEN_STEVEN: JokerInfo(JokerName.EVEN_STEVEN, JokerRarity.COMMON, 4, 2),
     JokerName.ODD_TODD: JokerInfo(JokerName.ODD_TODD, JokerRarity.COMMON, 4, 2),
     JokerName.SCHOLAR: JokerInfo(JokerName.SCHOLAR, JokerRarity.COMMON, 4, 2),
-    JokerName.BUSINESS_CARD: JokerInfo(JokerName.BUSINESS_CARD, JokerRarity.COMMON, 4, 2),
+    JokerName.BUSINESS_CARD: JokerInfo(
+        JokerName.BUSINESS_CARD, JokerRarity.COMMON, 4, 2
+    ),
     JokerName.SUPERNOVA: JokerInfo(JokerName.SUPERNOVA, JokerRarity.COMMON, 5, 2),
     JokerName.RIDE_THE_BUS: JokerInfo(JokerName.RIDE_THE_BUS, JokerRarity.COMMON, 6, 3),
     JokerName.SPACE_JOKER: JokerInfo(JokerName.SPACE_JOKER, JokerRarity.UNCOMMON, 5, 2),
-    JokerName.EGG: JokerInfo(JokerName.EGG, JokerRarity.COMMON, 4, 2, blueprint_compat=False),
+    JokerName.EGG: JokerInfo(
+        JokerName.EGG, JokerRarity.COMMON, 4, 2, blueprint_compat=False
+    ),
     JokerName.BURGLAR: JokerInfo(JokerName.BURGLAR, JokerRarity.UNCOMMON, 6, 3),
     JokerName.BLACKBOARD: JokerInfo(JokerName.BLACKBOARD, JokerRarity.UNCOMMON, 6, 3),
     JokerName.RUNNER: JokerInfo(JokerName.RUNNER, JokerRarity.COMMON, 5, 2),
     JokerName.ICE_CREAM: JokerInfo(JokerName.ICE_CREAM, JokerRarity.COMMON, 5, 2),
     JokerName.DNA: JokerInfo(JokerName.DNA, JokerRarity.RARE, 8, 4),
-    JokerName.SPLASH: JokerInfo(JokerName.SPLASH, JokerRarity.COMMON, 3, 1, blueprint_compat=False),
+    JokerName.SPLASH: JokerInfo(
+        JokerName.SPLASH, JokerRarity.COMMON, 3, 1, blueprint_compat=False
+    ),
     JokerName.BLUE_JOKER: JokerInfo(JokerName.BLUE_JOKER, JokerRarity.COMMON, 5, 2),
-    JokerName.SIXTH_SENSE: JokerInfo(JokerName.SIXTH_SENSE, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
-    JokerName.CONSTELLATION: JokerInfo(JokerName.CONSTELLATION, JokerRarity.UNCOMMON, 6, 3),
+    JokerName.SIXTH_SENSE: JokerInfo(
+        JokerName.SIXTH_SENSE, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
+    JokerName.CONSTELLATION: JokerInfo(
+        JokerName.CONSTELLATION, JokerRarity.UNCOMMON, 6, 3
+    ),
     JokerName.HIKER: JokerInfo(JokerName.HIKER, JokerRarity.UNCOMMON, 5, 2),
-    JokerName.FACELESS_JOKER: JokerInfo(JokerName.FACELESS_JOKER, JokerRarity.COMMON, 4, 2),
+    JokerName.FACELESS_JOKER: JokerInfo(
+        JokerName.FACELESS_JOKER, JokerRarity.COMMON, 4, 2
+    ),
     JokerName.GREEN_JOKER: JokerInfo(JokerName.GREEN_JOKER, JokerRarity.COMMON, 4, 2),
-    JokerName.SUPERPOSITION: JokerInfo(JokerName.SUPERPOSITION, JokerRarity.COMMON, 4, 2),
+    JokerName.SUPERPOSITION: JokerInfo(
+        JokerName.SUPERPOSITION, JokerRarity.COMMON, 4, 2
+    ),
     JokerName.TO_DO_LIST: JokerInfo(JokerName.TO_DO_LIST, JokerRarity.COMMON, 4, 2),
     JokerName.CAVENDISH: JokerInfo(JokerName.CAVENDISH, JokerRarity.COMMON, 4, 2),
     JokerName.CARD_SHARP: JokerInfo(JokerName.CARD_SHARP, JokerRarity.UNCOMMON, 6, 3),
@@ -850,51 +996,95 @@ JOKER_REGISTRY: dict[JokerName, JokerInfo] = {
     JokerName.SEANCE: JokerInfo(JokerName.SEANCE, JokerRarity.UNCOMMON, 6, 3),
     JokerName.RIFF_RAFF: JokerInfo(JokerName.RIFF_RAFF, JokerRarity.COMMON, 6, 3),
     JokerName.VAMPIRE: JokerInfo(JokerName.VAMPIRE, JokerRarity.UNCOMMON, 7, 3),
-    JokerName.SHORTCUT: JokerInfo(JokerName.SHORTCUT, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
+    JokerName.SHORTCUT: JokerInfo(
+        JokerName.SHORTCUT, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
     JokerName.HOLOGRAM: JokerInfo(JokerName.HOLOGRAM, JokerRarity.UNCOMMON, 7, 3),
     JokerName.VAGABOND: JokerInfo(JokerName.VAGABOND, JokerRarity.RARE, 8, 4),
     JokerName.BARON: JokerInfo(JokerName.BARON, JokerRarity.RARE, 8, 4),
-    JokerName.CLOUD_9: JokerInfo(JokerName.CLOUD_9, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
-    JokerName.ROCKET: JokerInfo(JokerName.ROCKET, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
+    JokerName.CLOUD_9: JokerInfo(
+        JokerName.CLOUD_9, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
+    JokerName.ROCKET: JokerInfo(
+        JokerName.ROCKET, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
     JokerName.OBELISK: JokerInfo(JokerName.OBELISK, JokerRarity.RARE, 8, 4),
-    JokerName.MIDAS_MASK: JokerInfo(JokerName.MIDAS_MASK, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
+    JokerName.MIDAS_MASK: JokerInfo(
+        JokerName.MIDAS_MASK, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
     JokerName.LUCHADOR: JokerInfo(JokerName.LUCHADOR, JokerRarity.UNCOMMON, 5, 2),
     JokerName.PHOTOGRAPH: JokerInfo(JokerName.PHOTOGRAPH, JokerRarity.COMMON, 5, 2),
-    JokerName.GIFT_CARD: JokerInfo(JokerName.GIFT_CARD, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
-    JokerName.TURTLE_BEAN: JokerInfo(JokerName.TURTLE_BEAN, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
+    JokerName.GIFT_CARD: JokerInfo(
+        JokerName.GIFT_CARD, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
+    JokerName.TURTLE_BEAN: JokerInfo(
+        JokerName.TURTLE_BEAN, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
     JokerName.EROSION: JokerInfo(JokerName.EROSION, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.RESERVED_PARKING: JokerInfo(JokerName.RESERVED_PARKING, JokerRarity.COMMON, 6, 3),
-    JokerName.MAIL_IN_REBATE: JokerInfo(JokerName.MAIL_IN_REBATE, JokerRarity.COMMON, 4, 2),
-    JokerName.TO_THE_MOON: JokerInfo(JokerName.TO_THE_MOON, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False),
-    JokerName.HALLUCINATION: JokerInfo(JokerName.HALLUCINATION, JokerRarity.COMMON, 4, 2),
-    JokerName.FORTUNE_TELLER: JokerInfo(JokerName.FORTUNE_TELLER, JokerRarity.COMMON, 6, 3),
-    JokerName.JUGGLER: JokerInfo(JokerName.JUGGLER, JokerRarity.COMMON, 4, 2, blueprint_compat=False),
-    JokerName.DRUNKARD: JokerInfo(JokerName.DRUNKARD, JokerRarity.COMMON, 4, 2, blueprint_compat=False),
+    JokerName.RESERVED_PARKING: JokerInfo(
+        JokerName.RESERVED_PARKING, JokerRarity.COMMON, 6, 3
+    ),
+    JokerName.MAIL_IN_REBATE: JokerInfo(
+        JokerName.MAIL_IN_REBATE, JokerRarity.COMMON, 4, 2
+    ),
+    JokerName.TO_THE_MOON: JokerInfo(
+        JokerName.TO_THE_MOON, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False
+    ),
+    JokerName.HALLUCINATION: JokerInfo(
+        JokerName.HALLUCINATION, JokerRarity.COMMON, 4, 2
+    ),
+    JokerName.FORTUNE_TELLER: JokerInfo(
+        JokerName.FORTUNE_TELLER, JokerRarity.COMMON, 6, 3
+    ),
+    JokerName.JUGGLER: JokerInfo(
+        JokerName.JUGGLER, JokerRarity.COMMON, 4, 2, blueprint_compat=False
+    ),
+    JokerName.DRUNKARD: JokerInfo(
+        JokerName.DRUNKARD, JokerRarity.COMMON, 4, 2, blueprint_compat=False
+    ),
     JokerName.STONE_JOKER: JokerInfo(JokerName.STONE_JOKER, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.GOLDEN_JOKER: JokerInfo(JokerName.GOLDEN_JOKER, JokerRarity.COMMON, 6, 3, blueprint_compat=False),
+    JokerName.GOLDEN_JOKER: JokerInfo(
+        JokerName.GOLDEN_JOKER, JokerRarity.COMMON, 6, 3, blueprint_compat=False
+    ),
     JokerName.LUCKY_CAT: JokerInfo(JokerName.LUCKY_CAT, JokerRarity.UNCOMMON, 6, 3),
     JokerName.BASEBALL_CARD: JokerInfo(JokerName.BASEBALL_CARD, JokerRarity.RARE, 8, 4),
     JokerName.BULL: JokerInfo(JokerName.BULL, JokerRarity.UNCOMMON, 6, 3),
     JokerName.DIET_COLA: JokerInfo(JokerName.DIET_COLA, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.TRADING_CARD: JokerInfo(JokerName.TRADING_CARD, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
+    JokerName.TRADING_CARD: JokerInfo(
+        JokerName.TRADING_CARD, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
     JokerName.FLASH_CARD: JokerInfo(JokerName.FLASH_CARD, JokerRarity.UNCOMMON, 5, 2),
     JokerName.POPCORN: JokerInfo(JokerName.POPCORN, JokerRarity.COMMON, 5, 2),
-    JokerName.SPARE_TROUSERS: JokerInfo(JokerName.SPARE_TROUSERS, JokerRarity.UNCOMMON, 6, 3),
+    JokerName.SPARE_TROUSERS: JokerInfo(
+        JokerName.SPARE_TROUSERS, JokerRarity.UNCOMMON, 6, 3
+    ),
     JokerName.ANCIENT_JOKER: JokerInfo(JokerName.ANCIENT_JOKER, JokerRarity.RARE, 8, 4),
     JokerName.RAMEN: JokerInfo(JokerName.RAMEN, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.WALKIE_TALKIE: JokerInfo(JokerName.WALKIE_TALKIE, JokerRarity.COMMON, 4, 2),
+    JokerName.WALKIE_TALKIE: JokerInfo(
+        JokerName.WALKIE_TALKIE, JokerRarity.COMMON, 4, 2
+    ),
     JokerName.SELTZER: JokerInfo(JokerName.SELTZER, JokerRarity.UNCOMMON, 6, 3),
     JokerName.CASTLE: JokerInfo(JokerName.CASTLE, JokerRarity.UNCOMMON, 6, 3),
     JokerName.SMILEY_FACE: JokerInfo(JokerName.SMILEY_FACE, JokerRarity.COMMON, 4, 2),
     JokerName.CAMPFIRE: JokerInfo(JokerName.CAMPFIRE, JokerRarity.RARE, 9, 4),
-    JokerName.GOLDEN_TICKET: JokerInfo(JokerName.GOLDEN_TICKET, JokerRarity.COMMON, 5, 2),
-    JokerName.MR_BONES: JokerInfo(JokerName.MR_BONES, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False),
+    JokerName.GOLDEN_TICKET: JokerInfo(
+        JokerName.GOLDEN_TICKET, JokerRarity.COMMON, 5, 2
+    ),
+    JokerName.MR_BONES: JokerInfo(
+        JokerName.MR_BONES, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False
+    ),
     JokerName.ACROBAT: JokerInfo(JokerName.ACROBAT, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.SOCK_AND_BUSKIN: JokerInfo(JokerName.SOCK_AND_BUSKIN, JokerRarity.UNCOMMON, 6, 3),
+    JokerName.SOCK_AND_BUSKIN: JokerInfo(
+        JokerName.SOCK_AND_BUSKIN, JokerRarity.UNCOMMON, 6, 3
+    ),
     JokerName.SWASHBUCKLER: JokerInfo(JokerName.SWASHBUCKLER, JokerRarity.COMMON, 4, 2),
-    JokerName.TROUBADOUR: JokerInfo(JokerName.TROUBADOUR, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
+    JokerName.TROUBADOUR: JokerInfo(
+        JokerName.TROUBADOUR, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
     JokerName.CERTIFICATE: JokerInfo(JokerName.CERTIFICATE, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.SMEARED_JOKER: JokerInfo(JokerName.SMEARED_JOKER, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
+    JokerName.SMEARED_JOKER: JokerInfo(
+        JokerName.SMEARED_JOKER, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
     JokerName.THROWBACK: JokerInfo(JokerName.THROWBACK, JokerRarity.UNCOMMON, 6, 3),
     JokerName.HANGING_CHAD: JokerInfo(JokerName.HANGING_CHAD, JokerRarity.COMMON, 4, 2),
     JokerName.ROUGH_GEM: JokerInfo(JokerName.ROUGH_GEM, JokerRarity.UNCOMMON, 7, 3),
@@ -902,14 +1092,22 @@ JOKER_REGISTRY: dict[JokerName, JokerInfo] = {
     JokerName.ARROWHEAD: JokerInfo(JokerName.ARROWHEAD, JokerRarity.UNCOMMON, 7, 3),
     JokerName.ONYX_AGATE: JokerInfo(JokerName.ONYX_AGATE, JokerRarity.UNCOMMON, 7, 3),
     JokerName.GLASS_JOKER: JokerInfo(JokerName.GLASS_JOKER, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.SHOWMAN: JokerInfo(JokerName.SHOWMAN, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False),
+    JokerName.SHOWMAN: JokerInfo(
+        JokerName.SHOWMAN, JokerRarity.UNCOMMON, 5, 2, blueprint_compat=False
+    ),
     JokerName.FLOWER_POT: JokerInfo(JokerName.FLOWER_POT, JokerRarity.UNCOMMON, 6, 3),
     JokerName.BLUEPRINT: JokerInfo(JokerName.BLUEPRINT, JokerRarity.RARE, 10, 5),
     JokerName.WEE_JOKER: JokerInfo(JokerName.WEE_JOKER, JokerRarity.RARE, 8, 4),
-    JokerName.MERRY_ANDY: JokerInfo(JokerName.MERRY_ANDY, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False),
-    JokerName.OOPS_ALL_6S: JokerInfo(JokerName.OOPS_ALL_6S, JokerRarity.UNCOMMON, 4, 2, blueprint_compat=False),
+    JokerName.MERRY_ANDY: JokerInfo(
+        JokerName.MERRY_ANDY, JokerRarity.UNCOMMON, 7, 3, blueprint_compat=False
+    ),
+    JokerName.OOPS_ALL_6S: JokerInfo(
+        JokerName.OOPS_ALL_6S, JokerRarity.UNCOMMON, 4, 2, blueprint_compat=False
+    ),
     JokerName.THE_IDOL: JokerInfo(JokerName.THE_IDOL, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.SEEING_DOUBLE: JokerInfo(JokerName.SEEING_DOUBLE, JokerRarity.UNCOMMON, 6, 3),
+    JokerName.SEEING_DOUBLE: JokerInfo(
+        JokerName.SEEING_DOUBLE, JokerRarity.UNCOMMON, 6, 3
+    ),
     JokerName.MATADOR: JokerInfo(JokerName.MATADOR, JokerRarity.UNCOMMON, 7, 3),
     JokerName.HIT_THE_ROAD: JokerInfo(JokerName.HIT_THE_ROAD, JokerRarity.RARE, 8, 4),
     JokerName.THE_DUO: JokerInfo(JokerName.THE_DUO, JokerRarity.RARE, 8, 4),
@@ -918,18 +1116,28 @@ JOKER_REGISTRY: dict[JokerName, JokerInfo] = {
     JokerName.THE_ORDER: JokerInfo(JokerName.THE_ORDER, JokerRarity.RARE, 8, 4),
     JokerName.THE_TRIBE: JokerInfo(JokerName.THE_TRIBE, JokerRarity.RARE, 8, 4),
     JokerName.STUNTMAN: JokerInfo(JokerName.STUNTMAN, JokerRarity.RARE, 7, 3),
-    JokerName.INVISIBLE_JOKER: JokerInfo(JokerName.INVISIBLE_JOKER, JokerRarity.RARE, 8, 4, blueprint_compat=False),
+    JokerName.INVISIBLE_JOKER: JokerInfo(
+        JokerName.INVISIBLE_JOKER, JokerRarity.RARE, 8, 4, blueprint_compat=False
+    ),
     JokerName.BRAINSTORM: JokerInfo(JokerName.BRAINSTORM, JokerRarity.RARE, 10, 5),
-    JokerName.SATELLITE: JokerInfo(JokerName.SATELLITE, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False),
-    JokerName.SHOOT_THE_MOON: JokerInfo(JokerName.SHOOT_THE_MOON, JokerRarity.COMMON, 5, 2),
+    JokerName.SATELLITE: JokerInfo(
+        JokerName.SATELLITE, JokerRarity.UNCOMMON, 6, 3, blueprint_compat=False
+    ),
+    JokerName.SHOOT_THE_MOON: JokerInfo(
+        JokerName.SHOOT_THE_MOON, JokerRarity.COMMON, 5, 2
+    ),
     JokerName.DRIVER: JokerInfo(JokerName.DRIVER, JokerRarity.RARE, 7, 3),
     JokerName.CARTOMANCER: JokerInfo(JokerName.CARTOMANCER, JokerRarity.UNCOMMON, 6, 3),
-    JokerName.ASTRONOMER: JokerInfo(JokerName.ASTRONOMER, JokerRarity.UNCOMMON, 8, 4, blueprint_compat=False),
+    JokerName.ASTRONOMER: JokerInfo(
+        JokerName.ASTRONOMER, JokerRarity.UNCOMMON, 8, 4, blueprint_compat=False
+    ),
     JokerName.BURNT_JOKER: JokerInfo(JokerName.BURNT_JOKER, JokerRarity.RARE, 8, 4),
     JokerName.BOOTSTRAPS: JokerInfo(JokerName.BOOTSTRAPS, JokerRarity.UNCOMMON, 7, 3),
     JokerName.CANIO: JokerInfo(JokerName.CANIO, JokerRarity.LEGENDARY, 20, 10),
     JokerName.TRIBOULET: JokerInfo(JokerName.TRIBOULET, JokerRarity.LEGENDARY, 20, 10),
     JokerName.YORICK: JokerInfo(JokerName.YORICK, JokerRarity.LEGENDARY, 20, 10),
-    JokerName.CHICOT: JokerInfo(JokerName.CHICOT, JokerRarity.LEGENDARY, 20, 10, blueprint_compat=False),
+    JokerName.CHICOT: JokerInfo(
+        JokerName.CHICOT, JokerRarity.LEGENDARY, 20, 10, blueprint_compat=False
+    ),
     JokerName.PERKEO: JokerInfo(JokerName.PERKEO, JokerRarity.LEGENDARY, 20, 10),
 }

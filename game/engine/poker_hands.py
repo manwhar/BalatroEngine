@@ -2,9 +2,25 @@ from collections import Counter
 from typing import Sequence
 
 try:
-    from game.balatro_models import Enhancement, Joker, JokerName, PlayingCard, PokerHand, Rank, Suit
+    from game.balatro_models import (
+        Enhancement,
+        Joker,
+        JokerName,
+        PlayingCard,
+        PokerHand,
+        Rank,
+        Suit,
+    )
 except ImportError:
-    from balatro_models import Enhancement, Joker, JokerName, PlayingCard, PokerHand, Rank, Suit
+    from balatro_models import (
+        Enhancement,
+        Joker,
+        JokerName,
+        PlayingCard,
+        PokerHand,
+        Rank,
+        Suit,
+    )
 
 
 RANK_VALUES: dict[Rank, int] = {
@@ -29,7 +45,7 @@ def evaluate_poker_hand(
     jokers: Sequence[Joker] | None = None,
 ) -> PokerHand:
     """Evaluates the poker hand type for a set of played or selected cards.
-    
+
     Fully accounts for Balatro rules including Stone cards, Wild cards,
     and modifier jokers (Four Fingers, Shortcut, Smeared Joker).
     """
@@ -42,7 +58,9 @@ def evaluate_poker_hand(
     has_smeared = JokerName.SMEARED_JOKER in joker_names
 
     # Filter out Stone cards (they have no rank and no suit)
-    valid_cards = [c for c in cards if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE]
+    valid_cards = [
+        c for c in cards if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE
+    ]
 
     if not valid_cards:
         return PokerHand.HIGH_CARD
@@ -54,7 +72,7 @@ def evaluate_poker_hand(
     def is_flush(card_subset: Sequence[PlayingCard], min_len: int = 5) -> bool:
         if len(card_subset) < min_len:
             return False
-        
+
         # All base suits
         suits_to_check = [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]
         for target_suit in suits_to_check:
@@ -63,9 +81,12 @@ def evaluate_poker_hand(
                 if c.enhancement == Enhancement.WILD:
                     match_count += 1
                 elif has_smeared:
-                    if target_suit in (Suit.HEARTS, Suit.DIAMONDS) and c.suit in (Suit.HEARTS, Suit.DIAMONDS):
-                        match_count += 1
-                    elif target_suit in (Suit.SPADES, Suit.CLUBS) and c.suit in (Suit.SPADES, Suit.CLUBS):
+                    if (
+                        target_suit in (Suit.HEARTS, Suit.DIAMONDS)
+                        and c.suit in (Suit.HEARTS, Suit.DIAMONDS)
+                        or target_suit in (Suit.SPADES, Suit.CLUBS)
+                        and c.suit in (Suit.SPADES, Suit.CLUBS)
+                    ):
                         match_count += 1
                 elif c.suit == target_suit:
                     match_count += 1
@@ -78,7 +99,9 @@ def evaluate_poker_hand(
         if len(card_subset) < min_len:
             return False
 
-        unique_vals = set(RANK_VALUES[c.rank] for c in card_subset if c.rank in RANK_VALUES)
+        unique_vals = {
+            RANK_VALUES[c.rank] for c in card_subset if c.rank in RANK_VALUES
+        }
         if not unique_vals:
             return False
 
@@ -94,8 +117,7 @@ def evaluate_poker_hand(
             diff = sorted_vals[i] - sorted_vals[i - 1]
             if diff == 1 or (has_shortcut and diff == 2):
                 current_streak += 1
-                if current_streak > max_consecutive:
-                    max_consecutive = current_streak
+                max_consecutive = max(max_consecutive, current_streak)
             elif diff > 0:
                 current_streak = 1
 
@@ -112,7 +134,13 @@ def evaluate_poker_hand(
         return PokerHand.FLUSH_FIVE
 
     # 2. Flush House: Full house (3 of a kind + pair) where all cards share suit
-    if len(valid_cards) >= 5 and counts_sorted[0] >= 3 and len(counts_sorted) > 1 and counts_sorted[1] >= 2 and is_flush(valid_cards, min_len=5):
+    if (
+        len(valid_cards) >= 5
+        and counts_sorted[0] >= 3
+        and len(counts_sorted) > 1
+        and counts_sorted[1] >= 2
+        and is_flush(valid_cards, min_len=5)
+    ):
         return PokerHand.FLUSH_HOUSE
 
     # 3. Five of a Kind
@@ -162,7 +190,7 @@ def get_scoring_cards(
     jokers: Sequence[Joker] | None = None,
 ) -> list[PlayingCard]:
     """Extracts the exact subset of played cards that actively score for the hand.
-    
+
     Adheres strictly to Balatro game logic:
     1. If the player has Splash, all played cards score.
     2. Any Stone Card played is always included in scoring cards.
@@ -181,12 +209,10 @@ def get_scoring_cards(
     has_smeared = JokerName.SMEARED_JOKER in joker_names
 
     stone_cards = [
-        c for c in cards
-        if c.enhancement == Enhancement.STONE or c.rank == Rank.NONE
+        c for c in cards if c.enhancement == Enhancement.STONE or c.rank == Rank.NONE
     ]
     valid_cards = [
-        c for c in cards
-        if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE
+        c for c in cards if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE
     ]
 
     if not valid_cards:
@@ -211,9 +237,20 @@ def get_scoring_cards(
                 if c.enhancement == Enhancement.WILD:
                     matched.append(c)
                 elif has_smeared:
-                    if target_suit in (Suit.HEARTS, Suit.DIAMONDS) and c.suit in (Suit.HEARTS, Suit.DIAMONDS):
-                        matched.append(c)
-                    elif target_suit in (Suit.SPADES, Suit.CLUBS) and c.suit in (Suit.SPADES, Suit.CLUBS):
+                    if (
+                        target_suit in (Suit.HEARTS, Suit.DIAMONDS)
+                        and c.suit
+                        in (
+                            Suit.HEARTS,
+                            Suit.DIAMONDS,
+                        )
+                        or target_suit in (Suit.SPADES, Suit.CLUBS)
+                        and c.suit
+                        in (
+                            Suit.SPADES,
+                            Suit.CLUBS,
+                        )
+                    ):
                         matched.append(c)
                 elif c.suit == target_suit:
                     matched.append(c)
