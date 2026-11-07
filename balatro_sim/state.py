@@ -1,24 +1,30 @@
 """Game State & Deck Tracking for Balatro Simulation.
 
-Tracks active run parameters:
+Tracks active run parameters with 100% parity to `balatro_source`:
 - seed (e.g. "HELLO")
 - ante (1-based)
 - round within ante (1=Small, 2=Big, 3=Boss) and total round count
 - deck: list of active card instances (Suit, Rank, Enhancement, Edition, Seal)
-  supporting add, remove, convert, destroy mutations
+  ordered by Balatro's exact `sort_id` (`C_2..C_T, D_2..D_T, H_2..H_T, S_2..S_T`)
+  and supporting add, remove, convert, destroy mutations
 - owned_jokers: list of active jokers and their positions
-- stake: modifiers affecting probabilities/costs
-- round lifecycle transitions: start_ante, start_round, trigger_start_of_round_effects, end_round
+- used_vouchers & shop_vouchers: tracks redeemed and currently visible shop vouchers
+- bosses_used: tracks boss blind generation counts for `get_new_boss()` parity
+- visible_hands: tracks visible poker hands (`G.GAME.hands`) for To Do List & Orbital Tag
+- active_tarots / banned_keys: tracks item availability for `get_current_pool()` parity
 """
 
 from __future__ import annotations
 
 import copy
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from enum import Enum, StrEnum
-from typing import Any, Callable
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from balatro_sim.rng import BalatroRNG
 
 
 class Suit(StrEnum):
@@ -159,6 +165,20 @@ class Seal(StrEnum):
     GOLD = "gold"
     PURPLE = "purple"
 
+    @property
+    def balatro_name(self) -> str:
+        match self:
+            case Seal.RED:
+                return "Red"
+            case Seal.BLUE:
+                return "Blue"
+            case Seal.GOLD:
+                return "Gold"
+            case Seal.PURPLE:
+                return "Purple"
+            case _:
+                return "None"
+
     @classmethod
     def from_str(cls, s: str) -> Seal:
         val = s.strip().lower()
@@ -184,9 +204,65 @@ class Stake(StrEnum):
     GOLD = "Gold Stake"
 
 
+# Default poker hands order in G.GAME.hands (game.lua:2001-2014)
+ALL_POKER_HANDS_ORDER: list[str] = [
+    "Flush Five",       # order = 1, visible = False by default
+    "Flush House",      # order = 2, visible = False by default
+    "Five of a Kind",   # order = 3, visible = False by default
+    "Straight Flush",   # order = 4, visible = True
+    "Four of a Kind",   # order = 5, visible = True
+    "Full House",       # order = 6, visible = True
+    "Flush",            # order = 7, visible = True
+    "Straight",         # order = 8, visible = True
+    "Three of a Kind",  # order = 9, visible = True
+    "Two Pair",         # order = 10, visible = True
+    "Pair",             # order = 11, visible = True
+    "High Card",        # order = 12, visible = True
+]
+
+DEFAULT_VISIBLE_POKER_HANDS: list[str] = [
+    "Straight Flush",
+    "Four of a Kind",
+    "Full House",
+    "Flush",
+    "Straight",
+    "Three of a Kind",
+    "Two Pair",
+    "Pair",
+    "High Card",
+]
+
+# Lexicographical rank order used by Balatro's card_protos sort (`a.s .. a.r`):
+# '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'J', 'K', 'Q', 'T'
+LEXICOGRAPHICAL_RANKS: list[Rank] = [
+    Rank.TWO,
+    Rank.THREE,
+    Rank.FOUR,
+    Rank.FIVE,
+    Rank.SIX,
+    Rank.SEVEN,
+    Rank.EIGHT,
+    Rank.NINE,
+    Rank.ACE,
+    Rank.JACK,
+    Rank.KING,
+    Rank.QUEEN,
+    Rank.TEN,
+]
+
+# Lexicographical suit order used by Balatro's card_protos sort (`a.s .. a.r`):
+# 'C', 'D', 'H', 'S'
+LEXICOGRAPHICAL_SUITS: list[Suit] = [
+    Suit.CLUBS,
+    Suit.DIAMONDS,
+    Suit.HEARTS,
+    Suit.SPADES,
+]
+
+
 @dataclass
 class Card:
-    """Card instance representation."""
+    """Card instance representation matching Balatro's `Card` object."""
 
     suit: Suit
     rank: Rank
@@ -195,7 +271,11 @@ class Card:
     seal: Seal = Seal.NONE
     debuffed: bool = False
     bonus_chips: int = 0
-    id: int = 0
+    id: int = 0  # Corresponds to Balatro's `sort_id`
+
+    @property
+    def sort_id(self) -> int:
+        return self.id
 
     @property
     def is_face(self) -> bool:
@@ -210,7 +290,7 @@ class Card:
         return f"{self.suit.short_code}_{self.rank.short_code}"
 
     def is_suit(self, suit: Suit | str) -> bool:
-        """Check card suit, taking Wild Card enhancement into account."""
+        """Check card suit, taking Wild Card and Stone Card enhancements into account."""
         if self.enhancement == Enhancement.STONE:
             return False
         if self.enhancement == Enhancement.WILD:
@@ -252,42 +332,83 @@ class JokerInstance:
 
 
 class Deck:
-    """Active deck representation with full mutation capabilities."""
+    """Active deck representation (`G.playing_cards`) with exact `sort_id` ordering."""
 
     def __init__(self, cards: list[Card] | None = None) -> None:
-        self.cards: list[Card] = cards if cards is not None else []
-        self._next_id: int = max([c.id for c in self.cards], default=0) + 1
+        self.cards: list[Card] = []
+        self._next_id: int = 1
+        if cards is not None:
+            for c in cards:
+                self.add_card(c)
 
     @classmethod
     def create_standard_52(cls) -> Deck:
-        """Create a standard Balatro 52-card deck."""
+        """Create a standard 52-card deck sorted in Balatro's exact `s..r` `sort_id` order.
+        
+        In `balatro_source/game.lua:2367-2373`, `card_protos` are sorted by
+        `((a.s or '')..(a.r or '')...) < ((b.s or '')..(b.r or '')...)`,
+        producing Clubs (2..9, A, J, K, Q, T), Diamonds, Hearts, Spades with `sort_id` 1..52.
+        """
         cards: list[Card] = []
         card_id = 1
-        for s in [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]:
-            for r in [
-                Rank.TWO,
-                Rank.THREE,
-                Rank.FOUR,
-                Rank.FIVE,
-                Rank.SIX,
-                Rank.SEVEN,
-                Rank.EIGHT,
-                Rank.NINE,
-                Rank.TEN,
-                Rank.JACK,
-                Rank.QUEEN,
-                Rank.KING,
-                Rank.ACE,
-            ]:
+        for s in LEXICOGRAPHICAL_SUITS:
+            for r in LEXICOGRAPHICAL_RANKS:
                 cards.append(Card(suit=s, rank=r, id=card_id))
                 card_id += 1
         return cls(cards)
 
+    @classmethod
+    def create_abandoned_40(cls) -> Deck:
+        """Create an Abandoned Deck (40 cards, no Jack/Queen/King) in exact `sort_id` order."""
+        cards: list[Card] = []
+        card_id = 1
+        for s in LEXICOGRAPHICAL_SUITS:
+            for r in LEXICOGRAPHICAL_RANKS:
+                if r not in (Rank.JACK, Rank.QUEEN, Rank.KING):
+                    cards.append(Card(suit=s, rank=r, id=card_id))
+                    card_id += 1
+        return cls(cards)
+
+    @classmethod
+    def create_checkered_52(cls) -> Deck:
+        """Create a Checkered Deck (26 Spades, 26 Hearts) in exact `sort_id` order.
+        
+        In `balatro_source/back.lua:239-253`, Clubs (`sort_id` 1..13) are converted to Spades
+        and Diamonds (`sort_id` 14..26) are converted to Hearts.
+        """
+        deck = cls.create_standard_52()
+        for c in deck.cards:
+            if c.suit == Suit.CLUBS:
+                c.suit = Suit.SPADES
+            elif c.suit == Suit.DIAMONDS:
+                c.suit = Suit.HEARTS
+        return deck
+
+    @classmethod
+    def create_erratic_52(cls, rng: BalatroRNG) -> Deck:
+        """Create an Erratic Deck (52 randomized cards using stream `'erratic'`) in exact `sort_id` order."""
+        from balatro_sim.events import P_CARDS_KEYS, parse_card_key
+
+        protos: list[str] = []
+        for _ in range(52):
+            k, _ = rng.choice("erratic", P_CARDS_KEYS)
+            protos.append(k)
+        # Sort by s..r just like game.lua:2367 (`C_2` < `C_3` < ... < `S_T`)
+        protos.sort(key=lambda key: key.replace("_", ""))
+        cards: list[Card] = []
+        for idx, k in enumerate(protos, start=1):
+            suit, rank = parse_card_key(k)
+            cards.append(Card(suit=suit, rank=rank, id=idx))
+        return cls(cards)
+
     def add_card(self, card: Card) -> Card:
-        """Add a card to the deck."""
-        if card.id == 0:
+        """Add a card to the deck, assigning the next `sort_id` if unset."""
+        if card.id <= 0:
             card.id = self._next_id
             self._next_id += 1
+        else:
+            if card.id >= self._next_id:
+                self._next_id = card.id + 1
         self.cards.append(card)
         return card
 
@@ -300,7 +421,7 @@ class Deck:
         return None
 
     def destroy_card(self, card_or_id: Card | int) -> Card | None:
-        """Destroy a card (alias for remove_card with logging/tracking)."""
+        """Destroy a card (alias for remove_card)."""
         return self.remove_card(card_or_id)
 
     def convert_card(
@@ -312,7 +433,7 @@ class Deck:
         new_edition: Edition | str | None = None,
         new_seal: Seal | str | None = None,
     ) -> Card | None:
-        """Mutate an existing card's attributes in place."""
+        """Mutate an existing card's attributes in place (preserving its `sort_id`)."""
         target_id = card_or_id.id if isinstance(card_or_id, Card) else card_or_id
         target = next((c for c in self.cards if c.id == target_id), None)
         if target is None:
@@ -335,15 +456,36 @@ class Deck:
             target.seal = Seal.from_str(str(new_seal)) if isinstance(new_seal, str) else new_seal
         return target
 
+    def get_non_stone_cards(self) -> list[Card]:
+        """Return all cards where `v.ability.effect ~= 'Stone Card'`, sorted by `sort_id`.
+        
+        Used by `reset_idol_card()`, `reset_mail_rank()`, and `reset_castle_card()`,
+        since `pseudorandom_element` sorts `Card` objects by `a.v.sort_id < b.v.sort_id`.
+        """
+        valid = [
+            c
+            for c in self.cards
+            if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE and c.suit != Suit.NONE
+        ]
+        valid.sort(key=lambda c: c.id)
+        return valid
+
     def get_valid_rank_cards(self) -> list[Card]:
-        """Cards that possess a valid rank (non-Stone cards)."""
-        return [c for c in self.cards if c.enhancement != Enhancement.STONE and c.rank != Rank.NONE]
+        """Alias for `get_non_stone_cards()`."""
+        return self.get_non_stone_cards()
 
     def get_rank_histogram(self) -> dict[Rank, int]:
-        """Return counts of each rank in current deck."""
-        hist: dict[Rank, int] = Counter()
-        for c in self.get_valid_rank_cards():
+        """Return counts of each rank in current deck (excluding Stone cards)."""
+        hist: Counter[Rank] = Counter()
+        for c in self.get_non_stone_cards():
             hist[c.rank] += 1
+        return dict(hist)
+
+    def get_suit_histogram(self) -> dict[Suit, int]:
+        """Return counts of each base suit in current deck (excluding Stone cards)."""
+        hist: Counter[Suit] = Counter()
+        for c in self.get_non_stone_cards():
+            hist[c.suit] += 1
         return dict(hist)
 
     def clone(self) -> Deck:
@@ -355,6 +497,15 @@ class Deck:
     def __len__(self) -> int:
         return len(self.cards)
 
+    def __iter__(self) -> Iterator[Card]:
+        return iter(self.cards)
+
+    def __getitem__(self, index: int) -> Card:
+        return self.cards[index]
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.cards
+
 
 @dataclass
 class GameState:
@@ -363,8 +514,9 @@ class GameState:
     seed: str
     ante: int = 1
     round_within_ante: int = 1  # 1=Small Blind, 2=Big Blind, 3=Boss Blind
-    total_rounds: int = 1
+    total_rounds: int = 0
     deck: Deck = field(default_factory=Deck.create_standard_52)
+    deck_type: str = "Red Deck"
     owned_jokers: list[JokerInstance] = field(default_factory=list)
     stake: Stake = Stake.WHITE
     hand: list[Card] = field(default_factory=list)
@@ -372,19 +524,77 @@ class GameState:
     hands_played_this_round: int = 0
     money: int = 4
     round_active: bool = True
+    win_ante: int = 8
+
+    # Dynamic round targets (G.GAME.current_round)
+    ancient_suit: Suit | None = None
+    castle_suit: Suit = Suit.SPADES
+    idol_card: tuple[Rank, Suit] = (Rank.ACE, Suit.SPADES)
+    mail_rank: Rank = Rank.ACE
+    to_do_hand: str | None = None
+
+    # Global pool / progression tracking (G.GAME)
+    used_vouchers: set[str] = field(default_factory=set)
+    shop_vouchers: list[str] = field(default_factory=list)
+    bosses_used: dict[str, int] = field(default_factory=dict)
+    current_boss: str | None = None
+    banned_keys: set[str] = field(default_factory=set)
+    active_tarots: set[str] = field(default_factory=set)
+    visible_hands: list[str] = field(
+        default_factory=lambda: list(DEFAULT_VISIBLE_POKER_HANDS)
+    )
+    pool_flags: dict[str, bool] = field(default_factory=dict)
+
     start_of_round_hooks: list[Callable[[GameState], None]] = field(default_factory=list)
+
+    @property
+    def round(self) -> int:
+        """Alias for `round_within_ante`."""
+        return self.round_within_ante
+
+    @round.setter
+    def round(self, value: int) -> None:
+        self.round_within_ante = value
+
+    @property
+    def total_rounds_played(self) -> int:
+        """Alias for `total_rounds`."""
+        return self.total_rounds
+
+    @total_rounds_played.setter
+    def total_rounds_played(self, value: int) -> None:
+        self.total_rounds = value
 
     @property
     def oops_count(self) -> int:
         """Count how many active Oops! All 6s jokers are owned."""
-        return sum(
-            1 for j in self.owned_jokers if "oops" in j.name.lower()
+        return sum(1 for j in self.owned_jokers if "oops" in j.name.lower())
+
+    @property
+    def has_showman(self) -> bool:
+        """Check whether Showman ('Ring Master') is currently owned."""
+        return any(
+            "showman" in j.name.lower() or "ring_master" in j.name.lower()
+            for j in self.owned_jokers
         )
 
     @property
     def probability_modifier(self) -> float:
         """Probability multiplier from Oops! All 6s (doubles per joker)."""
         return float(2 ** self.oops_count)
+
+    def unlock_secret_hand(self, hand_name: str) -> None:
+        """Make a secret poker hand ('Flush Five', 'Flush House', 'Five of a Kind') visible.
+        
+        Preserves Balatro's `G.GAME.hands` canonical order.
+        """
+        if hand_name not in ALL_POKER_HANDS_ORDER:
+            raise ValueError(f"Unknown poker hand: {hand_name}")
+        if hand_name not in self.visible_hands:
+            new_visible_set = set(self.visible_hands) | {hand_name}
+            self.visible_hands = [
+                h for h in ALL_POKER_HANDS_ORDER if h in new_visible_set
+            ]
 
     def add_joker(
         self,
@@ -478,11 +688,26 @@ class GameState:
             "ante": self.ante,
             "round_within_ante": self.round_within_ante,
             "total_rounds": self.total_rounds,
+            "deck_type": self.deck_type,
             "stake": self.stake.value,
             "money": self.money,
             "round_active": self.round_active,
+            "win_ante": self.win_ante,
             "discards_made_this_round": self.discards_made_this_round,
             "hands_played_this_round": self.hands_played_this_round,
+            "ancient_suit": self.ancient_suit.value if self.ancient_suit else None,
+            "castle_suit": self.castle_suit.value,
+            "idol_card": [self.idol_card[0].value, self.idol_card[1].value],
+            "mail_rank": self.mail_rank.value,
+            "to_do_hand": self.to_do_hand,
+            "used_vouchers": sorted(self.used_vouchers),
+            "shop_vouchers": list(self.shop_vouchers),
+            "bosses_used": dict(self.bosses_used),
+            "current_boss": self.current_boss,
+            "banned_keys": sorted(self.banned_keys),
+            "active_tarots": sorted(self.active_tarots),
+            "visible_hands": list(self.visible_hands),
+            "pool_flags": dict(self.pool_flags),
             "deck": [
                 {
                     "suit": c.suit.value,
@@ -516,11 +741,30 @@ class GameState:
         self.ante = snap["ante"]
         self.round_within_ante = snap["round_within_ante"]
         self.total_rounds = snap["total_rounds"]
+        self.deck_type = snap.get("deck_type", "Red Deck")
         self.stake = Stake(snap["stake"])
         self.money = snap["money"]
         self.round_active = snap["round_active"]
+        self.win_ante = snap.get("win_ante", 8)
         self.discards_made_this_round = snap.get("discards_made_this_round", 0)
         self.hands_played_this_round = snap.get("hands_played_this_round", 0)
+
+        anc = snap.get("ancient_suit")
+        self.ancient_suit = Suit(anc) if anc else None
+        self.castle_suit = Suit(snap.get("castle_suit", Suit.SPADES.value))
+        idol_raw = snap.get("idol_card", [Rank.ACE.value, Suit.SPADES.value])
+        self.idol_card = (Rank(idol_raw[0]), Suit(idol_raw[1]))
+        self.mail_rank = Rank(snap.get("mail_rank", Rank.ACE.value))
+        self.to_do_hand = snap.get("to_do_hand")
+
+        self.used_vouchers = set(snap.get("used_vouchers", []))
+        self.shop_vouchers = list(snap.get("shop_vouchers", []))
+        self.bosses_used = dict(snap.get("bosses_used", {}))
+        self.current_boss = snap.get("current_boss")
+        self.banned_keys = set(snap.get("banned_keys", []))
+        self.active_tarots = set(snap.get("active_tarots", []))
+        self.visible_hands = list(snap.get("visible_hands", DEFAULT_VISIBLE_POKER_HANDS))
+        self.pool_flags = dict(snap.get("pool_flags", {}))
 
         restored_cards = [
             Card(
@@ -552,19 +796,8 @@ class GameState:
 
     def clone(self) -> GameState:
         """Create an independent deep copy of this game state."""
-        cloned = GameState(
-            seed=self.seed,
-            ante=self.ante,
-            round_within_ante=self.round_within_ante,
-            total_rounds=self.total_rounds,
-            deck=self.deck.clone(),
-            owned_jokers=[j.clone() for j in self.owned_jokers],
-            stake=self.stake,
-            hand=[c.clone() for c in self.hand],
-            discards_made_this_round=self.discards_made_this_round,
-            hands_played_this_round=self.hands_played_this_round,
-            money=self.money,
-            round_active=self.round_active,
-        )
+        cloned = GameState(seed=self.seed)
+        cloned.restore(self.checkpoint())
+        cloned.hand = [c.clone() for c in self.hand]
+        cloned.start_of_round_hooks = list(self.start_of_round_hooks)
         return cloned
-
