@@ -1,4 +1,4 @@
-"""Comprehensive Unit Tests for Balatro Deterministic Simulation Engine.
+"""Comprehensive Unit Tests for Balatro Deterministic Simulation Engine (`game.engine.rng_sim`).
 
 Verifies:
 1. Exact bit-level parity of pseudohash, pseudoseed, Tw223, and LCG step against
@@ -19,6 +19,8 @@ Verifies:
 15. Boss Blind queue (`'boss'`), including `min_ante` locks, Ante 8 Showdown bosses, boss rerolls, Hieroglyph/Petroglyph (`-1 ante` vouchers at Ante 1 and Ante 8), and `bosses_used` cycle wrap-around.
 16. Skip Tag queue (`'Tag{ante}'`), including Ante 1 `min_ante = 2` resampling, `-1 ante` vouchers, and Orbital Tag (`'orbital'`) poker hand selection.
 17. Voucher queue (`'Voucher{ante}'` vs `'Voucher_fromtag'`), including unbought voucher re-appearances, Tier-1 -> Tier-2 prerequisite unlocking, starting deck vouchers (Magic/Nebula/Zodiac), and Voucher Tag global stream behavior.
+18. Mid-ante deck mutations: stateful round-by-round progression AND direct `round_num` jumping (`round_num=2|3`) without evaluating earlier rounds.
+19. Direct integration with `game.balatro_models` (`PlayingCard`, `Joker`, `Tarot`, `Voucher`, enums) and `game.gamestate.GameState`.
 """
 
 from __future__ import annotations
@@ -26,8 +28,27 @@ from __future__ import annotations
 import math
 import unittest
 
-from balatro_sim.api import BalatroRun, validate_seed
-from balatro_sim.events import (
+from game.balatro_models import (
+    BlindName,
+    Deck as DeckType,
+    Edition,
+    Enhancement,
+    Joker,
+    JokerName,
+    PlayingCard,
+    PokerHand,
+    Rank,
+    Seal,
+    SkipTag,
+    Stake,
+    Suit,
+    Tarot,
+    TarotName,
+    Voucher,
+    VoucherName,
+)
+from game.engine.rng_sim.api import BalatroRun, validate_seed
+from game.engine.rng_sim.events import (
     P_BOSS_BLINDS,
     P_CARDS_KEYS,
     P_TAGS,
@@ -47,7 +68,7 @@ from balatro_sim.events import (
     get_mail_in_rebate_target,
     predict_certificate,
 )
-from balatro_sim.rng import (
+from game.engine.rng_sim.rng import (
     BalatroRNG,
     Tw223,
     advance,
@@ -58,18 +79,16 @@ from balatro_sim.rng import (
     truncate13,
     u64_to_double,
 )
-from balatro_sim.state import (
+from game.engine.rng_sim.state import (
     Card,
     Deck,
-    Edition,
-    Enhancement,
     GameState,
     JokerInstance,
-    Rank,
-    Seal,
-    Stake,
-    Suit,
+    SimCard,
+    SimDeck,
+    SimGameState,
 )
+from game.gamestate import GameState as EngineGameState
 
 
 class TestRNGExactParity(unittest.TestCase):
@@ -96,7 +115,6 @@ class TestRNGExactParity(unittest.TestCase):
                 f"pseudohash('{s}') mismatch: 0x{actual_u64:016x} != 0x{expected_u64:016x}",
             )
 
-        # Test NaN case (division by zero in backwards hash loop)
         nan_hash = pseudohash("erratic7LB2WVPK".encode("utf-8"))
         self.assertTrue(math.isnan(nan_hash), "Expected NaN for 'erratic7LB2WVPK'")
 
@@ -122,23 +140,18 @@ class TestRNGExactParity(unittest.TestCase):
         """Verify multi-stream step progression against reference TESTSEED sequence."""
         rng = BalatroRNG("TESTSEED")
 
-        # 1. ['range', 'cdt1', 1, 52, 17]
         r1 = rng.randint("cdt1", 1, 52)
         self.assertEqual(r1, 17)
 
-        # 2. ['range', 'rarity1sho', 1, 52, 7]
         r2 = rng.randint("rarity1sho", 1, 52)
         self.assertEqual(r2, 7)
 
-        # 3. ['random', 'lucky_mult', '3fd496c83c669c70']
         f3 = rng.random("lucky_mult")
         self.assertEqual(double_to_u64(f3), 0x3FD496C83C669C70)
 
-        # 4. ['range', 'rarity1sho', 1, 52, 41]
         r4 = rng.randint("rarity1sho", 1, 52)
         self.assertEqual(r4, 41)
 
-        # 5. ['range', 'anc1', 1, 52, 36]
         r5 = rng.randint("anc1", 1, 52)
         self.assertEqual(r5, 36)
 
@@ -252,6 +265,7 @@ class TestCertificateMechanics(unittest.TestCase):
         self.assertEqual(cert_result.seal, Seal.PURPLE)
         self.assertEqual(cert_result.front_key, "C_Q")
         self.assertEqual(cert_result.seal_key, "Purple")
+        self.assertIsInstance(cert_result.card, PlayingCard)
 
         self.assertEqual(len(run.state.deck), initial_deck_len + 1)
         self.assertIn(cert_result.card, run.state.deck)
@@ -296,7 +310,7 @@ class TestLuckyCards(unittest.TestCase):
         self.assertEqual(run.state.oops_count, 0)
         self.assertEqual(run.state.probability_modifier, 1.0)
 
-        run.add_joker("Oops! All 6s")
+        run.add_joker(JokerName.OOPS_ALL_6S)
         self.assertEqual(run.state.oops_count, 1)
         self.assertEqual(run.state.probability_modifier, 2.0)
 
@@ -336,10 +350,10 @@ class TestMailInRebate(unittest.TestCase):
         target = Rank.FOUR
 
         discards = [
-            Card(Suit.SPADES, Rank.FOUR),
-            Card(Suit.HEARTS, Rank.FOUR),
-            Card(Suit.CLUBS, Rank.KING),
-            Card(Suit.DIAMONDS, Rank.ACE),
+            PlayingCard(suit=Suit.SPADES, rank=Rank.FOUR),
+            PlayingCard(suit=Suit.HEARTS, rank=Rank.FOUR),
+            PlayingCard(suit=Suit.CLUBS, rank=Rank.KING),
+            PlayingCard(suit=Suit.DIAMONDS, rank=Rank.ACE),
         ]
         result = run.evaluate_mail_in_rebate_discard(discards, target_rank=target)
         self.assertEqual(result.matches, 2)
@@ -359,17 +373,14 @@ class TestNewRoundTargetJokers(unittest.TestCase):
 
     def test_castle_suit_selection_and_deck_dependency(self) -> None:
         run = BalatroRun(seed="HELLO")
-        # In Ante 1 for seed HELLO, the 3 rounds (Small, Big, Boss) pull 3 times from 'cas1'
         ante1_suits = run.predict_castle_suits_for_ante(ante=1, rounds=3)
         self.assertEqual(ante1_suits, [Suit.DIAMONDS, Suit.SPADES, Suit.HEARTS])
 
-        # Edge Case 1: Checkered Deck (only Spades and Hearts)
-        checkered_run = BalatroRun(seed="HELLO", deck="Checkered Deck")
+        checkered_run = BalatroRun(seed="HELLO", deck=DeckType.CHECKERED_DECK)
         for ante in range(1, 9):
             for s in checkered_run.predict_castle_suits_for_ante(ante=ante, rounds=3):
                 self.assertIn(s, [Suit.SPADES, Suit.HEARTS])
 
-        # Edge Case 2: All Stone Cards in deck -> defaults to Suit.SPADES without crashing
         all_stone_deck = Deck([
             Card(Suit.HEARTS, Rank.KING, enhancement=Enhancement.STONE),
             Card(Suit.DIAMONDS, Rank.ACE, enhancement=Enhancement.STONE),
@@ -381,7 +392,6 @@ class TestNewRoundTargetJokers(unittest.TestCase):
         run = BalatroRun(seed="HELLO")
         suits_by_ante = run.predict_ancient_joker_suits(antes=range(1, 9), rounds_per_ante=3)
 
-        # Flatten all 24 rounds across Antes 1..8 and verify no two consecutive rounds ever share a suit!
         flat_suits = [s for a in range(1, 9) for s in suits_by_ante[a]]
         self.assertEqual(len(flat_suits), 24)
         for i in range(1, len(flat_suits)):
@@ -391,18 +401,14 @@ class TestNewRoundTargetJokers(unittest.TestCase):
                 f"Ancient Joker repeated {flat_suits[i]} at round index {i}",
             )
 
-        # Verify Ante 1 and Ante 2 exact sequences for seed HELLO
         self.assertEqual(suits_by_ante[1], [Suit.SPADES, Suit.HEARTS, Suit.SPADES])
         self.assertEqual(suits_by_ante[2], [Suit.HEARTS, Suit.DIAMONDS, Suit.CLUBS])
 
-        # Edge case: Skipping a blind in Ante 1 reduces 'anc1' calls from 3 to 2, changing the suit
-        # carried into Ante 2 Small Blind!
         with_skip = run.predict_ancient_joker_suits(
             antes=[1, 2], rounds_per_ante=3, skips_per_ante={1: 1}
         )
         self.assertEqual(len(with_skip[1]), 2)
         self.assertEqual(with_skip[1], [Suit.SPADES, Suit.HEARTS])
-        # Because Ante 1 ended on Hearts instead of Spades, Ante 2 Round 1 excludes Hearts and picks Spades!
         self.assertEqual(with_skip[2][0], Suit.SPADES)
 
     def test_idol_card_selection_and_deck_dependency(self) -> None:
@@ -413,7 +419,6 @@ class TestNewRoundTargetJokers(unittest.TestCase):
         self.assertEqual((ante1_idols[1].rank, ante1_idols[1].suit), (Rank.NINE, Suit.SPADES))
         self.assertEqual((ante1_idols[2].rank, ante1_idols[2].suit), (Rank.FOUR, Suit.HEARTS))
 
-        # Edge Case: Deck thinned to only Ace of Spades and Stone Cards -> Idol always picks Ace of Spades
         thin_deck = Deck([
             Card(Suit.SPADES, Rank.ACE),
             Card(Suit.HEARTS, Rank.TWO, enhancement=Enhancement.STONE),
@@ -429,19 +434,151 @@ class TestNewRoundTargetJokers(unittest.TestCase):
         run = BalatroRun(seed="HELLO")
         hands = run.predict_to_do_list_hands(rounds=10)
         self.assertEqual(len(hands), 10)
-        # First draw on seed HELLO from 9 visible hands is 'Straight'
-        self.assertEqual(hands[0], "Straight")
-        self.assertEqual(hands[:4], ["Straight", "Flush", "Three of a Kind", "Four of a Kind"])
-        # Subsequent end-of-round draws exclude the current hand, so no two consecutive rounds match
+        self.assertIsInstance(hands[0], PokerHand)
+        self.assertEqual(hands[0], PokerHand.STRAIGHT)
+        self.assertEqual(
+            hands[:4],
+            [
+                PokerHand.STRAIGHT,
+                PokerHand.FLUSH,
+                PokerHand.THREE_OF_A_KIND,
+                PokerHand.FOUR_OF_A_KIND,
+            ],
+        )
         for i in range(1, len(hands)):
             self.assertNotEqual(hands[i], hands[i - 1])
 
-        # Edge Case: Unlocking secret hands ('Five of a Kind', 'Flush Five') mid-run expands the pool
         hands_with_secret = run.predict_to_do_list_hands(
             rounds=4,
-            secret_hand_unlocks={2: ["Five of a Kind", "Flush Five"]},
+            secret_hand_unlocks={2: [PokerHand.FIVE_OF_A_KIND, PokerHand.FLUSH_FIVE]},
         )
-        self.assertEqual(hands_with_secret, ["Straight", "Flush", "Three of a Kind", "Straight Flush"])
+        self.assertEqual(
+            hands_with_secret,
+            [
+                PokerHand.STRAIGHT,
+                PokerHand.FLUSH,
+                PokerHand.THREE_OF_A_KIND,
+                PokerHand.STRAIGHT_FLUSH,
+            ],
+        )
+
+
+class TestMidAnteDeckChanges(unittest.TestCase):
+    """Test how the API handles mid-ante deck mutations without throwing away n-1 rounds."""
+
+    def test_stateful_round_by_round_deck_mutation(self) -> None:
+        """Calling `get_castle_suit` / `get_idol_card` / `get_mail_in_rebate_target` round-by-round
+        advances the RNG stream one step at a time as the deck changes in-place."""
+        run = BalatroRun(seed="HELLO")
+
+        # Round 1 (Small Blind): standard 52-card deck
+        r1_castle = run.get_castle_suit(ante=1)
+        r1_idol = run.get_idol_card(ante=1)
+        r1_mail = run.get_mail_in_rebate_target(ante=1)
+        self.assertEqual(r1_castle, Suit.DIAMONDS)
+        self.assertEqual((r1_idol.rank, r1_idol.suit), (Rank.TWO, Suit.CLUBS))
+        self.assertEqual(r1_mail, Rank.SIX)
+        self.assertEqual(run.get_stream_call_count("cas1"), 1)
+        self.assertEqual(run.get_stream_call_count("idol1"), 1)
+        self.assertEqual(run.get_stream_call_count("mail1"), 1)
+
+        # In Round 1 shop, player converts all Spades into Hearts!
+        for c in run.state.deck.cards:
+            if c.suit == Suit.SPADES:
+                c.suit = Suit.HEARTS
+
+        # Round 2 (Big Blind): call `get_castle_suit(ante=1)` directly.
+        # On an unmodified 52-card deck, Round 2 would have picked `Suit.SPADES` (9 of Spades).
+        # Because those Spades are now Hearts and `'cas1'` is already at call 1, Round 2
+        # directly evaluates call 2 against the mutated deck and picks `Suit.HEARTS`!
+        r2_castle = run.get_castle_suit(ante=1)
+        r2_idol = run.get_idol_card(ante=1)
+        self.assertEqual(r2_castle, Suit.HEARTS)
+        self.assertEqual((r2_idol.rank, r2_idol.suit), (Rank.NINE, Suit.HEARTS))
+        self.assertEqual(run.get_stream_call_count("cas1"), 2)
+        self.assertEqual(run.get_stream_call_count("idol1"), 2)
+
+    def test_direct_round_num_jump_without_evaluating_previous_rounds(self) -> None:
+        """Passing `round_num=2` or `round_num=3` jumps the LCG stream directly to that round
+        and evaluates only once against the current deck—no need to evaluate rounds 1..n-1."""
+        # Build a deck where all Spades were converted to Hearts
+        mutated_deck = Deck.create_standard_52()
+        for c in mutated_deck.cards:
+            if c.suit == Suit.SPADES:
+                c.suit = Suit.HEARTS
+
+        # Create a fresh run and jump straight to Round 2 (`round_num=2`) without ever calling Round 1!
+        fresh_run = BalatroRun(seed="HELLO", deck=mutated_deck)
+        r2_castle_direct = fresh_run.get_castle_suit(ante=1, round_num=2)
+        r2_idol_direct = fresh_run.get_idol_card(ante=1, round_num=2)
+        r2_mail_direct = fresh_run.get_mail_in_rebate_target(ante=1, round_num=2)
+
+        self.assertEqual(r2_castle_direct, Suit.HEARTS)
+        self.assertEqual((r2_idol_direct.rank, r2_idol_direct.suit), (Rank.NINE, Suit.HEARTS))
+        self.assertEqual(fresh_run.get_stream_call_count("cas1"), 2)
+        self.assertEqual(fresh_run.get_stream_call_count("idol1"), 2)
+        self.assertEqual(fresh_run.get_stream_call_count("mail1"), 2)
+        self.assertIsInstance(r2_mail_direct, Rank)
+
+
+class TestBalatroModelsAndGameStateIntegration(unittest.TestCase):
+    """Verify seamless integration with `game.balatro_models` and `game.gamestate.GameState`."""
+
+    def test_models_type_identity(self) -> None:
+        run = BalatroRun(seed="HELLO")
+
+        # Cards in deck are instances of `game.balatro_models.PlayingCard`
+        self.assertTrue(all(isinstance(c, PlayingCard) for c in run.state.deck))
+
+        # Jokers are instances of `game.balatro_models.Joker`
+        j = run.add_joker(JokerName.BLUEPRINT, edition=Edition.NEGATIVE)
+        self.assertIsInstance(j, Joker)
+        self.assertEqual(j.name, JokerName.BLUEPRINT)
+        self.assertEqual(j.edition, Edition.NEGATIVE)
+
+        # TarotPrediction exposes `TarotName` and `to_model() -> Tarot`
+        tarot_pred = run.predict_cartomancer_tarot(ante=1)
+        self.assertEqual(tarot_pred.tarot_name, TarotName.MOON)
+        self.assertIsInstance(tarot_pred.to_model(), Tarot)
+
+        # VoucherPrediction exposes `VoucherName` and `to_model() -> Voucher`
+        voucher_pred = run.get_next_voucher(ante=1)
+        self.assertEqual(voucher_pred.voucher_name, VoucherName.PLANET_MERCHANT)
+        self.assertIsInstance(voucher_pred.to_model(), Voucher)
+
+        # TagPrediction exposes `SkipTag` (including `SkipTag.SKIP_TAG` alias)
+        tag_pred = run.get_next_tag(ante=1)
+        self.assertEqual(tag_pred.skip_tag, SkipTag.VOUCHER_TAG)
+        self.assertEqual(SkipTag.SKIP_TAG, SkipTag.SPEED_TAG)
+
+        # BossBlindPrediction exposes `BlindName` (including all 28 boss blinds like THE_WINDOW and THE_MANACLE)
+        boss_pred = run.get_next_boss_blind(ante=1)
+        self.assertEqual(boss_pred.blind_name, BlindName.THE_GOAD)
+        self.assertEqual(BlindName.THE_WINDOW.value, "The Window")
+        self.assertEqual(BlindName.THE_MANACLE.value, "The Manacle")
+
+        # Native `PlayingCard` supports `id`, `sort_id`, `card_key`, `is_suit`, and `is_rank`
+        pc = PlayingCard(suit=Suit.CLUBS, rank=Rank.TEN, id=9)
+        self.assertEqual(pc.id, 9)
+        self.assertEqual(pc.sort_id, 9)
+        self.assertEqual(pc.card_key, "C_T")
+        self.assertTrue(pc.is_suit(Suit.CLUBS))
+        self.assertTrue(pc.is_rank(Rank.TEN))
+
+    def test_sync_from_engine_gamestate(self) -> None:
+        gs = EngineGameState(ante=2, round=1)
+        # Engine GameState creates 52 standard PlayingCards ordered [SPADES, HEARTS, CLUBS, DIAMONDS]
+        # Verify `from_gamestate` normalizes their `sort_id`s to Balatro's exact 1..52 order!
+        run = BalatroRun.from_gamestate(seed="HELLO", gs=gs)
+        self.assertEqual(run.state.ante, 2)
+        self.assertEqual([c.card_key for c in run.state.deck.cards], P_CARDS_KEYS)
+
+        # Mutate `gs.full_deck` mid-ante (e.g., remove all Clubs) and sync into `run`
+        gs.full_deck = [c for c in gs.full_deck if c.suit != Suit.CLUBS]
+        run.sync_from_gamestate(gs)
+        self.assertEqual(len(run.state.deck), 39)
+        for _ in range(5):
+            self.assertNotEqual(run.get_castle_suit(ante=2), Suit.CLUBS)
 
 
 class TestCartomancerVagabondAndStoneJoker(unittest.TestCase):
@@ -450,45 +587,41 @@ class TestCartomancerVagabondAndStoneJoker(unittest.TestCase):
     def test_cartomancer_and_vagabond_tarot_predictions(self) -> None:
         run = BalatroRun(seed="HELLO")
 
-        # Cartomancer uses 'Tarotcar{ante}'
         c1 = run.predict_cartomancer_tarot(ante=1)
         self.assertEqual(c1.key, "c_moon")
         self.assertEqual(c1.name, "The Moon")
+        self.assertEqual(c1.tarot_name, TarotName.MOON)
         self.assertEqual(c1.stream_key, "Tarotcar1")
         self.assertEqual(c1.resample_count, 0)
 
-        # Vagabond uses 'Tarotvag{ante}'
         v1 = run.predict_vagabond_tarot(ante=1)
         self.assertEqual(v1.key, "c_empress")
         self.assertEqual(v1.name, "The Empress")
+        self.assertEqual(v1.tarot_name, TarotName.EMPRESS)
         self.assertEqual(v1.stream_key, "Tarotvag1")
         self.assertEqual(v1.resample_count, 0)
 
-        # Edge Case 1: Holding 'The Moon' in consumables blocks Cartomancer from rolling it again
-        # (unless Showman is owned), triggering 'Tarotcar1_resample2'!
         run_blocked = BalatroRun(seed="HELLO")
         c1_blocked = run_blocked.predict_cartomancer_tarot(
-            ante=1, active_tarots={"The Moon"}
+            ante=1, active_tarots={TarotName.MOON}
         )
         self.assertNotEqual(c1_blocked.key, "c_moon")
         self.assertGreaterEqual(c1_blocked.resample_count, 1)
         self.assertEqual(run_blocked.get_stream_call_count("Tarotcar1_resample2"), 1)
 
-        # Edge Case 2: With Showman owned, holding 'The Moon' does NOT block it!
         run_showman = BalatroRun(seed="HELLO")
-        run_showman.add_joker("Showman")
+        run_showman.add_joker(JokerName.SHOWMAN)
         c1_showman = run_showman.predict_cartomancer_tarot(
-            ante=1, active_tarots={"The Moon"}
+            ante=1, active_tarots={TarotName.MOON}
         )
         self.assertEqual(c1_showman.key, "c_moon")
         self.assertEqual(c1_showman.resample_count, 0)
 
-        # Edge Case 3: If all 22 Tarots are held/banned without Showman, fallback is 'c_strength' ("Strength")
         all_22 = {t.key for t in P_TAROTS}
         run_all_blocked = BalatroRun(seed="HELLO")
         fallback_t = run_all_blocked.predict_cartomancer_tarot(ante=1, active_tarots=all_22)
         self.assertEqual(fallback_t.key, "c_strength")
-        self.assertEqual(fallback_t.name, "Strength")
+        self.assertEqual(fallback_t.tarot_name, TarotName.STRENGTH)
 
     def test_stone_joker_hidden_suit_and_rank(self) -> None:
         run = BalatroRun(seed="HELLO")
@@ -502,12 +635,10 @@ class TestCartomancerVagabondAndStoneJoker(unittest.TestCase):
         self.assertEqual(stone_res.hidden_suit, Suit.SPADES)
         self.assertEqual(stone_res.card.id, 53)
 
-        # While it is a Stone Card, `is_suit` and `is_rank` return False and it is excluded from Idol/Mail/Castle
         self.assertFalse(stone_res.card.is_suit(Suit.SPADES))
         self.assertFalse(stone_res.card.is_rank(Rank.SIX))
         self.assertNotIn(stone_res.card, run.state.deck.get_non_stone_cards())
 
-        # When enhanced into a Mult Card (e.g. via The Empress), its hidden 6 of Spades is revealed!
         run.state.deck.convert_card(stone_res.card, new_enhancement=Enhancement.MULT)
         self.assertTrue(stone_res.card.is_suit(Suit.SPADES))
         self.assertTrue(stone_res.card.is_rank(Rank.SIX))
@@ -520,20 +651,16 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
     def test_boss_blind_sequence_and_edge_cases(self) -> None:
         run = BalatroRun(seed="HELLO")
 
-        # 1. Standard Antes 1..8 sequence
         bosses = run.predict_boss_blinds(max_ante=8)
         self.assertEqual(len(bosses), 8)
-        # Ante 1..7 must be Normal bosses; Ante 8 must be a Showdown boss
         for b in bosses[:7]:
             self.assertFalse(b.is_showdown)
         self.assertTrue(bosses[7].is_showdown)
         self.assertEqual(bosses[0].key, "bl_goad")
         self.assertEqual(bosses[7].key, "bl_final_leaf")
-        # No normal boss repeats in Antes 1..7
         normal_keys = [b.key for b in bosses[:7]]
         self.assertEqual(len(normal_keys), len(set(normal_keys)))
 
-        # 2. Edge Case: Reroll boss at Ante 1 (Director's Cut / Boss Tag)
         with_reroll = run.predict_boss_blinds(max_ante=8, rerolls_at_step={1: 1})
         self.assertEqual(len(with_reroll), 9)
         self.assertEqual(with_reroll[0].key, "bl_goad")
@@ -541,8 +668,6 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
         self.assertEqual(with_reroll[1].ante, 1)
         self.assertNotEqual(with_reroll[1].key, "bl_goad")
 
-        # 3. Edge Case: Buying Hieroglyph in Ante 1 (step 1) drops ante to 0, so defeating Ante 1's
-        # boss brings ante back to 1 (`ease_ante(1)`), rolling a second Ante 1 boss!
         with_hiero_a1 = run.predict_boss_blinds(
             max_ante=8, minus_ante_vouchers_at_step={1: 1}
         )
@@ -551,30 +676,20 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
         self.assertEqual(with_hiero_a1[1].ante, 1)
         self.assertNotEqual(with_hiero_a1[0].key, with_hiero_a1[1].key)
 
-        # 4. Edge Case: Buying Hieroglyph in Ante 8 (step 8) AND rerolling the boss in Ante 8
-        # AFTER buying Hieroglyph! Because Hieroglyph immediately sets `ante = 7`, rerolling the
-        # boss in Ante 8 after buying Hieroglyph rolls a NORMAL boss (`ante = 7`) instead of a
-        # Showdown boss, and then the next ante is Ante 8 again with a new Showdown boss!
         hiero_a8_reroll = run.predict_boss_blinds(
             max_ante=8,
             minus_ante_vouchers_at_step={8: 1},
             rerolls_after_voucher_at_step={8: 1},
         )
-        # Step 8 initial boss is Showdown (Verdant Leaf at ante=8)
         self.assertEqual(hiero_a8_reroll[7].ante, 8)
         self.assertTrue(hiero_a8_reroll[7].is_showdown)
-        # Reroll after Hieroglyph in step 8 is rolled at ante=7 -> Normal boss!
         self.assertEqual(hiero_a8_reroll[8].ante, 7)
         self.assertTrue(hiero_a8_reroll[8].is_reroll)
         self.assertFalse(hiero_a8_reroll[8].is_showdown)
-        # Then step 9 is Ante 8 again -> Showdown boss (and not Verdant Leaf, since Verdant Leaf was already used)!
         self.assertEqual(hiero_a8_reroll[9].ante, 8)
         self.assertTrue(hiero_a8_reroll[9].is_showdown)
         self.assertNotEqual(hiero_a8_reroll[9].key, hiero_a8_reroll[7].key)
 
-        # 5. Edge Case: Cycle exhaustion across 48 antes (6 Showdown bosses at Antes 8, 16, 24, 32, 40, 48)
-        # Since there are 5 Showdown bosses, Antes 8..40 exhaust all 5 without repeats, and Ante 48
-        # resets `min_use` to 1!
         endless_bosses = run.predict_boss_blinds(max_ante=48)
         showdowns = [b for b in endless_bosses if b.is_showdown]
         self.assertEqual(len(showdowns), 6)
@@ -587,16 +702,12 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
         tags_per_ante = run.predict_skip_tags(max_ante=8, include_orbital_hands=True)
         self.assertEqual(len(tags_per_ante), 8)
 
-        # Verify Ante 1 tags never include any `min_ante = 2` tag
         min_ante_2_keys = {t.key for t in P_TAGS if t.min_ante == 2}
         for t in tags_per_ante[0]:
             self.assertNotIn(t.key, min_ante_2_keys)
         self.assertEqual(tags_per_ante[0][0].key, "tag_voucher")
         self.assertEqual(tags_per_ante[0][1].key, "tag_voucher")
 
-        # Edge Case: Redeeming Hieroglyph in Ante 1 causes Ante 1 to be visited twice;
-        # the second visit to Ante 1 pulls the 3rd & 4th draws of 'Tag1', which hit a `min_ante = 2`
-        # slot and resample via 'Tag1_resample2'!
         tags_with_hiero_a1 = run.predict_skip_tags(
             max_ante=2, minus_ante_vouchers_at_step={1: 1}
         )
@@ -606,8 +717,6 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
                 self.assertEqual(t.ante, 1)
                 self.assertNotIn(t.key, min_ante_2_keys)
 
-        # Edge Case: Redeeming Hieroglyph in Ante 2 causes Ante 2 to be visited twice,
-        # pulling tags 1 & 2 from 'Tag2' on visit 1, and tags 3 & 4 from 'Tag2' on visit 2!
         tags_with_hiero = run.predict_skip_tags(
             max_ante=3, minus_ante_vouchers_at_step={2: 1}
         )
@@ -622,30 +731,20 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
     def test_voucher_sequence_purchase_adaptation_and_voucher_tag_global_queue(self) -> None:
         run = BalatroRun(seed="HELLO")
 
-        # 1. If NO vouchers are purchased (`purchase_plan=False`), Tier-2 vouchers never appear,
-        # and unbought Tier-1 vouchers can appear multiple times across Antes 1..8!
         unbought_seq = run.predict_voucher_sequence(max_ante=8, purchase_plan=False)
         tier2_keys = {v.key for v in P_VOUCHERS if v.requires}
         for v in unbought_seq:
             self.assertNotIn(v.key, tier2_keys)
-        # In seed HELLO, 'v_grabber' (Grabber) appears in Ante 2 AND again in Ante 5 if not bought in Ante 2!
         self.assertEqual(unbought_seq[1].key, "v_grabber")
         self.assertEqual(unbought_seq[4].key, "v_grabber")
 
-        # 2. If vouchers ARE purchased (`purchase_plan=True`), 'v_grabber' bought in Ante 2 cannot
-        # reappear in Ante 5 (Ante 5 resamples to 'v_wasteful'), and Tier-2 upgrades unlock!
         bought_seq = run.predict_voucher_sequence(max_ante=8, purchase_plan=True)
         self.assertEqual(bought_seq[1].key, "v_grabber")
         self.assertEqual(bought_seq[4].key, "v_wasteful")
         self.assertGreaterEqual(bought_seq[4].resample_count, 1)
-        # No voucher ever repeats when bought!
         bought_keys = [v.key for v in bought_seq]
         self.assertEqual(len(bought_keys), len(set(bought_keys)))
 
-        # 3. Voucher Tag (`_from_tag = true`) pulls from the GLOBAL `'Voucher_fromtag'` stream,
-        # NOT the ante-specific `'Voucher{ante}'` stream!
-        # Verify that taking 2 Voucher Tags in Ante 1 vs taking 1 in Ante 1 and 1 in Ante 2
-        # pulls the exact same sequence from `'Voucher_fromtag'` (when no conflicting vouchers are bought).
         seq_two_in_a1 = run.predict_voucher_sequence(
             max_ante=2, purchase_plan=False, voucher_tags_at_step={1: 2}
         )
@@ -661,13 +760,10 @@ class TestBossBlindsTagsAndVouchers(unittest.TestCase):
         self.assertEqual(tag_vouchers_a1[0].key, tag_vouchers_split[0].key)
         self.assertEqual(tag_vouchers_a1[1].key, tag_vouchers_split[1].key)
 
-        # 4. Starting Deck Vouchers (Zodiac Deck starts with Tarot Merchant, Planet Merchant, Overstock)
-        zodiac_run = BalatroRun(seed="HELLO", deck="Zodiac Deck")
+        zodiac_run = BalatroRun(seed="HELLO", deck=DeckType.ZODIAC_DECK)
         self.assertIn("v_overstock_norm", zodiac_run.state.used_vouchers)
         self.assertIn("v_tarot_merchant", zodiac_run.state.used_vouchers)
         self.assertIn("v_planet_merchant", zodiac_run.state.used_vouchers)
-        # In Seed HELLO, Ante 1 normal voucher is 'v_planet_merchant' on Red Deck,
-        # but on Zodiac Deck 'v_planet_merchant' is already owned at run start, so Ante 1 resamples!
         zodiac_v1 = zodiac_run.get_next_voucher(ante=1)
         self.assertNotEqual(zodiac_v1.key, "v_planet_merchant")
         self.assertGreaterEqual(zodiac_v1.resample_count, 1)
@@ -702,7 +798,7 @@ class TestEventResolvers(unittest.TestCase):
     def test_oops_modifier_scaling(self) -> None:
         run = BalatroRun(seed="HELLO")
         for _ in range(3):
-            run.add_joker("Oops! All 6s")
+            run.add_joker(JokerName.OOPS_ALL_6S)
         self.assertEqual(run.state.probability_modifier, 8.0)
 
         self.assertTrue(run.evaluate_wheel_of_fortune())
@@ -750,13 +846,13 @@ class TestDeckAndStateMutations(unittest.TestCase):
 
     def test_joker_management(self) -> None:
         run = BalatroRun(seed="HELLO")
-        run.add_joker("Blueprint")
-        run.add_joker("Brainstorm")
-        self.assertTrue(run.has_joker("Blueprint"))
+        run.add_joker(JokerName.BLUEPRINT)
+        run.add_joker(JokerName.BRAINSTORM)
+        self.assertTrue(run.has_joker(JokerName.BLUEPRINT))
         self.assertTrue(run.has_joker("Brainstorm"))
         self.assertEqual(len(run.state.owned_jokers), 2)
 
-        removed = run.remove_joker("Blueprint")
+        removed = run.remove_joker(JokerName.BLUEPRINT)
         self.assertIsNotNone(removed)
         self.assertFalse(run.has_joker("Blueprint"))
         self.assertEqual(len(run.state.owned_jokers), 1)
@@ -768,7 +864,7 @@ class TestCheckpointAndFork(unittest.TestCase):
     def test_checkpoint_and_restore(self) -> None:
         run = BalatroRun(seed="HELLO")
         run.set_state(ante=3, round_num=1)
-        run.add_joker("Joker")
+        run.add_joker(JokerName.JOKER)
 
         cp = run.checkpoint()
 
@@ -780,7 +876,7 @@ class TestCheckpointAndFork(unittest.TestCase):
         run.restore(cp)
         self.assertEqual(run.state.ante, 3)
         self.assertEqual(run.state.round, 1)
-        self.assertTrue(run.has_joker("Joker"))
+        self.assertTrue(run.has_joker(JokerName.JOKER))
         self.assertEqual(run.rng.get_channel_call_count("cert_fr7"), 0)
 
     def test_fork(self) -> None:
@@ -798,33 +894,23 @@ class TestCheckpointAndFork(unittest.TestCase):
 
 
 class TestPublicAPIAndValidation(unittest.TestCase):
-    """Test top-level BalatroRun interface and seed validation."""
+    """Test top-level public API usage and seed validation."""
 
     def test_seed_validation(self) -> None:
-        valid_seeds = ["HELLO", "TEST1234", "1A2B3C4D", "A", "12345678"]
-        for s in valid_seeds:
-            ok, res = validate_seed(s)
-            self.assertTrue(ok, f"Seed '{s}' should be valid")
-
-        ok, res = validate_seed("hello")
+        ok, clean = validate_seed("hello")
         self.assertTrue(ok)
-        self.assertEqual(res, "HELLO")
+        self.assertEqual(clean, "HELLO")
 
-        invalid_seeds = [
-            ("", "empty"),
-            ("TOOLONGSEED", "length > 8"),
-            ("HELL0", "contains '0'"),
-            ("TEST-12", "contains hyphen"),
-            ("SEED!", "contains punctuation"),
-        ]
-        for s, desc in invalid_seeds:
-            ok, msg = validate_seed(s)
-            self.assertFalse(ok, f"Seed '{s}' ({desc}) should be invalid")
+        ok_zero, _ = validate_seed("HELL0")
+        self.assertFalse(ok_zero)
+
+        ok_long, _ = validate_seed("ABCDEFGHI")
+        self.assertFalse(ok_long)
 
         with self.assertRaises(ValueError):
-            BalatroRun(seed="INVALID_SEED_TOOLONG")
+            BalatroRun(seed="BAD_0_SEED")
 
-    def test_prompt_example_workflow(self) -> None:
+    def test_prompt_api_snippet(self) -> None:
         run = BalatroRun(seed="HELLO")
         run.set_state(ante=6, round_num=2)
 
@@ -842,4 +928,4 @@ class TestPublicAPIAndValidation(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

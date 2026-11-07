@@ -1,13 +1,12 @@
-"""Deterministic PRNG Pipeline Emulation for Balatro.
+"""Deterministic PRNG Pipeline Emulation for Balatro (`game.engine.rng_sim.rng`).
 
 Replicates Balatro's exact deterministic PRNG pipeline in native Python using
 IEEE-754 64-bit float math and 64-bit unsigned integer arithmetic, modeled after
-SpectralPack's Immolate and LuaJIT 2.0.5 / 2.1.
+`balatro_source` (`functions/misc_functions.lua`) and LuaJIT 2.0.5 / 2.1 (`lj_prng.c`).
 """
 
 from __future__ import annotations
 
-import copy
 import math
 import struct
 from collections.abc import Sequence
@@ -33,13 +32,12 @@ def u64_to_double(u: int) -> float:
 def truncate13(x: float) -> float:
     """Replicate Lua's `math.abs(tonumber(string.format('%.13f', x)))`.
     
-    LuaJIT 2.0.5 formats through C runtime sprintf('%.13f'), which rounds
+    LuaJIT formats through C runtime `sprintf('%.13f')`, which rounds
     ties to nearest even and parses back to float64.
     """
     if math.isnan(x):
         return float("nan")
-    raw = abs(float(f"{x:.13f}"))
-    return raw
+    return abs(float(f"{x:.13f}"))
 
 
 def advance(state: float) -> float:
@@ -88,10 +86,12 @@ def predict_seed(key: str, predict: str) -> float:
     return (pseed + pseudohash(predict)) / 2.0
 
 
-def pseudoseed(key: str, seed: str, current_state: float | None = None) -> tuple[float, float]:
-    """Compute / advance stream state for key and seed.
+def pseudoseed(
+    key: str, seed: str, current_state: float | None = None
+) -> tuple[float, float]:
+    """Compute / advance stream state for `key` and `seed`.
     
-    Returns (next_stream_state, seed_float_for_tw223).
+    Returns `(next_stream_state, seed_float_for_tw223)`.
     If `current_state` is None, this is the first draw for the stream,
     so state is initialized via `pseudohash(key + seed)`.
     """
@@ -109,8 +109,11 @@ def pseudoseed(key: str, seed: str, current_state: float | None = None) -> tuple
 # LuaJIT Tausworthe PRNG (Tw223 / lj_prng.c)
 # ---------------------------------------------------------------------------
 
+
 def _gen_word(z: int, k: int, q: int, s: int) -> int:
-    return ((((z << q) & MASK64) ^ z) >> (k - s)) ^ (((z & ((MASK64 << (64 - k)) & MASK64)) << s) & MASK64)
+    return ((((z << q) & MASK64) ^ z) >> (k - s)) ^ (
+        ((z & ((MASK64 << (64 - k)) & MASK64)) << s) & MASK64
+    )
 
 
 def _step_word(z: int, word: int) -> int:
@@ -148,7 +151,7 @@ class Tw223:
             self.u[i] = z
 
     def random(self) -> float:
-        """Draw a uniform random float in [0.0, 1.0). Replicates `math.random()`."""
+        """Draw a uniform random float in `[0.0, 1.0)`. Replicates `math.random()`."""
         r = 0
         for i in range(4):
             self.u[i] = _step_word(self.u[i], i)
@@ -157,11 +160,11 @@ class Tw223:
         return u64_to_double(bits) - 1.0
 
     def random_n(self, m: int) -> int:
-        """Draw an integer in [1, m]. Replicates `math.random(m)`."""
+        """Draw an integer in `[1, m]`. Replicates `math.random(m)`."""
         return math.floor(self.random() * m) + 1
 
     def random_range(self, m: int, n: int) -> int:
-        """Draw an integer in [m, n]. Replicates `math.random(m, n)`."""
+        """Draw an integer in `[m, n]`. Replicates `math.random(m, n)`."""
         return math.floor(self.random() * (n - m + 1)) + m
 
     def randint(self, min_val: int, max_val: int) -> int:
@@ -171,7 +174,7 @@ class Tw223:
     def element(self, items: Sequence[T]) -> tuple[T, int]:
         """Deterministic element selection matching Balatro's `pseudorandom_element`.
         
-        Returns (chosen_item, 0_based_index).
+        Returns `(chosen_item, 0_based_index)`.
         """
         if not items:
             raise ValueError("Cannot select element from empty sequence")
@@ -199,9 +202,10 @@ class Tw223:
 # Named PRNG Stream Channel
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PRNGChannel:
-    """Stateful RNG stream channel corresponding to one Balatro key (e.g. 'lucky_mult')."""
+    """Stateful RNG stream channel corresponding to one Balatro key (e.g. `'lucky_mult'`)."""
 
     key: str
     state: float  # Current raw LCG state
@@ -230,18 +234,22 @@ class PRNGChannel:
 # Master Balatro RNG Pipeline
 # ---------------------------------------------------------------------------
 
+
 class BalatroRNG:
     """Master deterministic RNG engine for a Balatro run.
     
-    Maintains independent, named PRNG stream channels (e.g., 'cert_fr', 'cert_sl',
-    'lucky_mult', 'lucky_money', 'wheel_of_fortune', 'space_joker', 'business_card', etc.)
+    Maintains independent, named PRNG stream channels (`'cert_fr'`, `'certsl'`,
+    `'lucky_mult'`, `'lucky_money'`, `'cas1'`, `'anc1'`, `'idol1'`, `'mail1'`, `'to_do'`,
+    `'Tarotcar1'`, `'Tarotvag1'`, `'marb_fr'`, `'boss'`, `'Tag1'`, `'Voucher1'`, `'Voucher_fromtag'`, etc.)
     with bit-exact LCG stepping, state inspection, and checkpoint/fork capabilities.
     """
 
     def __init__(self, seed: str, hashed_seed: float | None = None) -> None:
         self.seed: str = str(seed).strip().upper()
         self.hashed_seed: float = (
-            pseudohash(self.seed.encode("utf-8")) if hashed_seed is None else hashed_seed
+            pseudohash(self.seed.encode("utf-8"))
+            if hashed_seed is None
+            else hashed_seed
         )
         self.channels: dict[str, PRNGChannel] = {}
 
@@ -264,20 +272,31 @@ class BalatroRNG:
         ch = self._get_or_init_channel(key)
         return (ch.state + self.hashed_seed) / 2.0
 
+    def ensure_call_count(self, key: str, target_calls_before_draw: int) -> None:
+        """Advance channel `key` if its current `call_count` is less than `target_calls_before_draw`.
+        
+        Because Balatro's LCG stream step `st = advance(st)` does not depend on deck size or
+        external game state, this allows jumping directly to round `r` within an ante without
+        having to construct or evaluate intermediate rounds' decks!
+        """
+        current = self.get_channel_call_count(key)
+        if current < target_calls_before_draw:
+            self.advance(key, target_calls_before_draw - current)
+
     def random(self, key: str) -> float:
-        """Advance stream channel `key` and return 1 uniform float in [0.0, 1.0)."""
+        """Advance stream channel `key` and return 1 uniform float in `[0.0, 1.0)`."""
         pseed = self.step_seed(key)
         tw = Tw223(pseed)
         return tw.random()
 
     def randint(self, key: str, min_val: int, max_val: int) -> int:
-        """Advance stream channel `key` and return 1 integer in [min_val, max_val]."""
+        """Advance stream channel `key` and return 1 integer in `[min_val, max_val]`."""
         pseed = self.step_seed(key)
         tw = Tw223(pseed)
         return tw.randint(min_val, max_val)
 
     def random_n(self, key: str, m: int) -> int:
-        """Advance stream channel `key` and return 1 integer in [1, m]."""
+        """Advance stream channel `key` and return 1 integer in `[1, m]`."""
         pseed = self.step_seed(key)
         tw = Tw223(pseed)
         return tw.random_n(m)
@@ -285,7 +304,7 @@ class BalatroRNG:
     def choice(self, key: str, items: Sequence[T]) -> tuple[T, int]:
         """Advance stream channel `key` and pick an element from `items`.
         
-        Returns (chosen_item, index).
+        Returns `(chosen_item, index)`.
         """
         pseed = self.step_seed(key)
         tw = Tw223(pseed)
@@ -294,19 +313,13 @@ class BalatroRNG:
     def poll_odds(
         self, key: str, numerator: int, denominator: int, modifier: float = 1.0
     ) -> bool:
-        """Evaluate a 1-in-N or fractional probability check.
-        
-        Returns True if `random(key) < (numerator * modifier) / denominator`.
-        """
+        """Evaluate a 1-in-N or fractional probability check."""
         val = self.random(key)
         threshold = (numerator * modifier) / float(denominator)
         return val < threshold
 
     def advance(self, key: str, steps: int = 1) -> float:
-        """Advance stream channel `key` by `steps` calls without generating numbers.
-        
-        Returns the final raw LCG state of the channel.
-        """
+        """Advance stream channel `key` by `steps` LCG calls without instantiating Tw223."""
         if steps <= 0:
             if key in self.channels:
                 return self.channels[key].state
@@ -346,7 +359,8 @@ class BalatroRNG:
         self.seed = checkpoint["seed"]
         self.hashed_seed = checkpoint["hashed_seed"]
         self.channels = {
-            k: PRNGChannel.from_checkpoint(v) for k, v in checkpoint["channels"].items()
+            k: PRNGChannel.from_checkpoint(v)
+            for k, v in checkpoint["channels"].items()
         }
 
     def fork(self) -> BalatroRNG:

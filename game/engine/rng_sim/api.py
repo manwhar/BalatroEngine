@@ -1,13 +1,9 @@
-"""Public Python API for Balatro Deterministic Simulation.
+"""Public Python API for Balatro Deterministic Simulation (`game.engine.rng_sim`).
 
 Provides a clean, expressive top-level interface (`BalatroRun`) verified against
-`balatro_source` for:
-- Round target selections: Castle, Ancient Joker, The Idol, Mail-in Rebate, To Do List
-- Consumable/Card generators: Cartomancer, Vagabond, Marble Joker ("Stone Joker"), Certificate
-- Run queues with full edge-case support: Boss Blinds, Skip Tags (including Orbital Tag),
-  and Vouchers (including shop `'Voucher{ante}'` vs Voucher Tag `'Voucher_fromtag'`)
-- Mid-round probability triggers: Lucky Cards, Wheel of Fortune, Space Joker, Bloodstone,
-  Glass Cards, Business Card, Gros Michel, Cavendish, Reserved Parking, 8 Ball, Hallucination
+`balatro_source` and integrated with `game.balatro_models` (`PlayingCard`, `Joker`,
+`Suit`, `Rank`, `Enhancement`, `Edition`, `Seal`, `Stake`, `PokerHand`, `TarotName`,
+`VoucherName`, `SkipTag`, `BlindName`, `Deck`) and `game.gamestate.GameState`.
 """
 
 from __future__ import annotations
@@ -16,7 +12,26 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from balatro_sim.events import (
+from game.balatro_models import (
+    BlindName,
+    Deck as DeckType,
+    Edition,
+    Enhancement,
+    Joker,
+    JokerName,
+    PlayingCard,
+    PokerHand,
+    Rank,
+    Seal,
+    SkipTag,
+    Stake,
+    Suit,
+    Tarot,
+    TarotName,
+    Voucher,
+    VoucherName,
+)
+from game.engine.rng_sim.events import (
     BOSS_BY_KEY,
     DECK_STARTING_VOUCHERS,
     P_BOSS_BLINDS,
@@ -60,20 +75,17 @@ from balatro_sim.events import (
     predict_stone_joker_card,
     predict_vagabond_tarot,
 )
-from balatro_sim.rng import BalatroRNG, pseudohash, pseudoseed
-from balatro_sim.state import (
+from game.engine.rng_sim.rng import BalatroRNG, pseudohash, pseudoseed
+from game.engine.rng_sim.state import (
     ALL_POKER_HANDS_ORDER,
     DEFAULT_VISIBLE_POKER_HANDS,
     Card,
     Deck,
-    Edition,
-    Enhancement,
     GameState,
     JokerInstance,
-    Rank,
-    Seal,
-    Stake,
-    Suit,
+    SimCard,
+    SimDeck,
+    SimGameState,
 )
 
 # Allowed Balatro seed characters: 1-9 and A-Z (excluding 0)
@@ -82,10 +94,10 @@ BALATRO_SEED_PATTERN = re.compile(r"^[1-9A-Z]{1,8}$")
 
 def validate_seed(seed: str) -> tuple[bool, str]:
     """Validate and sanitize a Balatro seed.
-    
+
     Balatro run seeds are strings up to 8 characters composed of '1'-'9' and 'A'-'Z'.
     Lowercase characters are automatically capitalized.
-    
+
     Returns `(is_valid, sanitized_seed_or_error_message)`.
     """
     clean = seed.strip().upper()
@@ -109,7 +121,7 @@ class BalatroRun:
         self,
         seed: str = "HELLO",
         stake: Stake | str = Stake.WHITE,
-        deck: Deck | str | None = None,
+        deck: SimDeck | DeckType | Sequence[PlayingCard] | str | None = None,
         validate: bool = True,
     ) -> None:
         if validate:
@@ -122,39 +134,61 @@ class BalatroRun:
 
         self.rng = BalatroRNG(self.seed)
 
-        deck_type_name = "Red Deck"
-        if isinstance(deck, str):
-            deck_type_name = deck
-            lower_deck = deck.strip().lower()
+        deck_type_enum: DeckType | str = DeckType.RED_DECK
+        if isinstance(deck, (DeckType, str)):
+            deck_type_enum = DeckType(deck) if deck in DeckType._value2member_map_ else deck
+            lower_deck = str(deck.value if isinstance(deck, DeckType) else deck).strip().lower()
             if "abandoned" in lower_deck:
-                resolved_deck = Deck.create_abandoned_40()
+                resolved_deck = SimDeck.create_abandoned_40()
             elif "checkered" in lower_deck:
-                resolved_deck = Deck.create_checkered_52()
+                resolved_deck = SimDeck.create_checkered_52()
             elif "erratic" in lower_deck:
-                resolved_deck = Deck.create_erratic_52(self.rng)
+                resolved_deck = SimDeck.create_erratic_52(self.rng)
             else:
-                resolved_deck = Deck.create_standard_52()
-        elif isinstance(deck, Deck):
+                resolved_deck = SimDeck.create_standard_52()
+        elif isinstance(deck, SimDeck):
             resolved_deck = deck
+        elif isinstance(deck, Sequence):
+            resolved_deck = SimDeck.from_playing_cards(deck)
         else:
-            resolved_deck = Deck.create_standard_52()
+            resolved_deck = SimDeck.create_standard_52()
 
-        self.state = GameState(
+        self.state = SimGameState(
             seed=self.seed,
             stake=Stake(stake) if isinstance(stake, str) else stake,
             deck=resolved_deck,
-            deck_type=deck_type_name,
+            deck_type=deck_type_enum,
         )
 
         # Apply starting deck vouchers if applicable (Magic, Nebula, Zodiac)
-        starting_vouchers = DECK_STARTING_VOUCHERS.get(deck_type_name.strip().lower(), ())
+        dt_key = str(
+            deck_type_enum.value if isinstance(deck_type_enum, DeckType) else deck_type_enum
+        ).strip().lower()
+        starting_vouchers = DECK_STARTING_VOUCHERS.get(dt_key, ())
         for v_key in starting_vouchers:
             self.state.used_vouchers.add(v_key)
 
         self.events = EventResolver(self.rng)
 
+    @classmethod
+    def from_gamestate(
+        cls,
+        seed: str,
+        gs: Any,
+        validate: bool = True,
+    ) -> BalatroRun:
+        """Create a `BalatroRun` initialized from a live `game.gamestate.GameState`."""
+        run = cls(
+            seed=seed,
+            stake=getattr(gs, "stake", Stake.WHITE),
+            deck=getattr(gs, "deck_type", DeckType.RED_DECK),
+            validate=validate,
+        )
+        run.sync_from_gamestate(gs)
+        return run
+
     # -----------------------------------------------------------------------
-    # State Configuration & Fast-Forwarding
+    # State & Mid-Ante Deck Synchronization
     # -----------------------------------------------------------------------
 
     def set_state(
@@ -177,6 +211,28 @@ class BalatroRun:
         if stake is not None:
             self.state.stake = Stake(stake) if isinstance(stake, str) else stake
 
+    def update_deck(
+        self,
+        cards: Sequence[PlayingCard] | SimDeck,
+        preserve_existing_ids: bool = True,
+    ) -> None:
+        """Update the active deck mid-ante or mid-round from a list of `PlayingCard`s or a `SimDeck`.
+
+        When the deck changes in the middle of an ante (e.g., destroying cards with Hanged Man,
+        converting suits with World/Star/Sun/Moon, or adding cards in the shop), call `update_deck()`
+        (or mutate `run.state.deck` directly) before querying the next round's Castle / Idol / Mail-in Rebate.
+        """
+        if isinstance(cards, SimDeck):
+            self.state.deck = cards
+        else:
+            self.state.deck.sync_from_playing_cards(
+                cards, preserve_existing_ids=preserve_existing_ids
+            )
+
+    def sync_from_gamestate(self, gs: Any) -> None:
+        """Synchronize `ante`, `round`, `money`, `full_deck`, `jokers`, and `vouchers` from `game.gamestate.GameState`."""
+        self.state.sync_from_gamestate(gs)
+
     def start_ante(self, ante_num: int) -> None:
         """Transition into a new ante."""
         self.state.start_ante(ante_num)
@@ -195,17 +251,17 @@ class BalatroRun:
 
     def add_joker(
         self,
-        name: str,
+        name: JokerName | str | Joker,
         edition: Edition | str = Edition.NONE,
         eternal: bool = False,
         perishable: bool = False,
         rental: bool = False,
         state: dict[str, Any] | None = None,
-    ) -> JokerInstance:
-        """Add an active joker to the owned jokers."""
+    ) -> Joker:
+        """Add an active joker (`game.balatro_models.Joker`) to `state.owned_jokers`."""
         ed = Edition(edition) if isinstance(edition, str) else edition
         return self.state.add_joker(
-            name=name,
+            name,
             edition=ed,
             eternal=eternal,
             perishable=perishable,
@@ -213,30 +269,46 @@ class BalatroRun:
             state=state,
         )
 
-    def remove_joker(self, target: int | str) -> JokerInstance | None:
+    def remove_joker(self, target: int | JokerName | str) -> Joker | None:
         """Remove a joker by index or name."""
         return self.state.remove_joker(target)
 
-    def has_joker(self, name: str) -> bool:
+    def has_joker(self, name: JokerName | str) -> bool:
         """Check whether an active joker is present."""
         return self.state.has_joker(name)
 
-    def unlock_secret_hand(self, hand_name: str) -> None:
-        """Unlock a secret poker hand ('Flush Five', 'Flush House', 'Five of a Kind') into `visible_hands`."""
+    def unlock_secret_hand(self, hand_name: PokerHand | str) -> None:
+        """Unlock a secret poker hand (`Flush Five`, `Flush House`, `Five of a Kind`) into `visible_hands`."""
         self.state.unlock_secret_hand(hand_name)
 
     # -----------------------------------------------------------------------
     # 1. Castle Suit Selection (`reset_castle_card`)
     # -----------------------------------------------------------------------
 
-    def get_castle_suit(self, ante: int | None = None) -> Suit:
-        """Determine the suit Castle selects for the current round (`'cas' + str(ante)`)."""
+    def get_castle_suit(
+        self,
+        ante: int | None = None,
+        round_num: int | None = None,
+    ) -> Suit:
+        """Determine the suit Castle selects for the round (`'cas' + str(ante)`).
+
+        How to use when the deck changes mid-ante:
+        - **Stateful round-by-round (recommended)**: Call `get_castle_suit(ante=1)` in Round 1
+          (advances `'cas1'` call `0 -> 1`). When the deck changes after Round 1, mutate
+          `run.state.deck` (or call `run.update_deck(new_cards)`) and call `get_castle_suit(ante=1)`
+          in Round 2. Because `run.rng` remembers `'cas1'` is already at call 1, it directly
+          evaluates Round 2 (call `1 -> 2`) against the updated deck without re-running Round 1!
+        - **Direct round jump (`round_num=1|2|3`)**: Pass `round_num=2` (Big Blind) or `round_num=3`
+          (Boss Blind) to fast-forward `'cas{ante}'` directly to that round's LCG state and evaluate
+          against the current deck without computing earlier rounds.
+        """
         target_ante = ante if ante is not None else self.state.ante
         return get_castle_suit(
             rng=self.rng,
             deck=self.state.deck,
             ante=target_ante,
             state=self.state,
+            round_num=round_num,
         )
 
     def predict_castle_suits_for_ante(self, ante: int, rounds: int = 3) -> list[Suit]:
@@ -266,7 +338,7 @@ class BalatroRun:
         current_suit: Suit | str | None = None,
     ) -> Suit:
         """Determine the suit Ancient Joker selects for the round (`'anc' + str(ante)`).
-        
+
         Note: On the very first roll of a run (`state.ancient_suit is None`), all 4 suits
         `['Spades', 'Hearts', 'Clubs', 'Diamonds']` are eligible. On all subsequent rounds,
         the previous round's suit is excluded so Ancient Joker never picks the same suit twice in a row.
@@ -286,7 +358,7 @@ class BalatroRun:
         skips_per_ante: dict[int, int] | None = None,
     ) -> dict[int, list[Suit]]:
         """Predict Ancient Joker suits across `antes` without mutating main RNG.
-        
+
         Args:
             antes: Sequence of ante numbers (default 1..8).
             rounds_per_ante: Default 3 (Small, Big, Boss).
@@ -307,14 +379,23 @@ class BalatroRun:
     # 3. The Idol Card Selection (`reset_idol_card`)
     # -----------------------------------------------------------------------
 
-    def get_idol_card(self, ante: int | None = None) -> IdolTarget:
-        """Determine the card (rank + suit) The Idol selects for the round (`'idol' + str(ante)`)."""
+    def get_idol_card(
+        self,
+        ante: int | None = None,
+        round_num: int | None = None,
+    ) -> IdolTarget:
+        """Determine the card (rank + suit) The Idol selects for the round (`'idol' + str(ante)`).
+
+        Supports both stateful round-by-round progression (`round_num=None`) and direct jumping
+        to a specific round within the ante (`round_num=1|2|3`) without evaluating earlier rounds.
+        """
         target_ante = ante if ante is not None else self.state.ante
         return get_idol_card(
             rng=self.rng,
             deck=self.state.deck,
             ante=target_ante,
             state=self.state,
+            round_num=round_num,
         )
 
     def predict_idol_cards_for_ante(self, ante: int, rounds: int = 3) -> list[IdolTarget]:
@@ -341,11 +422,11 @@ class BalatroRun:
     def get_to_do_list_hand(
         self,
         is_initial_spawn: bool = False,
-        current_hand: str | None = None,
-        visible_hands: Sequence[str] | None = None,
-    ) -> str:
+        current_hand: PokerHand | str | None = None,
+        visible_hands: Sequence[PokerHand | str] | None = None,
+    ) -> PokerHand:
         """Determine the poker hand To Do List selects (`'to_do'`).
-        
+
         - On initial creation (`is_initial_spawn=True` or when `state.to_do_hand is None`),
           draws from all `visible_hands` (9 hands by default).
         - At the end of each round (`is_initial_spawn=False` with a current hand set),
@@ -362,23 +443,27 @@ class BalatroRun:
     def predict_to_do_list_hands(
         self,
         rounds: int = 8,
-        initial_hand: str | None = None,
-        secret_hand_unlocks: dict[int, Sequence[str]] | None = None,
-    ) -> list[str]:
+        initial_hand: PokerHand | str | None = None,
+        secret_hand_unlocks: dict[int, Sequence[PokerHand | str]] | None = None,
+    ) -> list[PokerHand]:
         """Predict a sequence of To Do List poker hands across `rounds` without mutating main RNG.
-        
+
         Args:
             rounds: Number of selections to predict (step 0 is initial spawn if `initial_hand is None`,
                 followed by `end_of_round` resets).
             initial_hand: Optional starting hand already on To Do List.
-            secret_hand_unlocks: Optional mapping `{step_index: ['Five of a Kind', ...]}` unlocking
+            secret_hand_unlocks: Optional mapping `{step_index: [PokerHand.FIVE_OF_A_KIND, ...]}` unlocking
                 secret poker hands before that step's roll.
         """
         forked = self.fork()
         if initial_hand is not None:
-            forked.state.to_do_hand = initial_hand
+            forked.state.to_do_hand = (
+                initial_hand
+                if isinstance(initial_hand, PokerHand)
+                else PokerHand(initial_hand)
+            )
         unlocks = secret_hand_unlocks or {}
-        hands: list[str] = []
+        hands: list[PokerHand] = []
         for step in range(rounds):
             if step in unlocks:
                 for secret_hand in unlocks[step]:
@@ -396,7 +481,7 @@ class BalatroRun:
     def predict_cartomancer_tarot(
         self,
         ante: int | None = None,
-        active_tarots: set[str] | None = None,
+        active_tarots: set[str | TarotName] | None = None,
         has_showman: bool = False,
     ) -> TarotPrediction:
         """Predict which Tarot card Cartomancer will give when a blind is selected (`'Tarotcar' + str(ante)`)."""
@@ -413,7 +498,7 @@ class BalatroRun:
         self,
         antes: Sequence[int] = range(1, 9),
         triggers_per_ante: int = 3,
-        active_tarots: set[str] | None = None,
+        active_tarots: set[str | TarotName] | None = None,
     ) -> dict[int, list[TarotPrediction]]:
         """Predict Cartomancer Tarot cards across multiple antes without mutating main RNG."""
         forked = self.fork()
@@ -428,7 +513,7 @@ class BalatroRun:
     def predict_vagabond_tarot(
         self,
         ante: int | None = None,
-        active_tarots: set[str] | None = None,
+        active_tarots: set[str | TarotName] | None = None,
         has_showman: bool = False,
     ) -> TarotPrediction:
         """Predict which Tarot card Vagabond will give when a hand is played with <= $4 (`'Tarotvag' + str(ante)`)."""
@@ -445,7 +530,7 @@ class BalatroRun:
         self,
         antes: Sequence[int] = range(1, 9),
         triggers_per_ante: int = 4,
-        active_tarots: set[str] | None = None,
+        active_tarots: set[str | TarotName] | None = None,
     ) -> dict[int, list[TarotPrediction]]:
         """Predict Vagabond Tarot cards across multiple antes without mutating main RNG."""
         forked = self.fork()
@@ -463,7 +548,7 @@ class BalatroRun:
 
     def predict_stone_joker_card(self, add_to_deck: bool = True) -> StoneCardResult:
         """Predict the Stone Card (and its hidden suit + rank) added on blind select (`'marb_fr'`).
-        
+
         In Balatro (`card.lua:2580-2601`), Marble Joker ("Stone Joker" in prompt) pulls a card front
         from `G.P_CARDS` using stream `'marb_fr'` and applies the `m_stone` (Stone Card) enhancement.
         If a different enhancement (e.g. Empress, Magician, Lovers) or Vampire is later used on that card,
@@ -518,7 +603,7 @@ class BalatroRun:
         mutate_state: bool = False,
     ) -> list[BossBlindPrediction]:
         """Predict the full sequence of Boss Blinds in a seed, accounting for all edge cases.
-        
+
         Edge cases supported (`common_events.lua:2338-2383`, `card.lua:2065-2075`):
         1. Minimum ante locks (`v.boss.min <= math.max(1, ante)`).
         2. Showdown bosses at multiples of `win_ante` (`ante % 8 == 0 and ante >= 2`),
@@ -558,28 +643,22 @@ class BalatroRun:
 
         while current_ante <= max_ante:
             runner.state.ante = current_ante
-            # Initial boss roll for this ante
             initial_pred = runner.get_next_boss_blind(ante=current_ante, is_reroll=False)
             predictions.append(initial_pred)
 
-            # Any boss rerolls BEFORE redeeming a -1 ante voucher in this step
             for _ in range(rerolls_before.get(step, 0)):
                 rr_pred = runner.reroll_boss_blind(ante=current_ante)
                 predictions.append(rr_pred)
 
-            # Redeem Hieroglyph / Petroglyph (-1 ante each) during this ante if scheduled
             drop = voucher_drops.get(step, 0)
             if drop > 0:
                 current_ante -= drop
                 runner.state.ante = current_ante
 
-                # Any boss rerolls AFTER redeeming a -1 ante voucher in this step
-                # (uses the decremented `current_ante`!)
                 for _ in range(rerolls_after.get(step, 0)):
                     rr_after = runner.reroll_boss_blind(ante=current_ante)
                     predictions.append(rr_after)
 
-            # Defeating the boss triggers `ease_ante(1)`
             current_ante += 1
             step += 1
 
@@ -647,21 +726,7 @@ class BalatroRun:
         include_orbital_hands: bool = False,
         mutate_state: bool = False,
     ) -> list[tuple[TagPrediction, TagPrediction]]:
-        """Predict the full sequence of `(Small Tag, Big Tag)` pairs across a run.
-        
-        Accounts for:
-        - `min_ante = 2` restriction in Ante 1 (`ante <= 1`), which marks 9 tags as `'UNAVAILABLE'`
-          and triggers `'Tag1_resample{it}'`.
-        - `-1 ante` vouchers (`Hieroglyph` / `Petroglyph`):
-          - If redeemed in Ante 1 (`ante` drops to `0`, then after Boss `ease_ante(1)` returns `ante` to `1`),
-            the second visit to Ante 1 draws the 3rd and 4th tags from `'Tag1'` (still with `min_ante = 2` locked!).
-          - What if BOTH Hieroglyph and Petroglyph are redeemed in Ante 1 (`ante` drops to `-1`, then after Boss
-            `ease_ante(1)` sets `ante = 0`)? In `common_events.lua:2052`, `_pool_key = 'Tag' .. ante` becomes
-            `'Tag0'` while `eff_ante` in `predict_ante_tags` / `get_next_tag` handles it!
-          - If redeemed in Ante 2 (`ante` drops to `1`, then after Boss `ease_ante(1)` returns `ante` to `2`),
-            the second visit to Ante 2 draws the 3rd and 4th tags from `'Tag2'`.
-        - `Orbital Tag` poker hand selection via `'orbital'` stream (`UI_definitions.lua:1506-1516`).
-        """
+        """Predict the full sequence of `(Small Tag, Big Tag)` pairs across a run."""
         runner = self if mutate_state else self.fork()
 
         if isinstance(minus_ante_vouchers_at_step, dict):
@@ -705,12 +770,7 @@ class BalatroRun:
         from_tag: bool = False,
         add_to_shop: bool = True,
     ) -> VoucherPrediction:
-        """Roll the next Voucher (`'Voucher' + str(ante)` for shop, or `'Voucher_fromtag'` for Voucher Tag).
-        
-        When `from_tag=False` (normal ante voucher), clears previous `state.shop_vouchers` first
-        (since each new ante resets the shop voucher slot) and adds the new voucher to `state.shop_vouchers`
-        so any subsequent Voucher Tag in the same ante will not duplicate it.
-        """
+        """Roll the next Voucher (`'Voucher' + str(ante)` for shop, or `'Voucher_fromtag'` for Voucher Tag)."""
         target_ante = ante if ante is not None else self.state.ante
         if not from_tag and add_to_shop:
             self.state.shop_vouchers.clear()
@@ -736,18 +796,10 @@ class BalatroRun:
 
     def redeem_voucher(
         self,
-        voucher_key_or_name: str,
+        voucher_key_or_name: str | VoucherName,
         apply_ante_effect: bool = False,
     ) -> str:
-        """Redeem (purchase) a voucher, updating `state.used_vouchers` and unlocking its Tier-2 upgrade.
-        
-        Args:
-            voucher_key_or_name: Voucher key (e.g. `'v_overstock_norm'`) or name (e.g. `'Overstock'`).
-            apply_ante_effect: If True and the voucher is `'Hieroglyph'` or `'Petroglyph'`,
-                also decrements `state.ante` by 1 (`ease_ante(-1)`).
-        Returns:
-            Canonical voucher key (`'v_...'`).
-        """
+        """Redeem (purchase) a voucher, updating `state.used_vouchers` and unlocking its Tier-2 upgrade."""
         v_key = normalize_voucher_key(voucher_key_or_name)
         self.state.used_vouchers.add(v_key)
         if v_key in self.state.shop_vouchers:
@@ -759,32 +811,12 @@ class BalatroRun:
     def predict_voucher_sequence(
         self,
         max_ante: int = 8,
-        purchase_plan: bool | dict[int, bool | Sequence[str]] = False,
+        purchase_plan: bool | dict[int, bool | Sequence[str | VoucherName]] = False,
         voucher_tags_at_step: dict[int, int] | None = None,
         minus_ante_vouchers_at_step: dict[int, int] | Sequence[int] | None = None,
         mutate_state: bool = False,
     ) -> list[VoucherPrediction]:
-        """Predict the sequence of Vouchers across a run, adapting dynamically to purchase order and Voucher Tags.
-        
-        Args:
-            max_ante: Highest ante to simulate (default 8).
-            purchase_plan:
-                - `False` (default): Do not buy any vouchers (unbought Tier-1 vouchers remain in the pool
-                  and can reappear in later antes or from Voucher Tags; Tier-2 vouchers stay locked).
-                - `True`: Buy every voucher that appears (removes bought vouchers from future pools and
-                  immediately unlocks their Tier-2 upgrades).
-                - `dict[int, bool | Sequence[str]]`: Per-step (1-based) rule:
-                  - `True`: buy all vouchers seen in that step (shop + any Voucher Tags).
-                  - `False`: buy none in that step.
-                  - `Sequence[str]`: buy only the specified voucher names/keys if they appear in that step.
-            voucher_tags_at_step: Optional mapping `{step_index: num_voucher_tags}` simulating taking
-                1 or more Voucher Tags (e.g. with Double Tag) during that ante.
-                Note: Voucher Tags pull from the global `'Voucher_fromtag'` stream while respecting
-                currently visible `shop_vouchers` and `used_vouchers`!
-            minus_ante_vouchers_at_step: Optional explicit `-1 ante` schedule if not driven automatically
-                by buying `Hieroglyph` / `Petroglyph` via `purchase_plan`.
-            mutate_state: If True, mutates `self`; otherwise runs on an isolated fork.
-        """
+        """Predict the sequence of Vouchers across a run, adapting dynamically to purchase order and Voucher Tags."""
         runner = self if mutate_state else self.fork()
         tag_counts = voucher_tags_at_step or {}
 
@@ -814,7 +846,6 @@ class BalatroRun:
             runner.state.ante = current_ante
             ante_drop_this_step = explicit_drops.get(step, 0)
 
-            # 1. Roll normal shop voucher for this ante (`'Voucher' + str(current_ante)`)
             shop_v = runner.get_next_voucher(
                 ante=current_ante, from_tag=False, add_to_shop=True
             )
@@ -828,7 +859,6 @@ class BalatroRun:
                 ):
                     ante_drop_this_step += 1
 
-            # 2. Roll any Voucher Tag skips taken during this ante (`'Voucher_fromtag'`)
             for _ in range(tag_counts.get(step, 0)):
                 tag_v = runner.predict_voucher_from_tag(
                     ante=current_ante, add_to_shop=True
@@ -858,12 +888,7 @@ class BalatroRun:
         add_to_deck: bool = True,
         ante_scoped: bool = True,
     ) -> CertificateResult:
-        """Query deterministic Certificate joker outcome.
-        
-        - `ante_scoped=True` (default): uses `'cert_fr{ante}'` and `'cert_sl{ante}'`.
-        - `ante_scoped=False` (`balatro_source/card.lua:2467-2469` mode): uses `'cert_fr'`
-          and `'certsl'` float thresholds.
-        """
+        """Query deterministic Certificate joker outcome."""
         target_ante = ante if ante is not None else self.state.ante
         return predict_certificate(
             rng=self.rng,
@@ -874,11 +899,7 @@ class BalatroRun:
         )
 
     def evaluate_lucky_hit(self) -> dict[str, bool]:
-        """Predict dynamic mid-round triggers for a scored Lucky Card.
-        
-        Evaluates +$20 cash (1 in 15 base) and +20 Mult (1 in 5 base)
-        using `'lucky_money'` and `'lucky_mult'` stream keys, scaled by Oops! All 6s.
-        """
+        """Predict dynamic mid-round triggers for a scored Lucky Card."""
         modifier = self.state.probability_modifier
         res = evaluate_lucky_hit(
             rng=self.rng,
@@ -886,23 +907,36 @@ class BalatroRun:
         )
         return res.to_dict()
 
-    def get_mail_in_rebate_target(self, ante: int | None = None) -> Rank:
-        """Query dynamically chosen Mail-in Rebate target rank for the current deck (`'mail' + str(ante)`)."""
+    def get_mail_in_rebate_target(
+        self,
+        ante: int | None = None,
+        round_num: int | None = None,
+    ) -> Rank:
+        """Query dynamically chosen Mail-in Rebate target rank for the current deck (`'mail' + str(ante)`).
+
+        Supports both stateful round-by-round progression (`round_num=None`) and direct jumping
+        to a specific round within the ante (`round_num=1|2|3`) without evaluating earlier rounds.
+        """
         target_ante = ante if ante is not None else self.state.ante
         return get_mail_in_rebate_target(
             rng=self.rng,
             deck=self.state.deck,
             ante=target_ante,
             state=self.state,
+            round_num=round_num,
         )
 
     def evaluate_mail_in_rebate_discard(
         self,
-        discarded_cards: Sequence[Card],
+        discarded_cards: Sequence[PlayingCard],
         target_rank: Rank | None = None,
     ) -> RebateEvaluation:
         """Evaluate payout from discarding candidates with Mail-in Rebate active."""
-        rank = target_rank if target_rank is not None else self.get_mail_in_rebate_target()
+        rank = (
+            target_rank
+            if target_rank is not None
+            else self.get_mail_in_rebate_target()
+        )
         return evaluate_mail_in_rebate_discard(
             target_rank=rank,
             discarded_cards=discarded_cards,

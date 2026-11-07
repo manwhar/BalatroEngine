@@ -1,5 +1,5 @@
 from collections import Counter
-from typing import Sequence
+from collections.abc import Sequence
 
 try:
     from game.balatro_models import (

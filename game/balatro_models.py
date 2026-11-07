@@ -233,6 +233,7 @@ class SkipTag(StrEnum):
     POLYCHROME_TAG = "Polychrome Tag"
     RARE_TAG = "Rare Tag"
     SPEED_TAG = "Speed Tag"
+    SKIP_TAG = "Speed Tag"
     STANDARD_TAG = "Standard Tag"
     TOP_UP_TAG = "Top-up Tag"
     UNCOMMON_TAG = "Uncommon Tag"
@@ -273,6 +274,8 @@ class BlindName(StrEnum):
     THE_PSYCHIC = "The Psychic"
     THE_GOAD = "The Goad"
     THE_WATER = "The Water"
+    THE_WINDOW = "The Window"
+    THE_MANACLE = "The Manacle"
     THE_EYE = "The Eye"
     THE_MOUTH = "The Mouth"
     THE_PLANT = "The Plant"
@@ -386,8 +389,52 @@ class PlayingCard(Card):
     seal: Seal = Seal.NONE
     type: CardType = CardType.PLAYING_CARD
     bonus_chips: int = 0  # Permanent chips gained (e.g. from Hiker)
+    id: int = field(default=0, compare=False)  # Balatro sort_id (G.playing_card)
     debuffed: bool = field(default=False, compare=False)
     destroyed: bool = field(default=False, compare=False)
+
+    @property
+    def sort_id(self) -> int:
+        return self.id
+
+    @sort_id.setter
+    def sort_id(self, value: int) -> None:
+        self.id = value
+
+    @property
+    def card_key(self) -> str:
+        """Balatro `G.P_CARDS` key (e.g., `'C_2'`, `'D_T'`, `'H_Q'`, `'S_A'`)."""
+        suit_code = {
+            Suit.SPADES: "S",
+            Suit.HEARTS: "H",
+            Suit.CLUBS: "C",
+            Suit.DIAMONDS: "D",
+        }.get(self.suit, "S")
+        rank_code = {
+            Rank.TEN: "T",
+            Rank.JACK: "J",
+            Rank.QUEEN: "Q",
+            Rank.KING: "K",
+            Rank.ACE: "A",
+            Rank.NONE: "A",
+        }.get(self.rank, self.rank.value)
+        return f"{suit_code}_{rank_code}"
+
+    def is_suit(self, suit: Suit | str) -> bool:
+        """Check whether this card matches `suit` (Stone cards have no suit; Wild cards match all suits)."""
+        if self.enhancement == Enhancement.STONE or self.suit == Suit.NONE:
+            return False
+        if self.enhancement == Enhancement.WILD:
+            return True
+        target = suit if isinstance(suit, Suit) else Suit(str(suit).strip().lower())
+        return self.suit == target
+
+    def is_rank(self, rank: Rank | str) -> bool:
+        """Check whether this card matches `rank` (Stone cards have no rank)."""
+        if self.enhancement == Enhancement.STONE or self.rank == Rank.NONE:
+            return False
+        target = rank if isinstance(rank, Rank) else Rank(str(rank).strip())
+        return self.rank == target
 
     @property
     def base_cost(self) -> int:
