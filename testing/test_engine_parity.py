@@ -1,12 +1,14 @@
 """
-Integration test script: Validates Python GameState engine parity against Lua telemetry log.
+Integration test script: Validates Python GameState engine parity against Lua telemetry log,
+simulating a video pipeline with perfect CV/OCR observations and zero ground-truth leakage
+across closed-loop state transitions.
 
 Usage:
-    python testing/test_engine_parity.py [--telemetry path/to/run_telemetry.jsonl]
+    python testing/test_engine_parity.py [--telemetry path/to/run_telemetry.jsonl] [--verbose]
 """
 
 import argparse
-import json
+import os
 from pathlib import Path
 import sys
 
@@ -19,137 +21,74 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    import game.balatro_models as bm
-    import game.gamestate as gs
+    from testing.test_engine import (
+        run_synthetic_test,
+        test_trajectory_parity as run_parity_check,
+    )
 except ImportError:
-    import balatro_models as bm
-    import gamestate as gs
-
-try:
-    from testing.test_engine import TestEngine
-except ImportError:
-    from test_engine import TestEngine
-
-
-def parse_lua_action(action_name: str, meta: dict, frame_idx: int, timestamp: float) -> bm.Action:
-    action_map = {
-        "Play Hand": bm.ActionType.PLAY_HAND,
-        "Discard": bm.ActionType.DISCARD,
-        "Reroll Shop": bm.ActionType.REROLL_SHOP,
-        "Cash Out": bm.ActionType.CASH_OUT,
-        "Buy Card": bm.ActionType.BUY_CARD,
-        "Buy and Use": bm.ActionType.BUY_AND_USE,
-        "Sell Card": bm.ActionType.SELL_CARD,
-        "Select Blind": bm.ActionType.SELECT_BLIND,
-        "Skip Blind": bm.ActionType.SKIP_BLIND,
-    }
-    act_type = action_map.get(action_name, bm.ActionType.PLAY_HAND)
-    return bm.Action(
-        type=act_type,
-        frame_idx=frame_idx,
-        timestamp=timestamp,
-        metadata=meta,
+    from test_engine import (
+        run_synthetic_test,
+        test_trajectory_parity as run_parity_check,
     )
 
 
-def test_trajectory_parity(telemetry_path: Path):
-    if not telemetry_path.exists():
-        print(f"No telemetry file found at {telemetry_path}. Generating dummy test...")
-        return run_synthetic_test()
+def find_telemetry_file(explicit_path: Path | None = None) -> Path | None:
+    if explicit_path and explicit_path.exists() and explicit_path.stat().st_size > 0:
+        return explicit_path
 
-    print(f"Loading Lua telemetry from {telemetry_path}...")
-    with open(telemetry_path, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
+    candidates = [
+        REPO_ROOT / "run_telemetry.jsonl",
+        REPO_ROOT / "output" / "run_telemetry.jsonl",
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "Balatro" / "run_telemetry.jsonl")
+        candidates.append(Path(appdata) / "Balatro" / "Mods" / "run_telemetry.jsonl")
+    candidates.append(Path.home() / "AppData" / "Roaming" / "Balatro" / "run_telemetry.jsonl")
 
-    if not lines:
-        print("Telemetry file is empty.")
-        return
+    non_empty = [p for p in candidates if p.exists() and p.stat().st_size > 0]
+    if non_empty:
+        return max(non_empty, key=lambda p: p.stat().st_mtime)
 
-    first_entry = json.loads(lines[0])
-    first_state_data = first_entry["state"]
+    if explicit_path and explicit_path.exists():
+        return explicit_path
+    for p in candidates:
+        if p.exists():
+            return p
 
-    # Initialize Python GameState from first Lua snapshot
-    sim_state = gs.GameState(
-        step_idx=0,
-        ante=first_state_data.get("ante", 1),
-        round=first_state_data.get("round", 1),
-        stats=bm.RunStats(
-            money=first_state_data.get("money", 4),
-            reroll_cost=first_state_data.get("reroll_cost", 5),
-            hands_left=first_state_data.get("hands_left", 4),
-            discards_left=first_state_data.get("discards_left", 3),
-        ),
-    )
+    return None
 
-    trajectory = gs.RunTrajectory(keyframe_interval=10)
-    errors = 0
 
-    for i, line in enumerate(lines):
-        entry = json.loads(line)
-        act_name = entry.get("action", "Play Hand")
-        meta = entry.get("action_metadata", {})
-        lua_state = entry.get("state", {})
-        step = entry.get("step", i)
-        ts = entry.get("timestamp", 0.0)
+def main(telemetry_path: Path | None = None, verbose: bool = False) -> int:
+    target_path = find_telemetry_file(telemetry_path)
+    if target_path is None or not target_path.exists():
+        print("No telemetry file found at default locations or %APPDATA%\\Balatro\\run_telemetry.jsonl.")
+        print("Running synthetic integration test instead...")
+        run_synthetic_test()
+        return 0
 
-        action = parse_lua_action(act_name, meta, frame_idx=step, timestamp=ts)
-        sim_state, delta = gs.step_simulation(sim_state, action)
-        trajectory.record_step(sim_state, action)
+    if target_path.stat().st_size == 0:
+        print(f"Found telemetry file at: {target_path}")
+        print("Notice: The telemetry log is currently 0 bytes (no gameplay actions recorded yet).")
+        print("\nHow to record telemetry:")
+        print("  1. Launch Balatro (with Steamodded + GameState Dataset CV mod installed).")
+        print("  2. Start a run (play hands, discard, or interact with shop/blinds).")
+        print("  3. The mod automatically records every action to run_telemetry.jsonl.")
+        print("  4. Rerun this script to verify parity against your live run!\n")
+        print("Running synthetic integration test in the meantime...")
+        run_synthetic_test()
+        return 0
 
-        # Verification checks
-        if "money" in lua_state and sim_state.stats.money != lua_state["money"]:
-            print(f"[Mismatch Step {step} '{act_name}'] Money: Python={sim_state.stats.money} vs Lua={lua_state['money']}")
-            errors += 1
-
-        if "reroll_cost" in lua_state and act_name == "Reroll Shop":
-            if sim_state.stats.reroll_cost != lua_state["reroll_cost"]:
-                print(f"[Mismatch Step {step} '{act_name}'] Reroll Cost: Python={sim_state.stats.reroll_cost} vs Lua={lua_state['reroll_cost']}")
-                errors += 1
-
-        if "deck_cards_count" in lua_state and sim_state.deck_cards_count != lua_state["deck_cards_count"]:
-            print(f"[Mismatch Step {step} '{act_name}'] Deck Cards Count: Python={sim_state.deck_cards_count} vs Lua={lua_state['deck_cards_count']}")
-            errors += 1
-
-        if "discard_pile" in lua_state and len(sim_state.discard_pile) != len(lua_state["discard_pile"]):
-            print(f"[Mismatch Step {step} '{act_name}'] Discard Pile Count: Python={len(sim_state.discard_pile)} vs Lua={len(lua_state['discard_pile'])}")
-            errors += 1
-
-    print(f"\nParity Test Completed. Total Steps: {len(lines)}, Discrepancies: {errors}")
+    errors = run_parity_check(target_path, verbose=verbose)
+    print(f"\nParity Test Completed on {target_path}. Discrepancies: {errors}")
     if errors == 0:
         print("PERFECT PARITY ACHIEVED!")
-
-
-def run_synthetic_test():
-    print("Running synthetic integration test...")
-    sim_state = gs.GameState(
-        stats=bm.RunStats(money=15, reroll_cost=5),
-        inventory=bm.Inventory(
-            jokers=[bm.Joker(name=bm.JokerName.GIFT_CARD), bm.Joker(name=bm.JokerName.JOKER)]
-        ),
-    )
-    traj = gs.RunTrajectory(keyframe_interval=3)
-
-    # 1. Reroll
-    sim_state, _ = gs.step_simulation(sim_state, bm.Action(type=bm.ActionType.REROLL_SHOP))
-    traj.record_step(sim_state)
-    assert sim_state.stats.money == 10
-    assert sim_state.stats.reroll_cost == 6
-
-    # 2. Cash out (triggers Gift Card)
-    sim_state, _ = gs.step_simulation(sim_state, bm.Action(type=bm.ActionType.CASH_OUT))
-    traj.record_step(sim_state)
-    assert sim_state.inventory.jokers[0].extra_value == 1
-    assert sim_state.inventory.jokers[1].extra_value == 1
-    assert sim_state.stats.reroll_cost == 5  # Resets in shop
-
-    # 3. Test trajectory seek
-    recovered_s0 = traj.get_state(0)
-    assert recovered_s0.stats.money == 10
-    print("Synthetic integration test passed successfully!")
+    return errors
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--telemetry", type=Path, default=Path("run_telemetry.jsonl"))
+    parser.add_argument("--telemetry", type=Path, default=None)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    test_trajectory_parity(args.telemetry)
+    sys.exit(main(args.telemetry, verbose=args.verbose))

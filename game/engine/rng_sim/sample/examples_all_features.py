@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from game.balatro_models import (
     Deck as DeckType,
+)
+from game.balatro_models import (
     Enhancement,
     JokerName,
     PlayingCard,
@@ -112,7 +114,9 @@ def example_1_castle() -> None:
 
     run = BalatroRun(seed="HELLO")
     suits_a1 = run.predict_castle_suits_for_ante(ante=1, rounds=3)
-    print(f"Standard 52-card Deck (Ante 1 Small/Big/Boss): {[s.value for s in suits_a1]}")
+    print(
+        f"Standard 52-card Deck (Ante 1 Small/Big/Boss): {[s.value for s in suits_a1]}"
+    )
 
     # Edge Case 1: Checkered Deck (26 Spades, 26 Hearts)
     checkered_run = BalatroRun(seed="HELLO", deck=DeckType.CHECKERED_DECK)
@@ -122,12 +126,16 @@ def example_1_castle() -> None:
     )
 
     # Edge Case 2: All Stone Cards -> falls back to Spades ('Spades')
-    stone_deck = Deck([
-        Card(Suit.HEARTS, Rank.ACE, enhancement=Enhancement.STONE),
-        Card(Suit.DIAMONDS, Rank.KING, enhancement=Enhancement.STONE),
-    ])
+    stone_deck = Deck(
+        [
+            Card(Suit.HEARTS, Rank.ACE, enhancement=Enhancement.STONE),
+            Card(Suit.DIAMONDS, Rank.KING, enhancement=Enhancement.STONE),
+        ]
+    )
     stone_run = BalatroRun(seed="HELLO", deck=stone_deck)
-    print(f"All-Stone Deck Fallback (Ante 1):              {stone_run.get_castle_suit(ante=1).value}\n")
+    print(
+        f"All-Stone Deck Fallback (Ante 1):              {stone_run.get_castle_suit(ante=1).value}\n"
+    )
 
 
 def example_2_ancient_joker() -> None:
@@ -137,14 +145,18 @@ def example_2_ancient_joker() -> None:
 
     run = BalatroRun(seed="HELLO")
     normal = run.predict_ancient_joker_suits(antes=[1, 2], rounds_per_ante=3)
-    print(f"No Blinds Skipped -> Ante 1: {[s.value for s in normal[1]]}, Ante 2: {[s.value for s in normal[2]]}")
+    print(
+        f"No Blinds Skipped -> Ante 1: {[s.value for s in normal[1]]}, Ante 2: {[s.value for s in normal[2]]}"
+    )
 
     # Edge Case: Skipping 1 blind in Ante 1 means `reset_ancient_card` is only called twice
     # in Ante 1, carrying Hearts into Ante 2 Round 1 instead of Spades!
     skipped = run.predict_ancient_joker_suits(
         antes=[1, 2], rounds_per_ante=3, skips_per_ante={1: 1}
     )
-    print(f"1 Skip in Ante 1  -> Ante 1: {[s.value for s in skipped[1]]}, Ante 2: {[s.value for s in skipped[2]]}\n")
+    print(
+        f"1 Skip in Ante 1  -> Ante 1: {[s.value for s in skipped[1]]}, Ante 2: {[s.value for s in skipped[2]]}\n"
+    )
 
 
 def example_3_idol() -> None:
@@ -155,14 +167,18 @@ def example_3_idol() -> None:
     run = BalatroRun(seed="HELLO")
     idols_a1 = run.predict_idol_cards_for_ante(ante=1, rounds=3)
     for idx, target in enumerate(idols_a1, start=1):
-        print(f"Ante 1 Round {idx}: {target.rank.name} of {target.suit.value} (sort_id={target.card_id})")
+        print(
+            f"Ante 1 Round {idx}: {target.rank.name} of {target.suit.value} (sort_id={target.card_id})"
+        )
 
     # Edge Case: Deck thinned to only 2x Ace of Spades + Stone Cards
-    thin_deck = Deck([
-        PlayingCard(suit=Suit.SPADES, rank=Rank.ACE),
-        PlayingCard(suit=Suit.SPADES, rank=Rank.ACE),
-        PlayingCard(suit=Suit.HEARTS, rank=Rank.TWO, enhancement=Enhancement.STONE),
-    ])
+    thin_deck = Deck(
+        [
+            PlayingCard(suit=Suit.SPADES, rank=Rank.ACE),
+            PlayingCard(suit=Suit.SPADES, rank=Rank.ACE),
+            PlayingCard(suit=Suit.HEARTS, rank=Rank.TWO, enhancement=Enhancement.STONE),
+        ]
+    )
     thin_run = BalatroRun(seed="HELLO", deck=thin_deck)
     t = thin_run.get_idol_card(ante=1)
     print(f"Thinned Deck (only A of Spades + Stone): {t.rank.name} of {t.suit.value}\n")
@@ -199,9 +215,7 @@ def example_5_cartomancer_and_vagabond() -> None:
     # Edge Case 1: Holding 'The Moon' blocks Cartomancer from generating 'The Moon',
     # causing it to resample on `'Tarotcar1_resample2'`!
     run_held = BalatroRun(seed="HELLO")
-    c1_held = run_held.predict_cartomancer_tarot(
-        ante=1, active_tarots={TarotName.MOON}
-    )
+    c1_held = run_held.predict_cartomancer_tarot(ante=1, active_tarots={TarotName.MOON})
     print(
         f"Cartomancer (holding The Moon):       {c1_held.tarot_name.value} "
         f"(resamples={c1_held.resample_count})"
@@ -306,7 +320,9 @@ def example_9_vouchers() -> None:
     print("With 2 Voucher Tags in Ante 1:")
     for v in with_tags:
         src = "TAG ('Voucher_fromtag')" if v.from_tag else f"SHOP ('{v.stream_key}')"
-        print(f"  Ante {v.ante} [{src:<22}]: {v.voucher_name.value} (resamples={v.resample_count})")
+        print(
+            f"  Ante {v.ante} [{src:<22}]: {v.voucher_name.value} (resamples={v.resample_count})"
+        )
     print()
 
 
@@ -318,7 +334,9 @@ def example_10_certificate_and_probabilities() -> None:
     run = BalatroRun(seed="HELLO")
     run.set_state(ante=6, round_num=2)
     cert = run.predict_certificate()
-    print(f"Certificate (Ante 6): {cert.rank.name} of {cert.suit.value}, Seal={cert.seal.value}")
+    print(
+        f"Certificate (Ante 6): {cert.rank.name} of {cert.suit.value}, Seal={cert.seal.value}"
+    )
     print(f"Next 3 Lucky Card Rolls: {run.batch_evaluate_lucky_hits(3)}")
     print(f"Next 5 Wheel of Fortune Rolls: {run.batch_evaluate_wheel_of_fortune(5)}")
 

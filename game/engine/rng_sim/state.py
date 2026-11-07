@@ -931,9 +931,9 @@ class SimGameState:
         - `ante`, `round_within_ante`, `stake`, `deck_type`, `money`
         - `deck` (preserving `sort_id`s of existing `PlayingCard`s in `gs.full_deck`)
         - `owned_jokers` (from `gs.inventory.jokers`)
-        - `active_tarots` (from `gs.inventory.consumables` and `gs.shop.cards`)
+        - `active_tarots` (from `gs.inventory.consumables`, `gs.shop_cards`, and `gs.pack_cards`)
         - `used_vouchers` (from `gs.vouchers_redeemed`)
-        - `shop_vouchers` (from `gs.shop.vouchers`)
+        - `shop_vouchers` (from `gs.shop_vouchers`)
         - `visible_hands` (unlocking any secret hand with `gs.hand_play_counts[h] > 0`)
         """
         from game.engine.rng_sim.events import normalize_tarot_key, normalize_voucher_key
@@ -942,16 +942,13 @@ class SimGameState:
         self.round_within_ante = getattr(gs, "round", self.round_within_ante)
         self.stake = getattr(gs, "stake", self.stake)
         self.deck_type = getattr(gs, "deck", self.deck_type)
-
-        stats = getattr(gs, "stats", None)
-        if stats is not None:
-            self.money = getattr(stats, "money", self.money)
-            self.hands_played_this_round = getattr(
-                stats, "hands_played_this_round", self.hands_played_this_round
-            )
-            self.discards_made_this_round = getattr(
-                stats, "discards_used_this_round", self.discards_made_this_round
-            )
+        self.money = getattr(gs, "money", self.money)
+        self.hands_played_this_round = getattr(
+            gs, "hands_played_this_round", self.hands_played_this_round
+        )
+        self.discards_made_this_round = getattr(
+            gs, "discards_used_this_round", self.discards_made_this_round
+        )
 
         full_deck = getattr(gs, "full_deck", None)
         if full_deck is not None:
@@ -975,15 +972,20 @@ class SimGameState:
             for v in vouchers_redeemed:
                 self.used_vouchers.add(normalize_voucher_key(str(v)))
 
-        shop = getattr(gs, "shop", None)
-        if shop is not None:
+        shop_vouchers = getattr(gs, "shop_vouchers", None)
+        if shop_vouchers is not None:
             self.shop_vouchers = [
                 normalize_voucher_key(str(v.name))
-                for v in getattr(shop, "vouchers", [])
+                for v in shop_vouchers
             ]
-            for c in getattr(shop, "cards", []):
-                if getattr(c, "type", None) == CardType.TAROT or isinstance(c, Tarot):
-                    self.active_tarots.add(normalize_tarot_key(str(c.name)))
+
+        for c in getattr(gs, "shop_cards", []):
+            if getattr(c, "type", None) == CardType.TAROT or isinstance(c, Tarot):
+                self.active_tarots.add(normalize_tarot_key(str(c.name)))
+
+        for c in getattr(gs, "pack_cards", []):
+            if getattr(c, "type", None) == CardType.TAROT or isinstance(c, Tarot):
+                self.active_tarots.add(normalize_tarot_key(str(c.name)))
 
         hand_play_counts = getattr(gs, "hand_play_counts", {}) or {}
         for secret in (

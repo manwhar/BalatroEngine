@@ -22,6 +22,161 @@ function G.DATASET_MOD:get_selected_object()
     return nil, nil, "None"
 end
 
+-- Helper: Extract and sort all Joker centers with names and rarities
+function UI.get_all_joker_entries()
+    local entries = {}
+    if G.P_CENTERS then
+        for k, v in pairs(G.P_CENTERS) do
+            if v.set == 'Joker' and k ~= 'j_undiscovered' and k ~= 'j_locked' then
+                local display_name = (v.name and v.name ~= "") and v.name or k
+                if G.localization and G.localization.descriptions and G.localization.descriptions.Joker and G.localization.descriptions.Joker[k] then
+                    local loc_entry = G.localization.descriptions.Joker[k]
+                    if loc_entry.name then
+                        if type(loc_entry.name) == "table" then
+                            display_name = table.concat(loc_entry.name, " ")
+                        else
+                            display_name = tostring(loc_entry.name)
+                        end
+                    end
+                elseif type(localize) == "function" then
+                    local ok, loc_name = pcall(localize, {type = 'name_text', set = 'Joker', key = k})
+                    if ok and loc_name and loc_name ~= "" then
+                        display_name = loc_name
+                    end
+                end
+                table.insert(entries, {
+                    key = k,
+                    name = display_name,
+                    rarity = v.rarity or 1,
+                    center = v
+                })
+            end
+        end
+        table.sort(entries, function(a, b)
+            return (a.name or a.key):lower() < (b.name or b.key):lower()
+        end)
+    end
+    return entries
+end
+
+function UI.get_filtered_joker_entries(mod)
+    local all_entries = UI.get_all_joker_entries()
+    local r_filter = mod.test_joker_rarity_filter or "All"
+    if r_filter == "All" then
+        return all_entries
+    end
+    local target_r = 1
+    if r_filter == "Uncommon" then target_r = 2
+    elseif r_filter == "Rare" then target_r = 3
+    elseif r_filter == "Legendary" then target_r = 4
+    end
+
+    local filtered = {}
+    for _, ent in ipairs(all_entries) do
+        if ent.rarity == target_r then
+            table.insert(filtered, ent)
+        end
+    end
+    if #filtered == 0 then return all_entries end
+    return filtered
+end
+
+function UI.spawn_test_joker(mod)
+    local entries = mod.test_joker_list or UI.get_filtered_joker_entries(mod)
+    local idx = mod.test_joker_idx or 1
+    local selected = entries[idx]
+    if not selected then
+        mod.capture_flash = 1.5
+        mod.capture_flash_text = "NO JOKER SELECTED!"
+        return
+    end
+
+    if not G.jokers then
+        mod.capture_flash = 2.0
+        mod.capture_flash_text = "NO ACTIVE RUN DETECTED! START A RUN FIRST."
+        print("GDCV_JOKER_SPAWN: Failed - G.jokers is nil (not in a run)")
+        return
+    end
+
+    -- Create card safely in G.jokers area
+    local target_key = selected.key
+    local card = create_card('Joker', G.jokers, nil, nil, nil, nil, target_key, 'deck')
+    if not card then
+        mod.capture_flash = 2.0
+        mod.capture_flash_text = "FAILED TO CREATE CARD: " .. tostring(target_key)
+        return
+    end
+
+    -- Apply Edition
+    local ed_choice = mod.test_joker_edition or "None"
+    if ed_choice == "Foil" then
+        card:set_edition({foil = true}, true, true)
+    elseif ed_choice == "Holo" then
+        card:set_edition({holo = true}, true, true)
+    elseif ed_choice == "Polychrome" then
+        card:set_edition({polychrome = true}, true, true)
+    elseif ed_choice == "Negative" then
+        card:set_edition({negative = true}, true, true)
+    end
+
+    -- Apply Sticker
+    local st_choice = mod.test_joker_sticker or "None"
+    if st_choice == "Eternal" and card.set_eternal then
+        card:set_eternal(true)
+    elseif st_choice == "Perishable" and card.set_perishable then
+        card:set_perishable(true)
+    elseif st_choice == "Rental" and card.set_rental then
+        card:set_rental(true)
+    end
+
+    -- Register with active deck and board
+    card:add_to_deck()
+    G.jokers:emplace(card)
+
+    -- Extra safety: expand card limit if slot capacity reached so test jokers always fit
+    if G.jokers.config and G.jokers.config.card_limit and #G.jokers.cards > G.jokers.config.card_limit then
+        G.jokers.config.card_limit = #G.jokers.cards
+    end
+
+    if play_sound then
+        pcall(play_sound, 'card1')
+    end
+    if card.juice_up then
+        pcall(function() card:juice_up(0.4, 0.4) end)
+    end
+
+    mod.capture_flash = 1.8
+    mod.capture_flash_text = string.format("SPAWNED: %s (%s)", selected.name, target_key)
+    print(string.format("GDCV_JOKER_SPAWN: Successfully spawned %s [%s] (Edition=%s, Sticker=%s)",
+        selected.name, target_key, ed_choice, st_choice))
+end
+
+function UI.clear_all_jokers(mod)
+    if not G.jokers or not G.jokers.cards or #G.jokers.cards == 0 then
+        mod.capture_flash = 1.5
+        mod.capture_flash_text = "NO JOKERS TO CLEAR!"
+        return
+    end
+
+    local count = #G.jokers.cards
+    for i = count, 1, -1 do
+        local c = G.jokers.cards[i]
+        if c then
+            if c.remove_from_deck then
+                pcall(function() c:remove_from_deck() end)
+            end
+            G.jokers:remove_card(c)
+            if c.remove then
+                pcall(function() c:remove() end)
+            end
+        end
+    end
+
+    mod.capture_flash = 1.8
+    mod.capture_flash_text = string.format("REMOVED %d JOKERS FROM BOARD!", count)
+    print(string.format("GDCV_JOKER_SPAWN: Cleared %d jokers from active joker bar", count))
+end
+
 -- ==========================================
 -- SMODS CONFIG TAB & MENU CALLBACKS
 -- ==========================================
@@ -133,6 +288,56 @@ function UI.init_callbacks(mod)
             love.event.quit("restart")
         end
     end
+
+    -- ==========================================
+    -- JOKER TEST GENERATOR CALLBACKS
+    -- ==========================================
+    G.FUNCS.gdcv_change_joker_rarity = function(args)
+        local r_name = args.to_val or "All"
+        mod.test_joker_rarity_filter = r_name
+        local entries = UI.get_filtered_joker_entries(mod)
+        mod.test_joker_list = entries
+        mod.test_joker_idx = 1
+        local sel = entries[1]
+        mod.test_joker_name_display = sel and sel.name or "None"
+        mod.test_joker_key_display = sel and ("[" .. sel.key .. "]") or "[-]"
+    end
+
+    G.FUNCS.gdcv_change_joker_selection = function(args)
+        local idx = args.to_key
+        if not idx then
+            -- Fallback by searching option value in list
+            local entries = mod.test_joker_list or UI.get_filtered_joker_entries(mod)
+            for i, ent in ipairs(entries) do
+                if ent.name == args.to_val then
+                    idx = i
+                    break
+                end
+            end
+        end
+        idx = idx or 1
+        mod.test_joker_idx = idx
+        local entries = mod.test_joker_list or UI.get_filtered_joker_entries(mod)
+        local sel = entries[idx]
+        mod.test_joker_name_display = sel and sel.name or "None"
+        mod.test_joker_key_display = sel and ("[" .. sel.key .. "]") or "[-]"
+    end
+
+    G.FUNCS.gdcv_change_joker_edition = function(args)
+        mod.test_joker_edition = args.to_val or "None"
+    end
+
+    G.FUNCS.gdcv_change_joker_sticker = function(args)
+        mod.test_joker_sticker = args.to_val or "None"
+    end
+
+    G.FUNCS.gdcv_spawn_selected_joker = function(e)
+        UI.spawn_test_joker(mod)
+    end
+
+    G.FUNCS.gdcv_clear_all_jokers = function(e)
+        UI.clear_all_jokers(mod)
+    end
 end
 
 function UI.create_config_tab()
@@ -161,6 +366,44 @@ function UI.create_config_tab()
         if val == current_pm_str then current_pm_idx = idx; break end
     end
 
+    -- Initialize Joker Generator State
+    mod.test_joker_rarity_filter = mod.test_joker_rarity_filter or "All"
+    mod.test_joker_edition = mod.test_joker_edition or "None"
+    mod.test_joker_sticker = mod.test_joker_sticker or "None"
+    local joker_entries = UI.get_filtered_joker_entries(mod)
+    mod.test_joker_list = joker_entries
+    mod.test_joker_idx = math.min(mod.test_joker_idx or 1, math.max(1, #joker_entries))
+
+    local joker_names = {}
+    for _, ent in ipairs(joker_entries) do
+        table.insert(joker_names, ent.name)
+    end
+    if #joker_names == 0 then
+        joker_names = {"No Jokers Found"}
+    end
+
+    local sel_entry = joker_entries[mod.test_joker_idx]
+    mod.test_joker_name_display = sel_entry and sel_entry.name or "None"
+    mod.test_joker_key_display = sel_entry and ("[" .. sel_entry.key .. "]") or "[-]"
+
+    local rarity_options = {"All", "Common", "Uncommon", "Rare", "Legendary"}
+    local rarity_idx = 1
+    for i, r in ipairs(rarity_options) do
+        if r == mod.test_joker_rarity_filter then rarity_idx = i; break end
+    end
+
+    local edition_options = {"None", "Foil", "Holo", "Polychrome", "Negative"}
+    local edition_idx = 1
+    for i, ed in ipairs(edition_options) do
+        if ed == mod.test_joker_edition then edition_idx = i; break end
+    end
+
+    local sticker_options = {"None", "Eternal", "Perishable", "Rental"}
+    local sticker_idx = 1
+    for i, st in ipairs(sticker_options) do
+        if st == mod.test_joker_sticker then sticker_idx = i; break end
+    end
+
     local tab_def = {
         n = G.UIT.ROOT,
         config = {
@@ -177,6 +420,27 @@ function UI.create_config_tab()
                 config = {align = "cm", padding = 0.04},
                 nodes = {
                     {n = G.UIT.T, config = {text = "GameState Dataset CV - Settings", scale = 0.42, colour = G.C.GOLD}}
+                }
+            },
+            -- Telemetry Engine Status
+            {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.02},
+                nodes = {
+                    {
+                        n = G.UIT.C,
+                        config = {align = "cm", padding = 0.04, r = 0.1, colour = G.C.L_BLACK, minw = 6.4},
+                        nodes = {
+                            {
+                                n = G.UIT.T,
+                                config = {
+                                    text = "Engine Parity Tracker: AUTO-ACTIVE (Recording to run_telemetry.jsonl)",
+                                    scale = 0.28,
+                                    colour = G.C.GREEN
+                                }
+                            }
+                        }
+                    }
                 }
             },
             -- Mode Selector Cycle
@@ -240,6 +504,151 @@ function UI.create_config_tab()
                             scale = 0.65
                         })
                     }}
+                }
+            },
+            -- =========================================================
+            -- JOKER SPAWNER TEST BENCH (RNG & GameState Re-creation)
+            -- =========================================================
+            {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.03},
+                nodes = {
+                    {
+                        n = G.UIT.C,
+                        config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 6.5},
+                        nodes = {
+                            -- Header
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0.02},
+                                nodes = {
+                                    {
+                                        n = G.UIT.T,
+                                        config = {
+                                            text = "JOKER TEST GENERATOR (GameState / RNG)",
+                                            scale = 0.34,
+                                            colour = G.C.ORANGE
+                                        }
+                                    }
+                                }
+                            },
+                            -- Rarity Filter Cycle
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cr", padding = 0.02},
+                                nodes = {
+                                    {n = G.UIT.C, config = {align = "cl", minw = 2.8}, nodes = {
+                                        {n = G.UIT.T, config = {text = "Rarity Filter", scale = 0.30, colour = G.C.UI.TEXT_LIGHT}}
+                                    }},
+                                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                                        create_option_cycle({
+                                            id = 'gdcv_joker_rarity_cycle',
+                                            options = rarity_options,
+                                            current_option = rarity_idx,
+                                            opt_callback = 'gdcv_change_joker_rarity',
+                                            w = 3.2,
+                                            h = 0.55,
+                                            scale = 0.60
+                                        })
+                                    }}
+                                }
+                            },
+                            -- Joker Selector Cycle
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cr", padding = 0.02},
+                                nodes = {
+                                    {n = G.UIT.C, config = {align = "cl", minw = 2.8}, nodes = {
+                                        {n = G.UIT.T, config = {text = "Select Joker", scale = 0.30, colour = G.C.UI.TEXT_LIGHT}}
+                                    }},
+                                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                                        create_option_cycle({
+                                            id = 'gdcv_joker_choice_cycle',
+                                            options = joker_names,
+                                            current_option = math.min(mod.test_joker_idx, #joker_names),
+                                            opt_callback = 'gdcv_change_joker_selection',
+                                            w = 3.2,
+                                            h = 0.55,
+                                            scale = 0.55
+                                        })
+                                    }}
+                                }
+                            },
+                            -- Active Key Display
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0.01},
+                                nodes = {
+                                    {
+                                        n = G.UIT.T,
+                                        config = {
+                                            ref_table = mod,
+                                            ref_value = "test_joker_key_display",
+                                            text = mod.test_joker_key_display,
+                                            scale = 0.26,
+                                            colour = G.C.BLUE
+                                        }
+                                    }
+                                }
+                            },
+                            -- Modifiers: Edition & Sticker Cycle Row
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0.02},
+                                nodes = {
+                                    {n = G.UIT.C, config = {align = "cm", padding = 0.01}, nodes = {
+                                        {n = G.UIT.T, config = {text = "Edition:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
+                                        create_option_cycle({
+                                            id = 'gdcv_joker_edition_cycle',
+                                            options = edition_options,
+                                            current_option = edition_idx,
+                                            opt_callback = 'gdcv_change_joker_edition',
+                                            w = 2.2,
+                                            h = 0.5,
+                                            scale = 0.55
+                                        })
+                                    }},
+                                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
+                                    {n = G.UIT.C, config = {align = "cm", padding = 0.01}, nodes = {
+                                        {n = G.UIT.T, config = {text = "Sticker:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
+                                        create_option_cycle({
+                                            id = 'gdcv_joker_sticker_cycle',
+                                            options = sticker_options,
+                                            current_option = sticker_idx,
+                                            opt_callback = 'gdcv_change_joker_sticker',
+                                            w = 2.2,
+                                            h = 0.5,
+                                            scale = 0.55
+                                        })
+                                    }}
+                                }
+                            },
+                            -- Action Buttons: Spawn Joker & Clear All Jokers
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0.03},
+                                nodes = {
+                                    UIBox_button({
+                                        button = 'gdcv_spawn_selected_joker',
+                                        label = {'+ Spawn Joker'},
+                                        minw = 2.9,
+                                        minh = 0.55,
+                                        scale = 0.32,
+                                        colour = G.C.GOLD
+                                    }),
+                                    {n = G.UIT.B, config = {w = 0.2, h = 0.1}},
+                                    UIBox_button({
+                                        button = 'gdcv_clear_all_jokers',
+                                        label = {'Clear Jokers'},
+                                        minw = 2.9,
+                                        minh = 0.55,
+                                        scale = 0.32,
+                                        colour = G.C.RED
+                                    })
+                                }
+                            }
+                        }
+                    }
                 }
             },
             -- Stats & Info Row

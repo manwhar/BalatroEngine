@@ -17,6 +17,7 @@ RUNNING LIST OF UNIMPLEMENTED CV CALLS (Strictly Necessary):
 """
 
 from typing import Any
+
 try:
     from game.balatro_models import (
         BlindName,
@@ -47,7 +48,9 @@ def cv_detect_shop_cards(frame: Any = None) -> list[Any]:
     return []
 
 
-def cv_detect_joker_text_value(frame: Any, joker: Joker, pattern: str = "") -> int | float | None:
+def cv_detect_joker_text_value(
+    frame: Any, joker: Joker, pattern: str = ""
+) -> int | float | None:
     """OCRs numeric values from a joker's badge or hovered description."""
     return None
 
@@ -62,7 +65,9 @@ def cv_detect_target_rank(frame: Any = None, joker: Joker | None = None) -> Rank
     return Rank.ACE
 
 
-def cv_detect_target_poker_hand(frame: Any = None, joker: Joker | None = None) -> PokerHand:
+def cv_detect_target_poker_hand(
+    frame: Any = None, joker: Joker | None = None
+) -> PokerHand:
     """Reads the active target poker hand for To Do List."""
     return PokerHand.PAIR
 

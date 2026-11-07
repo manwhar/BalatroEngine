@@ -52,7 +52,9 @@ def evaluate_poker_hand(
     if not cards:
         return PokerHand.HIGH_CARD
 
-    joker_names = {j.name for j in (jokers or [])}
+    joker_names = {
+        j.name for j in (jokers or []) if not getattr(j, "debuffed", False)
+    }
     has_four_fingers = JokerName.FOUR_FINGERS in joker_names
     has_shortcut = JokerName.SHORTCUT in joker_names
     has_smeared = JokerName.SMEARED_JOKER in joker_names
@@ -200,7 +202,9 @@ def get_scoring_cards(
     if not cards:
         return []
 
-    joker_names = {j.name for j in (jokers or [])}
+    joker_names = {
+        j.name for j in (jokers or []) if not getattr(j, "debuffed", False)
+    }
     if JokerName.SPLASH in joker_names:
         return list(cards)
 

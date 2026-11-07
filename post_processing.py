@@ -20,7 +20,7 @@ def remove_duplicates(d: dict[str, int]) -> dict:
 
     return dict(reversed(new_dict.items()))
 
-def get_relevant_frames(d: dict[str, dict[str, int]]) -> tuple[list[str], list[str]]:
+def get_relevant_frames(d: dict[str, dict[str, int]]):
     key = d["key"]
     frames = d["frames"]
 

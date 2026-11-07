@@ -38,7 +38,6 @@ try:
         PlayingCard,
         PokerHand,
         Rank,
-        RunStats,
         Suit,
         JOKER_REGISTRY,
     )
@@ -59,7 +58,6 @@ except ImportError:
         PlayingCard,
         PokerHand,
         Rank,
-        RunStats,
         Suit,
         JOKER_REGISTRY,
     )
@@ -212,7 +210,7 @@ def test_functional_dispatch():
     state = GameState(
         inventory=Inventory(jokers=[bp, burnt]),
         hand=Hand(cards=pair_cards),
-        stats=RunStats(discards_used_this_round=1),
+        discards_used_this_round=1,
         hand_levels={PokerHand.PAIR: 1},
     )
     ctx = TriggerContext(event=TriggerEvent.DISCARD, state=state)
@@ -225,7 +223,7 @@ def test_functional_dispatch():
     state_incompat = GameState(
         inventory=Inventory(jokers=[burnt, bp, ff]),
         hand=Hand(cards=pair_cards),
-        stats=RunStats(discards_used_this_round=1),
+        discards_used_this_round=1,
         hand_levels={PokerHand.PAIR: 1},
     )
     ctx_incompat = TriggerContext(event=TriggerEvent.DISCARD, state=state_incompat)
@@ -238,11 +236,12 @@ def test_functional_dispatch():
     bs = Joker(name=JokerName.BRAINSTORM)
     state_burglar = GameState(
         inventory=Inventory(jokers=[burglar, bs]),
-        stats=RunStats(hands_left=4, discards_left=3),
+        hands_left=4,
+        discards_left=3,
     )
     ctx_burglar = TriggerContext(event=TriggerEvent.SETTING_BLIND, state=state_burglar)
     dispatch_jokers(ctx_burglar)
-    assert state_burglar.stats.hands_left == 10, f"Expected 10 hands (4 base + 3 burglar + 3 brainstorm), got {state_burglar.stats.hands_left}"
+    assert state_burglar.hands_left == 10, f"Expected 10 hands (4 base + 3 burglar + 3 brainstorm), got {state_burglar.hands_left}"
 
     # Scenario 4: Flash Card + Blueprint (Scaling Jokers do NOT scale on Blueprint copy)
     # Rerolling shop should increase Flash Card's mult once (+2), NOT twice (+4)
@@ -250,7 +249,8 @@ def test_functional_dispatch():
     flash.state["mult"] = 0
     state_flash = GameState(
         inventory=Inventory(jokers=[bp, flash]),
-        stats=RunStats(money=10, reroll_cost=5),
+        money=10,
+        reroll_cost=5,
     )
     ctx_reroll = TriggerContext(event=TriggerEvent.REROLL_SHOP, state=state_flash)
     dispatch_jokers(ctx_reroll)

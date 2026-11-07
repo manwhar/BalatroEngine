@@ -12,6 +12,7 @@ class Location(StrEnum):
     BLIND = "blind"
     SHOP = "shop"
     SELECT = "select"
+    PACK = "pack"
 
 
 class PokerHand(StrEnum):
@@ -321,6 +322,7 @@ class ActionType(StrEnum):
     SELECT_CARD = "Select Card"
     SELL_CARD = "Sell Card"
     SKIP_BLIND = "Skip Blind"
+    SKIP_PACK = "Skip Pack"
     SORT_RANK = "Sort by Rank"
     SORT_SUIT = "Sort by Suit"
     USE_CONSUMABLE = "Use Consumable"
@@ -473,6 +475,8 @@ class PlayingCard(Card):
 class HandCard:
     card: PlayingCard
     selected: bool = False
+    facing_back: bool = False
+    forced_selection: bool = False
 
 
 @dataclass(kw_only=True)
@@ -505,14 +509,18 @@ class Hand:
 
     def select(self, index: int) -> None:
         if 0 <= index < len(self.cards):
-            # Only allow selecting if fewer than 5 are already selected
-            if not self.cards[index].selected and len(self.selected_cards) >= 5:
+            hc = self.cards[index]
+            if hc.selected and hc.forced_selection:
                 return
-            self.cards[index].selected = not self.cards[index].selected
+            # Only allow selecting if fewer than 5 are already selected
+            if not hc.selected and len(self.selected_cards) >= 5:
+                return
+            hc.selected = not hc.selected
 
     def clear_selection(self) -> None:
         for c in self.cards:
-            c.selected = False
+            if not c.forced_selection:
+                c.selected = False
 
 
 @dataclass(kw_only=True)
@@ -552,7 +560,6 @@ class JokerInfo:
     rarity: JokerRarity
     base_cost: int
     base_sell_value: int
-    funcs: "JokerFunctions | None" = None
     blueprint_compat: bool = True
 
 
@@ -565,7 +572,10 @@ class Joker(Card):
     edition: Edition = Edition.NONE
     eternal: bool = False
     perishable: bool = False
+    perish_tally: int = 5
     rental: bool = False
+    debuffed: bool = False
+    facing_back: bool = False
     extra_value: int = 0  # e.g., Gift Card bonuses
     state: dict = field(default_factory=dict)  # e.g. {"chips": 45} for Runner
 
@@ -595,26 +605,6 @@ class BoosterPack:
     cost: int
     choose: int
     extra: int  # total options shown (e.g. choose 1 of 3 -> extra=3)
-
-
-@dataclass(kw_only=True)
-class ShopState:
-    cards: list[Card] = field(default_factory=list)  # Jokers, Consumables, PlayingCards
-    vouchers: list[Voucher] = field(default_factory=list)
-    packs: list[BoosterPack] = field(default_factory=list)
-    reroll_cost: int = 5
-
-
-@dataclass(kw_only=True)
-class RunStats:
-    money: int = 4
-    ante: int = 1
-    round: int = 1
-    hands_left: int = 4
-    discards_left: int = 3
-    hands_played_this_round: int = 0
-    discards_used_this_round: int = 0
-    reroll_cost: int = 5
 
 
 @dataclass(kw_only=True)
@@ -707,70 +697,69 @@ class Inventory:
         return len(self.consumables) < self.max_consumables
 
 
-@dataclass(frozen=True, slots=True)
-class JokerFunctions:
-    """
-    Joker functionality; each field is a potential in-game trigger.
-    2 types of possible functions:
-        1) Directly update a game value triggered by a certain action
-           OR event  (action ~ player input; event ~ glass breaking);
-           i.e., playing a hand increases green joker. Closed-loop.
+# @dataclass(frozen=True, slots=True)
+# class JokerFunctions:
+#     """
+#     Joker functionality; each field is a potential in-game trigger.
+#     2 types of possible functions:
+#         1) Directly update a game value triggered by a certain action
+#            OR event  (action ~ player input; event ~ glass breaking);
+#            i.e., playing a hand increases green joker. Closed-loop.
 
-        2) Some value is updated, but we need to queue a CV query to
-           determine what the result is (usually due to randomness).
-           i.e., cartomancer/perkeo creates a consumable card -> CV
-           query to re-document consumables
-           NOTE: If this is triggered by an action, that action was
-                 made without the updated value already existing, so
-                 we can queue the CV re-check for the next action.
-                 For instance: Clicking Select Blind with Cartomancer
-                 is done without the resultant tarot card in
-                 inventory. However, we don't care about what that
-                 tarot card is until the NEXT action, so add "re-index
-                 consumables" to the list of things to scan at the
-                 time of next action.
+#         2) Some value is updated, but we need to queue a CV query to
+#            determine what the result is (usually due to randomness).
+#            i.e., cartomancer/perkeo creates a consumable card -> CV
+#            query to re-document consumables
+#            NOTE: If this is triggered by an action, that action was
+#                  made without the updated value already existing, so
+#                  we can queue the CV re-check for the next action.
+#                  For instance: Clicking Select Blind with Cartomancer
+#                  is done without the resultant tarot card in
+#                  inventory. However, we don't care about what that
+#                  tarot card is until the NEXT action, so add "re-index
+#                  consumables" to the list of things to scan at the
+#                  time of next action.
 
-                 If the value is triggered by a random event (i.e.
-                 glass breaking), same thing. Queue CV check for the
-                 *next* action.
-    We don't care about jokers that statically update the score, like
-    The Trio, since they don't modify the game state more than playing
-    a hand / performing any action without them would.
-        ex: With/without The Trio, when we receive the "Play Hand"
-        action, we need to:
-            - Check how many hands are remaining
-            - Check the current blind score
-            - Check how much money we have
-            ...etc (nothing changes by having The Trio)
+#                  If the value is triggered by a random event (i.e.
+#                  glass breaking), same thing. Queue CV check for the
+#                  *next* action.
+#     We don't care about jokers that statically update the score, like
+#     The Trio, since they don't modify the game state more than playing
+#     a hand / performing any action without them would.
+#         ex: With/without The Trio, when we receive the "Play Hand"
+#         action, we need to:
+#             - Check how many hands are remaining
+#             - Check the current blind score
+#             - Check how much money we have
+#             ...etc (nothing changes by having The Trio)
 
 
-    """
+#     """
 
-    discard: list[
-        Callable
-    ]  # castle, ramen, trading card, green joker, yorick, burnt joker, hit the road,
+#     discard: list[
+#         Callable
+#     ]  # castle, ramen, trading card, green joker, yorick, burnt joker, hit the road,
 
-    # ride the bus, lucky cat, seltzer, midas mask, obelisk, vagabond, vampire, seance, square joker,
-    # superposition, green joker, hiker, sixth sense, DNA, runner, matador, space joker, 8 ball, loyalty card,
-    play_hand: list[Callable]
+#     # ride the bus, lucky cat, seltzer, midas mask, obelisk, vagabond, vampire, seance, square joker,
+#     # superposition, green joker, hiker, sixth sense, DNA, runner, matador, space joker, 8 ball, loyalty card,
+#     play_hand: list[Callable]
 
-    next_round: list[Callable]  # perkeo
+#     next_round: list[Callable]  # perkeo
 
-    # madness, riff-raff, burglar, cartomancer, certificate, ceremonial dagger, marble joker
-    select_blind: list[Callable]
-    use_planet: list[Callable]  # satellite, constellation,
-    sell_card: list[Callable]  # campfire, cola, luchador, invisible joker,
-    end_round: list[Callable]  # gift card, egg, hit the road
-    end_ante: list[Callable]  # campfire, rocket
-    add_card: list[Callable]  # hologram
-    glass_broken: list[Callable]  # glass joker
-    reroll: list[Callable]  # flashcard
-    open_pack: list[Callable]  # hallucation
-    skip_pack: list[Callable]  # red card
-    remove_card: list[Callable]  # canio
-    deck_change: list[Callable]  # stone joker, steel joker
+#     # madness, riff-raff, burglar, cartomancer, certificate, ceremonial dagger, marble joker
+#     select_blind: list[Callable]
+#     use_planet: list[Callable]  # satellite, constellation,
+#     sell_card: list[Callable]  # campfire, cola, luchador, invisible joker,
+#     end_round: list[Callable]  # gift card, egg, hit the road
+#     end_ante: list[Callable]  # campfire, rocket
+#     add_card: list[Callable]  # hologram
+#     glass_broken: list[Callable]  # glass joker
+#     reroll: list[Callable]  # flashcard
+#     open_pack: list[Callable]  # hallucation
+#     skip_pack: list[Callable]  # red card
+#     remove_card: list[Callable]  # canio
+#     deck_change: list[Callable]  # stone joker, steel joker
 
-def play_hand_green()
 
 # ---------------------------------------------------------
 # Static Data Tables & Registries (Keep at bottom)

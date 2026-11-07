@@ -24,6 +24,7 @@ class TriggerEvent(Enum):
     OPEN_BOOSTER = auto()
     SKIP_BOOSTER = auto()
     USE_CONSUMABLE = auto()
+    LEAVE_SHOP = auto()
 
     # Hand Play & Discard Events
     BEFORE_PLAY = auto()
