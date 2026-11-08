@@ -31,6 +31,7 @@ class TriggerEvent(Enum):
     AFTER_PLAY = auto()
     DISCARD = auto()
     INDIVIDUAL_CARD_SCORED = auto()
+    HELD_CARD_SCORED = auto()
 
 
 @dataclass(kw_only=True)

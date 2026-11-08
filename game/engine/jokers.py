@@ -4,6 +4,7 @@ Connects all 150 Balatro Jokers to active state changes, accumulators,
 game triggers, passive deck modifiers, and CV observation hooks.
 """
 
+from collections import Counter
 import copy
 import random
 from typing import Callable
@@ -122,10 +123,10 @@ def is_card_face(card: PlayingCard, jokers: list[Joker] | None = None) -> bool:
     """Checks if a PlayingCard counts as a face card, respecting debuffs, Stone, and Pareidolia."""
     if getattr(card, "debuffed", False):
         return False
-    if card.enhancement == Enhancement.STONE or card.rank == Rank.NONE:
-        return False
     if jokers and any(j.name == JokerName.PAREIDOLIA and not j.debuffed for j in jokers):
         return True
+    if card.enhancement == Enhancement.STONE or card.rank == Rank.NONE:
+        return False
     return card.is_face
 
 
@@ -497,15 +498,21 @@ def handle_ceremonial_dagger(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
     if ctx.event == TriggerEvent.SETTING_BLIND:
-        jokers = ctx.state.inventory.jokers
-        if joker in jokers:
-            idx = jokers.index(joker)
-            if idx + 1 < len(jokers):
-                sliced = jokers[idx + 1]
+        initial_jokers = ctx.extra.get("initial_jokers") if ctx.extra else None
+        jokers_to_check = initial_jokers if initial_jokers is not None else ctx.state.inventory.jokers
+        if joker in jokers_to_check:
+            idx = jokers_to_check.index(joker)
+            if idx + 1 < len(jokers_to_check):
+                sliced = jokers_to_check[idx + 1]
                 if not sliced.eternal:
+                    if sliced in ctx.state.inventory.jokers:
+                        ctx.state.inventory.jokers.remove(sliced)
                     on_joker_removed(ctx.state, sliced)
-                    jokers.pop(idx + 1)
-                    added_mult = sliced.sell_value * 2
+                    sell_val = sliced.get_sell_value(
+                        discount_percent=ctx.state.discount_percent,
+                        inflation=ctx.state.inflation,
+                    )
+                    added_mult = sell_val * 2
                     joker.state["mult"] = joker.state.get("mult", 0) + added_mult
 
 
@@ -626,11 +633,26 @@ def handle_spare_trousers(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
     if ctx.event == TriggerEvent.BEFORE_PLAY:
+        played = ctx.full_hand or (
+            ctx.state.hand.selected_cards if ctx.state and ctx.state.hand else []
+        )
+        valid_cards = [
+            c
+            for c in played
+            if getattr(c, "enhancement", None) != Enhancement.STONE
+            and getattr(c, "rank", Rank.NONE) != Rank.NONE
+        ]
+        counts = sorted(Counter(c.rank for c in valid_cards).values(), reverse=True)
+        contains_two_pair = len(counts) >= 2 and counts[0] >= 2 and counts[1] >= 2
         hand = ctx.poker_hand or evaluate_poker_hand(
-            ctx.full_hand or (ctx.state.hand.selected_cards if ctx.state and ctx.state.hand else []),
+            played,
             ctx.state.inventory.jokers if ctx.state else None,
         )
-        if hand in (PokerHand.TWO_PAIR, PokerHand.FULL_HOUSE, PokerHand.FLUSH_HOUSE):
+        if contains_two_pair or hand in (
+            PokerHand.TWO_PAIR,
+            PokerHand.FULL_HOUSE,
+            PokerHand.FLUSH_HOUSE,
+        ):
             joker.state["mult"] = joker.state.get("mult", 0) + 2
 
 
@@ -931,26 +953,20 @@ def handle_burglar(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.DRUNKARD)
 def handle_drunkard(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
-        return
-    if ctx.event == TriggerEvent.SETTING_BLIND:
-        ctx.state.discards_left += 1
+    # Passive modifier applied to base discards on SETTING_BLIND / add_to_deck
+    pass
 
 
 @joker_hook(JokerName.MERRY_ANDY)
 def handle_merry_andy(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
-        return
-    if ctx.event == TriggerEvent.SETTING_BLIND:
-        ctx.state.discards_left += 3
+    # Passive modifier applied to base discards on SETTING_BLIND / add_to_deck
+    pass
 
 
 @joker_hook(JokerName.TROUBADOUR)
 def handle_troubadour(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
-        return
-    if ctx.event == TriggerEvent.SETTING_BLIND:
-        ctx.state.hands_left = max(1, ctx.state.hands_left - 1)
+    # Passive modifier applied to base hands on SETTING_BLIND / add_to_deck
+    pass
 
 
 @joker_hook(JokerName.MARBLE_JOKER)
@@ -995,17 +1011,28 @@ def handle_cartomancer(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.RIFF_RAFF)
 def handle_riff_raff(joker: Joker, ctx: TriggerContext):
+    if ctx.is_blueprint:
+        return
     if ctx.event == TriggerEvent.SETTING_BLIND:
         if ctx.state.inventory and ctx.state.inventory.can_add_joker:
-            if ctx.state.rng:
-                space = ctx.state.inventory.joker_slots - len(ctx.state.inventory.jokers)
-                spawn_count = min(2, space)
-                spawned = predict_riff_raff_jokers(
-                    ctx.state.rng, ante=ctx.state.ante, count=spawn_count
-                )
-                for sj in spawned:
+            if ctx.action and ctx.action.metadata and ctx.action.metadata.get("riff_raff_spawned"):
+                queue = ctx.action.metadata["riff_raff_spawned"]
+                space = ctx.state.inventory.max_jokers - len(ctx.state.inventory.jokers)
+                spawn_count = min(2, space, len(queue))
+                for _ in range(spawn_count):
+                    sj = queue.pop(0)
                     ctx.state.inventory.jokers.append(sj)
                     on_joker_added(ctx.state, sj)
+            elif ctx.state.rng:
+                space = ctx.state.inventory.max_jokers - len(ctx.state.inventory.jokers)
+                spawn_count = min(2, space)
+                if spawn_count > 0:
+                    spawned = predict_riff_raff_jokers(
+                        ctx.state.rng, ante=ctx.state.ante, count=spawn_count
+                    )
+                    for sj in spawned:
+                        ctx.state.inventory.jokers.append(sj)
+                        on_joker_added(ctx.state, sj)
             else:
                 ctx.state.pending_cv_checks.add("jokers")
 
@@ -1180,7 +1207,7 @@ def handle_dna(joker: Joker, ctx: TriggerContext):
 def handle_sixth_sense(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.BEFORE_PLAY:
+    if ctx.event == TriggerEvent.AFTER_PLAY:
         played = ctx.full_hand or (ctx.state.hand.selected_cards if ctx.state and ctx.state.hand else [])
         if ctx.state.hands_played_this_round <= 1 and len(played) == 1:
             c = played[0]
@@ -1303,17 +1330,16 @@ def handle_business_card(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.RESERVED_PARKING)
 def handle_reserved_parking(joker: Joker, ctx: TriggerContext):
-    if ctx.event == TriggerEvent.BEFORE_PLAY:
+    if ctx.event == TriggerEvent.HELD_CARD_SCORED:
         jokers = ctx.state.inventory.jokers if ctx.state and ctx.state.inventory else None
-        held = [hc.card for hc in ctx.state.hand.cards if not hc.selected]
-        if ctx.state.rng:
-            oops = get_oops_multiplier(ctx.state)
-            for c in held:
-                if is_card_face(c, jokers) and not getattr(c, "debuffed", False):
-                    if ctx.state.rng.poll_odds("parking", 1, 2, oops):
-                        ctx.state.money += 1
-        elif any(is_card_face(c, jokers) for c in held):
-            ctx.state.pending_cv_checks.add("money")
+        c = ctx.target_card
+        if c and is_card_face(c, jokers) and not getattr(c, "debuffed", False):
+            if ctx.state.rng:
+                oops = get_oops_multiplier(ctx.state)
+                if ctx.state.rng.poll_odds("parking", 1, 2, oops):
+                    ctx.state.money += 1
+            else:
+                ctx.state.pending_cv_checks.add("money")
 
 
 @joker_hook(JokerName.MATADOR)

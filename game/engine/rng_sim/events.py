@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from game.engine.rng_sim.rng import BalatroRNG
+from game.engine.rng_sim.rng import BalatroRNG, Tw223
 from game.engine.rng_sim.state import (
     DEFAULT_VISIBLE_POKER_HANDS,
     BlindName,

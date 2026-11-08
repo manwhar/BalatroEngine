@@ -228,11 +228,6 @@ function UI.setup_custom_test_suite(mod)
             local card = create_card('Joker', G.jokers, nil, nil, true, nil, k, 'deck')
             if card then
                 card:set_edition({negative = true}, true, true)
-                if card.set_eternal then
-                    card:set_eternal(true)
-                else
-                    card.ability.eternal = true
-                end
                 card:add_to_deck()
                 G.jokers:emplace(card)
                 jokers_spawned = jokers_spawned + 1
@@ -240,6 +235,24 @@ function UI.setup_custom_test_suite(mod)
         end
     end
     G.jokers.config.card_limit = math.max(G.jokers.config.card_limit or 5, #G.jokers.cards)
+
+    -- Ensure Ceremonial Dagger is moved to the far right so it doesn't destroy other Jokers on blind select
+    local dagger_idx = nil
+    if G.jokers and G.jokers.cards then
+        for idx, j in ipairs(G.jokers.cards) do
+            local k = j.config and j.config.center and j.config.center.key
+            if k == "j_ceremonial" or (j.ability and j.ability.name == "Ceremonial Dagger") then
+                dagger_idx = idx
+                break
+            end
+        end
+        if dagger_idx and dagger_idx < #G.jokers.cards then
+            local dagger_card = table.remove(G.jokers.cards, dagger_idx)
+            table.insert(G.jokers.cards, dagger_card)
+            if G.jokers.set_ranks then G.jokers:set_ranks() end
+            if G.jokers.align_cards then G.jokers:align_cards() end
+        end
+    end
 
     -- 2. Convert half of all cards in deck to Lucky Cards, half to Glass Cards
     local total_cards = #G.playing_cards
@@ -290,8 +303,16 @@ function UI.setup_custom_test_suite(mod)
     mod.capture_flash = 2.5
     mod.capture_flash_text = string.format("TEST SUITE: +%d JOKERS, +%d CONSUMABLES, %d CARDS 50/50 LUCKY/GLASS!",
         jokers_spawned, consumables_spawned, total_cards)
-    print(string.format("GDCV_TEST_SUITE: Spawned %d Jokers (Neg/Eternal), %d Consumables (Neg), converted %d deck cards (half Lucky / half Glass)",
+    print(string.format("GDCV_TEST_SUITE: Spawned %d Jokers (Negative), %d Consumables (Negative), Ceremonial Dagger on far right, converted %d deck cards (half Lucky / half Glass)",
         jokers_spawned, consumables_spawned, total_cards))
+
+    if G.DATASET_MOD and G.DATASET_MOD.RunTracker and G.DATASET_MOD.RunTracker.snapshot_gamestate then
+        G.DATASET_MOD.RunTracker.snapshot_gamestate("Setup Test Suite", {
+            jokers_spawned = jokers_spawned,
+            consumables_spawned = consumables_spawned,
+            total_cards = total_cards
+        })
+    end
 end
 
 -- ==========================================

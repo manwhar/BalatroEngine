@@ -9,7 +9,9 @@ try:
         BlindName,
         BoosterPack,
         Card,
+        CardBounds,
         Deck,
+        Edition,
         Enhancement,
         Hand,
         HandCard,
@@ -38,7 +40,9 @@ except ImportError:
         BlindName,
         BoosterPack,
         Card,
+        CardBounds,
         Deck,
+        Edition,
         Enhancement,
         Hand,
         HandCard,
@@ -102,6 +106,84 @@ def _cards_match(a: PlayingCard, b: PlayingCard) -> bool:
         and a.edition == b.edition
         and a.seal == b.seal
     )
+
+
+def get_rank_sort_nominal(card: PlayingCard) -> float:
+    """Calculates Balatro's exact nominal value for 'Sort by Rank' (descending).
+
+    Nominals:
+      Ace: 11.4, King: 10.3, Queen: 10.2, Jack: 10.1, 10: 10.0, 9..2: 9.0..2.0
+      Suit nominals: Spades: +0.04, Hearts: +0.03, Clubs: +0.02, Diamonds: +0.01
+      Stone card: -1000.0 (always sorts to rightmost end)
+    """
+    if card.enhancement == Enhancement.STONE:
+        return -1000.0
+
+    rank_nominals = {
+        Rank.TWO: (2.0, 0.0),
+        Rank.THREE: (3.0, 0.0),
+        Rank.FOUR: (4.0, 0.0),
+        Rank.FIVE: (5.0, 0.0),
+        Rank.SIX: (6.0, 0.0),
+        Rank.SEVEN: (7.0, 0.0),
+        Rank.EIGHT: (8.0, 0.0),
+        Rank.NINE: (9.0, 0.0),
+        Rank.TEN: (10.0, 0.0),
+        Rank.JACK: (10.0, 0.1),
+        Rank.QUEEN: (10.0, 0.2),
+        Rank.KING: (10.0, 0.3),
+        Rank.ACE: (11.0, 0.4),
+    }
+    suit_nominals = {
+        Suit.DIAMONDS: 0.01,
+        Suit.CLUBS: 0.02,
+        Suit.HEARTS: 0.03,
+        Suit.SPADES: 0.04,
+    }
+    base_nom, face_nom = rank_nominals.get(card.rank, (0.0, 0.0))
+    suit_nom = suit_nominals.get(card.suit, 0.0)
+    tie_break = (card.id * 1e-6) if card.id else 0.0
+    return base_nom + face_nom + suit_nom + tie_break
+
+
+def get_suit_sort_nominal(card: PlayingCard) -> float:
+    """Calculates Balatro's exact nominal value for 'Sort by Suit' (suit desc).
+
+    Nominals:
+      Spades block: 40.0 + rank_nominal
+      Hearts block: 30.0 + rank_nominal
+      Clubs block: 20.0 + rank_nominal
+      Diamonds block: 10.0 + rank_nominal
+      Stone card: -1000.0
+    """
+    if card.enhancement == Enhancement.STONE:
+        return -1000.0
+
+    rank_nominals = {
+        Rank.TWO: (2.0, 0.0),
+        Rank.THREE: (3.0, 0.0),
+        Rank.FOUR: (4.0, 0.0),
+        Rank.FIVE: (5.0, 0.0),
+        Rank.SIX: (6.0, 0.0),
+        Rank.SEVEN: (7.0, 0.0),
+        Rank.EIGHT: (8.0, 0.0),
+        Rank.NINE: (9.0, 0.0),
+        Rank.TEN: (10.0, 0.0),
+        Rank.JACK: (10.0, 0.1),
+        Rank.QUEEN: (10.0, 0.2),
+        Rank.KING: (10.0, 0.3),
+        Rank.ACE: (11.0, 0.4),
+    }
+    suit_nominals = {
+        Suit.DIAMONDS: 0.01,
+        Suit.CLUBS: 0.02,
+        Suit.HEARTS: 0.03,
+        Suit.SPADES: 0.04,
+    }
+    base_nom, face_nom = rank_nominals.get(card.rank, (0.0, 0.0))
+    suit_nom = suit_nominals.get(card.suit, 0.0)
+    tie_break = (card.id * 1e-6) if card.id else 0.0
+    return base_nom + face_nom + (suit_nom * 1000.0) + tie_break
 
 
 @dataclass(kw_only=True)
@@ -189,6 +271,7 @@ class GameState:
     seed: str = ""
     rng: Any = None
     resolver: Any = None
+    _next_slot_uid: int = field(default=1, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.seed and self.rng is None:
@@ -229,7 +312,7 @@ class GameState:
                 if j.name == JokerName.HOLOGRAM and not j.debuffed:
                     j.state["x_mult"] = round(j.state.get("x_mult", 1.0) + 0.25, 2)
 
-    def remove_card_from_deck(self, card: PlayingCard) -> bool:
+    def remove_card_from_deck(self, card: PlayingCard, shattered: bool = False) -> bool:
         """Removes a single matching card from full deck, discard pile, and hand when destroyed."""
         removed = False
         for i, c in enumerate(self.full_deck):
@@ -275,7 +358,11 @@ class GameState:
                     continue
                 if is_face and j.name == JokerName.CANIO:
                     j.state["x_mult"] = round(j.state.get("x_mult", 1.0) + 1.0, 2)
-                elif card.enhancement == Enhancement.GLASS and j.name == JokerName.GLASS_JOKER:
+                elif (
+                    card.enhancement == Enhancement.GLASS
+                    and shattered
+                    and j.name == JokerName.GLASS_JOKER
+                ):
                     j.state["x_mult"] = round(j.state.get("x_mult", 1.0) + 0.75, 2)
         return removed
 
@@ -290,6 +377,279 @@ class GameState:
                     remaining.pop(i)
                     break
         return remaining
+
+    def _get_next_slot_uid(self) -> int:
+        uid = self._next_slot_uid
+        self._next_slot_uid += 1
+        return uid
+
+    def ensure_slot_uids(self) -> None:
+        """Assigns persistent slot UIDs and initializes CardBounds for any unassigned hand cards."""
+        for hc in self.hand.cards:
+            if hc.slot_uid == 0:
+                hc.slot_uid = self._get_next_slot_uid()
+            if hc.facing_back:
+                if hc.bounds is None:
+                    hc.bounds = CardBounds(is_face_down=True)
+                if not hc.bounds.candidate_card_ids:
+                    candidates = self.get_face_down_candidate_pool(hc)
+                    hc.bounds.set_candidates(candidates)
+
+    def get_face_down_candidate_pool(self, target_hc: HandCard | None = None) -> list[PlayingCard]:
+        """Gathers available candidate PlayingCard objects that could occupy a face-down slot."""
+        resolved_in_hand_ids = {
+            c.card.id
+            for c in self.hand.cards
+            if c is not target_hc
+            and (not c.facing_back or (c.bounds and c.bounds.is_resolved))
+            and c.card.id != 0
+        }
+        unavailable_ids = (
+            {c.id for c in self.discard_pile if c.id}
+            | {c.id for c in self.played_cards_this_round if c.id}
+            | resolved_in_hand_ids
+        )
+
+        base_pool = list(self.remaining_deck)
+        if not base_pool and self.full_deck:
+            base_pool = [c for c in self.full_deck if c.id not in unavailable_ids]
+
+        pool: list[PlayingCard] = []
+        for c in base_pool:
+            if c.id not in unavailable_ids:
+                pool.append(c)
+
+        if target_hc is not None:
+            if target_hc._real_card and not any(_cards_match(c, target_hc._real_card) for c in pool):
+                if target_hc._real_card.id not in unavailable_ids:
+                    pool.append(target_hc._real_card)
+            elif target_hc.bounds and target_hc.bounds.candidate_cards:
+                for c in target_hc.bounds.candidate_cards:
+                    if c.id not in unavailable_ids and not any(_cards_match(p, c) for p in pool):
+                        pool.append(c)
+
+        return pool
+
+    def apply_sort_observation(
+        self, sort_type: str = "rank", selected_slot_uid: int | None = None
+    ) -> None:
+        """Updates hand order and narrows CardBounds for all face-down cards from sort order."""
+        self.ensure_slot_uids()
+        norm_type = sort_type.lower()
+        is_suit_sort = "suit" in norm_type
+        nominal_fn = get_suit_sort_nominal if is_suit_sort else get_rank_sort_nominal
+
+        # 1. Deterministic sort if simulation or cards have true values
+        can_simulate_sort = all(
+            (c._real_card is not None or c.card.rank != Rank.NONE or c.enhancement == Enhancement.STONE)
+            for c in self.hand.cards
+        )
+        if can_simulate_sort:
+            self.hand.cards.sort(
+                key=lambda hc: nominal_fn(hc._real_card if hc._real_card else hc.card),
+                reverse=True,
+            )
+
+        # 2. Iterate deduction passes until fixpoint is reached
+        changed = True
+        while changed:
+            changed = False
+            for i, hc in enumerate(self.hand.cards):
+                if (hc.bounds and hc.bounds.is_resolved) or (not hc.facing_back and hc.bounds is None):
+                    continue
+
+                if hc.bounds is None:
+                    hc.bounds = CardBounds(is_face_down=True)
+
+                # Determine upper nominal bound from nearest known face-up card to the left
+                upper_nominal = float("inf")
+                for left_i in range(i - 1, -1, -1):
+                    left_card = self.hand.cards[left_i]
+                    if not left_card.facing_back and left_card.card.rank != Rank.NONE:
+                        upper_nominal = nominal_fn(left_card.card)
+                        break
+
+                # Determine lower nominal bound from nearest known face-up card to the right
+                lower_nominal = float("-inf")
+                for right_i in range(i + 1, len(self.hand.cards)):
+                    right_card = self.hand.cards[right_i]
+                    if not right_card.facing_back and right_card.card.rank != Rank.NONE:
+                        lower_nominal = nominal_fn(right_card.card)
+                        break
+
+                # Filter candidates against bounds
+                pool = self.get_face_down_candidate_pool(hc)
+                valid_candidates: list[PlayingCard] = []
+                for cand in pool:
+                    cand_nom = nominal_fn(cand)
+                    if cand_nom > upper_nominal + 1e-5 or cand_nom < lower_nominal - 1e-5:
+                        continue
+                    if cand.rank not in hc.bounds.possible_ranks:
+                        continue
+                    if cand.suit not in hc.bounds.possible_suits:
+                        continue
+                    if cand.enhancement not in hc.bounds.possible_enhancements:
+                        continue
+                    if cand.edition not in hc.bounds.possible_editions:
+                        continue
+                    if cand.seal not in hc.bounds.possible_seals:
+                        continue
+                    valid_candidates.append(cand)
+
+                # Update bounds
+                prev_ids = set(hc.bounds.candidate_card_ids)
+                hc.bounds.set_candidates(valid_candidates)
+
+                if prev_ids != hc.bounds.candidate_card_ids:
+                    changed = True
+
+                # Check if exactly 1 candidate remains -> resolve!
+                if hc.bounds.is_resolved and valid_candidates:
+                    resolved = valid_candidates[0]
+                    hc.resolve_face_down(resolved)
+                    changed = True
+                    break  # Restart loop with new resolved card as face-up boundary
+
+        self.reconcile_face_down_adjacencies()
+
+    def reconcile_face_down_adjacencies(self) -> None:
+        """Enforces visual adjacency constraints and human memory bounds for face-down cards.
+
+        In Balatro's UI, cards in hand are displayed in a horizontal sequence:
+        1. Isolated face-down cards (separated from other face-down cards by at least one
+           face-up card) remain visually distinct landmarks and retain all specific
+           information known about them (e.g. from Tarot flip-reveals or deductions).
+        2. Contiguous adjacent face-down cards without face-up dividers that share the same
+           visual signature (selection highlight, seal sticker, or edition sheen on the back)
+           are visually indistinguishable to human perception. They lose individual positional
+           certainty and conflate their candidate pools to the union of their possibilities,
+           forgetting specific single-card identity.
+        """
+        cards = self.hand.cards
+        if len(cards) <= 1:
+            return
+
+        # 1. Partition hand into contiguous segments of face-down cards
+        segments: list[list[int]] = []
+        current_segment: list[int] = []
+
+        for idx, hc in enumerate(cards):
+            is_fd = hc.facing_back or (hc.bounds is not None and hc.bounds.is_face_down)
+            if is_fd:
+                current_segment.append(idx)
+            else:
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+        if current_segment:
+            segments.append(current_segment)
+
+        # 2. Process each contiguous segment
+        for segment in segments:
+            # An isolated face-down card (length 1) has visual landmarks on both sides -> retains identity!
+            if len(segment) < 2:
+                continue
+
+            # Group adjacent cards by visual appearance on the card back:
+            # - selected state (raised vs resting)
+            # - visible seal (e.g. Red, Blue, Gold, Purple seal sticker on back)
+            # - visible edition (e.g. Foil, Holographic, Polychrome sheen on back)
+            vis_groups: dict[tuple, list[int]] = {}
+            for idx in segment:
+                hc = cards[idx]
+                seal_vis = hc.card.seal
+                if seal_vis == Seal.NONE and hc._real_card and hc._real_card.seal != Seal.NONE:
+                    seal_vis = hc._real_card.seal
+                ed_vis = hc.card.edition
+                if ed_vis == Edition.NONE and hc._real_card and hc._real_card.edition != Edition.NONE:
+                    ed_vis = hc._real_card.edition
+
+                vis_sig = (hc.selected, seal_vis, ed_vis)
+                vis_groups.setdefault(vis_sig, []).append(idx)
+
+            for vis_sig, group_indices in vis_groups.items():
+                if len(group_indices) >= 2:
+                    pooled_candidates: list[PlayingCard] = []
+                    seen_ids: set[int] = set()
+
+                    for idx in group_indices:
+                        hc = cards[idx]
+                        if hc.bounds and hc.bounds.candidate_cards:
+                            cands = hc.bounds.candidate_cards
+                        else:
+                            cands = self.get_face_down_candidate_pool(hc)
+
+                        for c in cands:
+                            cid = c.id if c.id else id(c)
+                            if cid not in seen_ids:
+                                seen_ids.add(cid)
+                                pooled_candidates.append(c)
+
+                    for idx in group_indices:
+                        hc = cards[idx]
+                        if hc._real_card:
+                            cid = (
+                                hc._real_card.id
+                                if hc._real_card.id
+                                else id(hc._real_card)
+                            )
+                            if cid not in seen_ids:
+                                seen_ids.add(cid)
+                                pooled_candidates.append(hc._real_card)
+
+                    if len(pooled_candidates) >= 2:
+                        for idx in group_indices:
+                            hc = cards[idx]
+                            hc.blur_candidates(pooled_candidates)
+
+    def update_face_down_candidates(self) -> None:
+        """Prunes candidate pools of unresolved face-down cards against remaining deck."""
+        changed = True
+        while changed:
+            changed = False
+            for hc in self.hand.cards:
+                if (hc.bounds and hc.bounds.is_resolved) or (not hc.facing_back and hc.bounds is None):
+                    continue
+                if hc.bounds is None:
+                    hc.bounds = CardBounds(is_face_down=True)
+                pool = self.get_face_down_candidate_pool(hc)
+                if not hc.bounds.candidate_card_ids:
+                    valid = pool
+                else:
+                    valid = [c for c in pool if c.id in hc.bounds.candidate_card_ids]
+                prev_len = len(hc.bounds.candidate_card_ids)
+                hc.bounds.set_candidates(valid)
+                if len(hc.bounds.candidate_card_ids) != prev_len:
+                    changed = True
+                if hc.bounds.is_resolved and valid:
+                    hc.resolve_face_down(valid[0])
+                    changed = True
+                    break
+
+    def draw_cards(self, count: int | None = None, face_down: bool = False) -> list[HandCard]:
+        """Draws cards from remaining deck into hand, appending them strictly to the right."""
+        self.ensure_slot_uids()
+        needed = (self.hand.max_size - len(self.hand.cards)) if count is None else count
+        if needed <= 0:
+            return []
+
+        rem = self.remaining_deck
+        drawn_playing_cards = rem[:needed]
+        new_hand_cards: list[HandCard] = []
+
+        for c in drawn_playing_cards:
+            uid = self._get_next_slot_uid()
+            if face_down:
+                hc = HandCard(card=c, facing_back=True, slot_uid=uid)
+                hc.bounds = CardBounds(is_face_down=True)
+                hc.bounds.set_candidates(self.remaining_deck)
+            else:
+                hc = HandCard(card=c, facing_back=False, slot_uid=uid)
+            self.hand.cards.append(hc)
+            new_hand_cards.append(hc)
+
+        self.reconcile_face_down_adjacencies()
+        return new_hand_cards
 
     def copy(self) -> "GameState":
         return copy.deepcopy(self)

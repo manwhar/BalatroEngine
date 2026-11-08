@@ -500,15 +500,44 @@ class CardBounds:
         self.candidate_card_ids = {c.id for c in cards}
         if cards:
             c_ranks = {c.rank for c in cards}
-            self.possible_ranks = (self.possible_ranks & c_ranks) if self.possible_ranks else c_ranks
+            if self.possible_ranks:
+                inter_r = self.possible_ranks & c_ranks
+                if inter_r:
+                    self.possible_ranks = inter_r
+            else:
+                self.possible_ranks = c_ranks
+
             c_suits = {c.suit for c in cards}
-            self.possible_suits = (self.possible_suits & c_suits) if self.possible_suits else c_suits
+            if self.possible_suits:
+                inter_s = self.possible_suits & c_suits
+                if inter_s:
+                    self.possible_suits = inter_s
+            else:
+                self.possible_suits = c_suits
+
             c_enh = {c.enhancement for c in cards}
-            self.possible_enhancements = (self.possible_enhancements & c_enh) if self.possible_enhancements else c_enh
+            if self.possible_enhancements:
+                inter_e = self.possible_enhancements & c_enh
+                if inter_e:
+                    self.possible_enhancements = inter_e
+            else:
+                self.possible_enhancements = c_enh
+
             c_ed = {c.edition for c in cards}
-            self.possible_editions = (self.possible_editions & c_ed) if self.possible_editions else c_ed
+            if self.possible_editions:
+                inter_ed = self.possible_editions & c_ed
+                if inter_ed:
+                    self.possible_editions = inter_ed
+            else:
+                self.possible_editions = c_ed
+
             c_seals = {c.seal for c in cards}
-            self.possible_seals = (self.possible_seals & c_seals) if self.possible_seals else c_seals
+            if self.possible_seals:
+                inter_sl = self.possible_seals & c_seals
+                if inter_sl:
+                    self.possible_seals = inter_sl
+            else:
+                self.possible_seals = c_seals
 
     def get_rank_probabilities(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> dict[Rank, float]:
         """Returns marginal probability P(Rank) for each of the 13 ranks."""
@@ -609,17 +638,24 @@ class HandCard:
 
     def __post_init__(self) -> None:
         if self.facing_back:
-            if self._real_card is None and (self.card.rank != Rank.NONE or self.card.suit != Suit.NONE):
+            if self._real_card is None and (
+                self.card.rank != Rank.NONE or self.card.suit != Suit.NONE or self.card.id != 0
+            ):
                 self._real_card = copy.deepcopy(self.card)
             if self.bounds is None:
                 self.bounds = CardBounds(is_face_down=True)
             if not self.bounds.is_resolved:
+                self.card = copy.deepcopy(self.card)
                 self.card.rank = Rank.NONE
                 self.card.suit = Suit.NONE
+                self.card.id = 0
 
-    def resolve_face_down(self, resolved_card: PlayingCard) -> None:
+    def resolve_face_down(self, resolved_card: PlayingCard, lift_facing_back: bool = False) -> None:
         """Resolves a face-down card to an exact PlayingCard, lifting hidden-state masks."""
-        self.facing_back = False
+        if lift_facing_back:
+            self.facing_back = False
+            if self.bounds:
+                self.bounds.is_face_down = False
         self._real_card = copy.deepcopy(resolved_card)
         self.card.rank = resolved_card.rank
         self.card.suit = resolved_card.suit
@@ -629,8 +665,8 @@ class HandCard:
         self.card.id = resolved_card.id
         self.card.bonus_chips = resolved_card.bonus_chips
         if self.bounds is None:
-            self.bounds = CardBounds(is_face_down=False)
-        self.bounds.is_face_down = False
+            self.bounds = CardBounds(is_face_down=self.facing_back)
+        self.bounds.is_face_down = self.facing_back
         self.bounds.possible_ranks = {resolved_card.rank}
         self.bounds.possible_suits = {resolved_card.suit}
         self.bounds.possible_enhancements = {resolved_card.enhancement}
@@ -638,6 +674,57 @@ class HandCard:
         self.bounds.possible_seals = {resolved_card.seal}
         self.bounds.candidate_card_ids = {resolved_card.id}
         self.bounds.candidate_cards = [resolved_card]
+
+    def reveal_temporarily(self, observed_card: PlayingCard | None = None) -> None:
+        """Called when a face-down card is temporarily flipped face-up (e.g. by a Tarot or Spectral card).
+
+        The player observes the true rank, suit, seal, edition, and enhancement during the flip animation.
+        The card flips back face-down (facing_back remains True), but its bounds and observable card attributes
+        are resolved to the exact card observed.
+        """
+        source = observed_card or self._real_card or self.card
+        self._real_card = copy.deepcopy(source)
+        if self.bounds is None:
+            self.bounds = CardBounds(is_face_down=True)
+        self.bounds.is_face_down = True
+        self.bounds.possible_ranks = {source.rank}
+        self.bounds.possible_suits = {source.suit}
+        self.bounds.possible_enhancements = {source.enhancement}
+        self.bounds.possible_editions = {source.edition}
+        self.bounds.possible_seals = {source.seal}
+        source_id = source.id if source.id else getattr(source, "sort_id", 0)
+        self.bounds.candidate_card_ids = {source_id} if source_id else {id(source)}
+        self.bounds.candidate_cards = [copy.deepcopy(source)]
+        self.card.rank = source.rank
+        self.card.suit = source.suit
+        self.card.enhancement = source.enhancement
+        self.card.edition = source.edition
+        self.card.seal = source.seal
+        self.card.id = source.id
+        self.card.bonus_chips = source.bonus_chips
+        self.facing_back = True
+
+    def blur_candidates(self, candidate_cards: Sequence[PlayingCard]) -> None:
+        """Called when positional certainty is lost (e.g. adjacent face-down cards drawn or clustered).
+
+        Expands candidate bounds to the union of indistinguishable cards, masking card rank/suit/id
+        if not uniquely resolved.
+        """
+        if self.bounds is None:
+            self.bounds = CardBounds(is_face_down=True)
+        cards_list = list(candidate_cards)
+        self.bounds.candidate_cards = cards_list
+        self.bounds.candidate_card_ids = {c.id for c in cards_list}
+        self.bounds.possible_ranks = {c.rank for c in cards_list if c.rank != Rank.NONE}
+        self.bounds.possible_suits = {c.suit for c in cards_list if c.suit != Suit.NONE}
+        self.bounds.possible_enhancements = {c.enhancement for c in cards_list}
+        self.bounds.possible_editions = {c.edition for c in cards_list}
+        self.bounds.possible_seals = {c.seal for c in cards_list}
+        self.bounds.is_face_down = True
+        if not self.bounds.is_resolved:
+            self.card.rank = Rank.NONE
+            self.card.suit = Suit.NONE
+            self.card.id = 0
 
     def get_rank_vector(self) -> list[float]:
         if not self.facing_back and self.card.rank != Rank.NONE:

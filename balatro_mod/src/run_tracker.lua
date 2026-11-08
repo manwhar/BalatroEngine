@@ -57,10 +57,19 @@ local function serialize_card(c)
     if not c then return nil end
     local edition_name = "none"
     if c.edition then
-        if c.edition.foil then edition_name = "foil"
-        elseif c.edition.holo then edition_name = "holographic"
-        elseif c.edition.polychrome then edition_name = "polychrome"
-        elseif c.edition.negative then edition_name = "negative"
+        if type(c.edition) == "table" then
+            if c.edition.foil or c.edition.type == "foil" then edition_name = "foil"
+            elseif c.edition.holo or c.edition.type == "holo" then edition_name = "holographic"
+            elseif c.edition.polychrome or c.edition.type == "polychrome" then edition_name = "polychrome"
+            elseif c.edition.negative or c.edition.type == "negative" then edition_name = "negative"
+            end
+        elseif type(c.edition) == "string" then
+            local ed_lower = string.lower(c.edition)
+            if ed_lower:find("foil") then edition_name = "foil"
+            elseif ed_lower:find("holo") then edition_name = "holographic"
+            elseif ed_lower:find("poly") then edition_name = "polychrome"
+            elseif ed_lower:find("neg") then edition_name = "negative"
+            end
         end
     end
 
@@ -70,21 +79,24 @@ local function serialize_card(c)
     end
 
     local enhancement_name = "none"
-    if c.ability and c.ability.name then
-        local en = c.ability.name
-        if en:find("Bonus") then enhancement_name = "bonus"
-        elseif en:find("Mult") then enhancement_name = "mult"
-        elseif en:find("Wild") then enhancement_name = "wild"
-        elseif en:find("Glass") then enhancement_name = "glass"
-        elseif en:find("Steel") then enhancement_name = "steel"
-        elseif en:find("Stone") then enhancement_name = "stone"
-        elseif en:find("Gold") then enhancement_name = "gold"
-        elseif en:find("Lucky") then enhancement_name = "lucky"
-        end
+    local center_key = c.config and c.config.center and c.config.center.key or ""
+    local ab_name = c.ability and (c.ability.name or c.ability.effect) or ""
+    if center_key == "m_bonus" or ab_name:find("Bonus") then enhancement_name = "bonus"
+    elseif center_key == "m_mult" or ab_name:find("Mult") then enhancement_name = "mult"
+    elseif center_key == "m_wild" or ab_name:find("Wild") then enhancement_name = "wild"
+    elseif center_key == "m_glass" or ab_name:find("Glass") then enhancement_name = "glass"
+    elseif center_key == "m_steel" or ab_name:find("Steel") then enhancement_name = "steel"
+    elseif center_key == "m_stone" or ab_name:find("Stone") then enhancement_name = "stone"
+    elseif center_key == "m_gold" or ab_name:find("Gold") then enhancement_name = "gold"
+    elseif center_key == "m_lucky" or ab_name:find("Lucky") then enhancement_name = "lucky"
     end
 
+    local card_id = c.playing_card or c.sort_id or c.ID or 0
+
     return {
-        id = c.sort_id or 0,
+        id = card_id,
+        sort_id = c.sort_id or 0,
+        playing_card = c.playing_card or nil,
         key = c.config and c.config.center and c.config.center.key or nil,
         set = c.ability and c.ability.set or nil,
         name = c.ability and c.ability.name or (c.base and c.base.name) or "Unknown",
@@ -95,12 +107,12 @@ local function serialize_card(c)
         edition = edition_name,
         seal = seal_name,
         enhancement = enhancement_name,
-        debuffed = c.debuff or false,
+        debuffed = (c.debuff == true) or false,
         eternal = (c.ability and c.ability.eternal) or false,
         perishable = (c.ability and c.ability.perishable) or false,
         perish_tally = (c.ability and c.ability.perish_tally) or 5,
         rental = (c.ability and c.ability.rental) or false,
-        facing_back = (c.facing == "back") or false,
+        facing_back = (c.facing == "back") or (c.ability and c.ability.wheel_flipped == true) or false,
         forced_selection = (c.ability and c.ability.forced_selection) or false,
         suit = c.base and c.base.suit or "none",
         value = c.base and c.base.value or "none"
@@ -118,12 +130,14 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             local item = serialize_card(j)
             local ab = j.ability or {}
             local ex = type(ab.extra) == "table" and ab.extra or nil
-            item.mult = ab.mult or (ex and ex.mult) or 0
-            item.x_mult = ab.x_mult or (ex and ex.x_mult) or 1.0
-            item.chips = (ex and ex.chips) or ab.chips or (type(ab.extra) == "number" and ab.extra) or 0
+            item.mult = ab.mult or (ex and (ex.mult or ex.s_mult)) or 0
+            item.x_mult = ab.x_mult or ab.Xmult or (ex and (ex.x_mult or ex.Xmult)) or 1.0
+            item.chips = (ex and (ex.chips or ex.chip_mod)) or ab.chips or (type(ab.extra) == "number" and ab.extra) or 0
             item.h_size = (ex and ex.h_size) or ab.h_size or 0
             item.invis_rounds = ab.invis_rounds or 0
             item.yorick_discards = ab.yorick_discards or nil
+            item.loyalty_remaining = ab.loyalty_remaining or nil
+            item.payout = (ex and ex.dollars) or ab.payout or nil
             item.to_do_poker_hand = ab.to_do_poker_hand or nil
             item.extra = sanitize_extra(ab.extra)
             table.insert(jokers, item)
@@ -214,27 +228,94 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
         end
     end
 
+    local draw_pile_cards = {}
+    if G.deck and G.deck.cards then
+        for i, c in ipairs(G.deck.cards) do
+            table.insert(draw_pile_cards, serialize_card(c))
+        end
+    end
+
+    local active_tags = {}
+    if G.GAME.tags then
+        for i, t in ipairs(G.GAME.tags) do
+            table.insert(active_tags, {
+                name = t.name or (t.key and string.gsub(t.key, "^tag_", "")) or "Unknown",
+                key = t.key or nil,
+                tally = t.tally or 1
+            })
+        end
+    end
+
+    local small_tag = G.GAME.round_resets and G.GAME.round_resets.blind_tags and G.GAME.round_resets.blind_tags.Small or nil
+    local big_tag = G.GAME.round_resets and G.GAME.round_resets.blind_tags and G.GAME.round_resets.blind_tags.Big or nil
+
+    local loc = "blind"
+    if G.booster_pack or (G.pack_cards and G.pack_cards.cards and #G.pack_cards.cards > 0) then
+        loc = "pack"
+    elseif G.STATE == (G.STATES and G.STATES.SHOP) or (G.shop and not G.shop.alignment.offset.py) then
+        loc = "shop"
+    elseif G.STATE == (G.STATES and G.STATES.BLIND_SELECT) or G.blind_select then
+        loc = "select"
+    else
+        loc = "blind"
+    end
+
+    local consumeable_usage = {}
+    if G.GAME.consumeable_usage then
+        for k, v in pairs(G.GAME.consumeable_usage) do
+            table.insert(consumeable_usage, {key = k, count = v.count or 1, set = v.set or ""})
+        end
+    end
+
+    local prng_streams = {}
+    if G.GAME and G.GAME.pseudorandom then
+        for k, v in pairs(G.GAME.pseudorandom) do
+            if type(v) == "number" then
+                prng_streams[k] = v
+            end
+        end
+    end
+
     local cr = G.GAME.current_round or {}
+
+    local joker_order_ids = {}
+    for _, j in ipairs(jokers) do
+        table.insert(joker_order_ids, j.id)
+    end
+    local meta = action_metadata or {}
+    if not meta.joker_order then
+        meta.joker_order = joker_order_ids
+    end
 
     local payload = {
         step = RunTracker.action_step,
         timestamp = love.timer.getTime(),
         action = action_name,
-        action_metadata = action_metadata or {},
+        action_metadata = meta,
         state = {
             seed = (G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed) or "",
+            seeded = (G.GAME and G.GAME.seeded) or false,
+            stake = G.GAME.stake or 1,
+            deck_name = (G.GAME.selected_back and G.GAME.selected_back.name) or "Red Deck",
+            location = loc,
             money = G.GAME.dollars or 0,
             round_dollars = cr.dollars or 0,
             ante = G.GAME.round_resets and G.GAME.round_resets.ante or 1,
             round = G.GAME.round or 1,
             hands_left = cr.hands_left or 0,
             discards_left = cr.discards_left or 0,
+            base_hands = (G.GAME and G.GAME.round_resets and G.GAME.round_resets.hands) or 4,
+            base_discards = (G.GAME and G.GAME.round_resets and G.GAME.round_resets.discards) or 3,
             hands_played_this_round = cr.hands_played or 0,
             discards_used_this_round = cr.discards_used or 0,
             reroll_cost = cr.reroll_cost or 5,
             free_rerolls = cr.free_rerolls or 0,
+            inflation = G.GAME.inflation or 0,
+            probability_normal = (G.GAME and G.GAME.probabilities and G.GAME.probabilities.normal) or 1,
             blinds_skipped = G.GAME.skips or 0,
             tarots_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.tarot) or 0,
+            planets_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.planet) or 0,
+            spectrals_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.spectral) or 0,
             unused_discards = G.GAME.unused_discards or 0,
             last_tarot_planet = G.GAME.last_tarot_planet or nil,
             castle_suit = (cr.castle_card and cr.castle_card.suit) or "Spades",
@@ -245,10 +326,15 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             current_chips = G.GAME.chips or 0,
             blind = blind_name,
             boss_blind = boss_name,
+            boss_disabled = (G.GAME.blind and G.GAME.blind.disabled == true) or false,
+            small_blind_tag = small_tag,
+            big_blind_tag = big_tag,
+            active_tags = active_tags,
             jokers = jokers,
             joker_slots = (G.jokers and G.jokers.config and G.jokers.config.card_limit) or 5,
             consumables = consumables,
             consumable_slots = (G.consumeables and G.consumeables.config and G.consumeables.config.card_limit) or 2,
+            consumeable_usage = consumeable_usage,
             hand = hand_cards,
             hand_max_size = (G.hand and G.hand.config and G.hand.config.card_limit) or 8,
             selected_cards = selected_cards,
@@ -256,13 +342,16 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             shop_vouchers = shop_vouchers,
             shop_packs = shop_packs,
             pack_cards = pack_cards,
+            pack_choices_remaining = (G.GAME and G.GAME.pack_choices) or 0,
             vouchers = vouchers_redeemed,
             hand_levels = hand_levels,
             hand_play_counts = hand_play_counts,
             deck_cards_count = (G.playing_cards and #G.playing_cards) or 52,
             deck = full_deck_cards,
+            draw_pile = draw_pile_cards,
             discard_pile = discard_cards,
-            remaining_deck_count = (G.deck and G.deck.cards and #G.deck.cards) or 0
+            remaining_deck_count = (G.deck and G.deck.cards and #G.deck.cards) or 0,
+            prng_streams = prng_streams
         }
     }
 
@@ -287,14 +376,30 @@ function RunTracker.hook_actions()
     -- 1. Play Hand
     local orig_play = G.FUNCS.play_cards_from_highlighted
     G.FUNCS.play_cards_from_highlighted = function(e)
-        RunTracker.snapshot_gamestate("Play Hand")
+        local h_cards = {}
+        if G.hand and G.hand.highlighted then
+            for _, hc in ipairs(G.hand.highlighted) do
+                table.insert(h_cards, serialize_card(hc))
+            end
+        end
+        RunTracker.snapshot_gamestate("Play Hand", {
+            selected_cards = h_cards
+        })
         return orig_play(e)
     end
 
     -- 2. Discard
     local orig_discard = G.FUNCS.discard_cards_from_highlighted
     G.FUNCS.discard_cards_from_highlighted = function(e, hook)
-        RunTracker.snapshot_gamestate("Discard", hook and {hook = true} or nil)
+        local h_cards = {}
+        if G.hand and G.hand.highlighted then
+            for _, hc in ipairs(G.hand.highlighted) do
+                table.insert(h_cards, serialize_card(hc))
+            end
+        end
+        local meta = { selected_cards = h_cards }
+        if hook then meta.hook = true end
+        RunTracker.snapshot_gamestate("Discard", meta)
         return orig_discard(e, hook)
     end
 
@@ -321,11 +426,18 @@ function RunTracker.hook_actions()
         local card = e and e.config and e.config.ref_table
         local act_name = (e and e.config and e.config.id == 'buy_and_use') and "Buy and Use" or "Buy Card"
         local idx = find_card_index_0based(G.shop_jokers, card)
+        local h_cards = {}
+        if G.hand and G.hand.highlighted then
+            for _, hc in ipairs(G.hand.highlighted) do
+                table.insert(h_cards, serialize_card(hc))
+            end
+        end
         RunTracker.snapshot_gamestate(act_name, {
             card = card and card.ability and card.ability.name or nil,
             key = card and card.config and card.config.center and card.config.center.key or nil,
             cost = card and card.cost or 0,
-            target_idx = idx
+            target_idx = idx,
+            selected_cards = h_cards
         })
         return orig_buy(e)
     end
@@ -391,12 +503,19 @@ function RunTracker.hook_actions()
                         act_name = "Use Consumable"
                         idx = find_card_index_0based(G.consumeables, card)
                     end
+                    local h_cards = {}
+                    if G.hand and G.hand.highlighted then
+                        for _, hc in ipairs(G.hand.highlighted) do
+                            table.insert(h_cards, serialize_card(hc))
+                        end
+                    end
                     RunTracker.snapshot_gamestate(act_name, {
                         card = card.ability and card.ability.name or nil,
                         key = card.config and card.config.center and card.config.center.key or nil,
                         set = set_name,
                         cost = card.cost or 0,
-                        target_idx = idx
+                        target_idx = idx,
+                        selected_cards = h_cards
                     })
                 end
             end
@@ -431,7 +550,43 @@ function RunTracker.hook_actions()
         end
     end
 
-    print("RUN_TRACKER: All 12 gameplay action hooks installed!")
+    -- 13. Sort by Rank
+    local orig_sort_rank = G.FUNCS.sort_hand_value
+    if orig_sort_rank then
+        G.FUNCS.sort_hand_value = function(e)
+            local sel_ids = {}
+            if G.hand and G.hand.highlighted then
+                for _, c in ipairs(G.hand.highlighted) do
+                    table.insert(sel_ids, c.playing_card or c.sort_id or 0)
+                end
+            end
+            RunTracker.snapshot_gamestate("Sort by Rank", {
+                sort_type = "rank",
+                selected_card_ids = sel_ids
+            })
+            return orig_sort_rank(e)
+        end
+    end
+
+    -- 14. Sort by Suit
+    local orig_sort_suit = G.FUNCS.sort_hand_suit
+    if orig_sort_suit then
+        G.FUNCS.sort_hand_suit = function(e)
+            local sel_ids = {}
+            if G.hand and G.hand.highlighted then
+                for _, c in ipairs(G.hand.highlighted) do
+                    table.insert(sel_ids, c.playing_card or c.sort_id or 0)
+                end
+            end
+            RunTracker.snapshot_gamestate("Sort by Suit", {
+                sort_type = "suit",
+                selected_card_ids = sel_ids
+            })
+            return orig_sort_suit(e)
+        end
+    end
+
+    print("RUN_TRACKER: All 14 gameplay action hooks installed!")
 end
 
 return RunTracker
