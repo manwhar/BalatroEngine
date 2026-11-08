@@ -222,6 +222,7 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
         action = action_name,
         action_metadata = action_metadata or {},
         state = {
+            seed = (G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed) or "",
             money = G.GAME.dollars or 0,
             round_dollars = cr.dollars or 0,
             ante = G.GAME.round_resets and G.GAME.round_resets.ante or 1,
@@ -238,8 +239,8 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             last_tarot_planet = G.GAME.last_tarot_planet or nil,
             castle_suit = (cr.castle_card and cr.castle_card.suit) or "Spades",
             ancient_suit = (cr.ancient_card and cr.ancient_card.suit) or "Spades",
-            mail_card_rank = (cr.mail_card and cr.mail_card.value) or "Ace",
-            idol_card = cr.idol_card and {rank = cr.idol_card.value, suit = cr.idol_card.suit} or nil,
+            mail_card_rank = (cr.mail_card and (cr.mail_card.rank or cr.mail_card.value)) or "Ace",
+            idol_card = cr.idol_card and {rank = cr.idol_card.rank or cr.idol_card.value, suit = cr.idol_card.suit} or nil,
             target_chips = G.GAME.blind and G.GAME.blind.chips or 0,
             current_chips = G.GAME.chips or 0,
             blind = blind_name,
@@ -293,7 +294,7 @@ function RunTracker.hook_actions()
     -- 2. Discard
     local orig_discard = G.FUNCS.discard_cards_from_highlighted
     G.FUNCS.discard_cards_from_highlighted = function(e, hook)
-        RunTracker.snapshot_gamestate("Discard")
+        RunTracker.snapshot_gamestate("Discard", hook and {hook = true} or nil)
         return orig_discard(e, hook)
     end
 

@@ -63,14 +63,30 @@ except ImportError:
 
 
 def create_standard_deck() -> list[PlayingCard]:
-    """Generates a standard 52-card deck of PlayingCard objects."""
+    """Generates a standard 52-card deck of PlayingCard objects in Balatro's exact sort_id order (1..52)."""
+    suits = [Suit.CLUBS, Suit.DIAMONDS, Suit.HEARTS, Suit.SPADES]
     ranks = [
-        Rank.TWO, Rank.THREE, Rank.FOUR, Rank.FIVE, Rank.SIX,
-        Rank.SEVEN, Rank.EIGHT, Rank.NINE, Rank.TEN,
-        Rank.JACK, Rank.QUEEN, Rank.KING, Rank.ACE,
+        Rank.TWO,
+        Rank.THREE,
+        Rank.FOUR,
+        Rank.FIVE,
+        Rank.SIX,
+        Rank.SEVEN,
+        Rank.EIGHT,
+        Rank.NINE,
+        Rank.ACE,
+        Rank.JACK,
+        Rank.KING,
+        Rank.QUEEN,
+        Rank.TEN,
     ]
-    suits = [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]
-    return [PlayingCard(rank=r, suit=s) for s in suits for r in ranks]
+    deck = []
+    card_id = 1
+    for s in suits:
+        for r in ranks:
+            deck.append(PlayingCard(rank=r, suit=s, id=card_id))
+            card_id += 1
+    return deck
 
 
 def _cards_match(a: PlayingCard, b: PlayingCard) -> bool:
@@ -154,6 +170,7 @@ class GameState:
     # Boss Blind & Hand/Card Constraint State
     boss_blind: BlindName | None = None
     boss_disabled: bool = False
+    round_won: bool = False
     hand_levels: dict[PokerHand, int] = field(default_factory=dict)
     hand_play_counts: dict[PokerHand, int] = field(default_factory=dict)
     hands_played_this_round_by_type: set[PokerHand] = field(default_factory=set)
@@ -167,6 +184,27 @@ class GameState:
     discard_pile: list[PlayingCard] = field(default_factory=list)
     played_cards_this_round: list[PlayingCard] = field(default_factory=list)
     played_cards_this_ante: list[PlayingCard] = field(default_factory=list)
+
+    # PRNG Engine State
+    seed: str = ""
+    rng: Any = None
+    resolver: Any = None
+
+    def __post_init__(self) -> None:
+        if self.seed and self.rng is None:
+            self.set_seed(self.seed)
+
+    def set_seed(self, seed: str) -> None:
+        """Initializes or resets the deterministic BalatroRNG and EventResolver on this GameState."""
+        self.seed = str(seed).strip().upper()
+        try:
+            from game.engine.rng_sim.rng import BalatroRNG
+            from game.engine.rng_sim.events import EventResolver
+        except ImportError:
+            from engine.rng_sim.rng import BalatroRNG
+            from engine.rng_sim.events import EventResolver
+        self.rng = BalatroRNG(self.seed)
+        self.resolver = EventResolver(self.rng)
 
     @property
     def discount_percent(self) -> int:
@@ -199,6 +237,15 @@ class GameState:
                 self.full_deck.pop(i)
                 removed = True
                 break
+        if not removed:
+            for i, c in enumerate(self.full_deck):
+                if c.rank == card.rank and c.suit == card.suit:
+                    self.full_deck.pop(i)
+                    removed = True
+                    break
+        if not removed and self.full_deck:
+            self.full_deck.pop()
+            removed = True
         for i, c in enumerate(self.discard_pile):
             if _cards_match(c, card):
                 self.discard_pile.pop(i)
@@ -292,6 +339,7 @@ _TRACKED_STATE_FIELDS: tuple[str, ...] = (
     "to_do_poker_hand",
     "boss_blind",
     "boss_disabled",
+    "round_won",
     "hand_levels",
     "hand_play_counts",
     "hands_played_this_round_by_type",
@@ -303,6 +351,7 @@ _TRACKED_STATE_FIELDS: tuple[str, ...] = (
     "discard_pile",
     "played_cards_this_round",
     "played_cards_this_ante",
+    "seed",
 )
 
 

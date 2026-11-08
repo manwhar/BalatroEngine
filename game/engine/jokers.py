@@ -45,16 +45,62 @@ except ImportError:
         Suit,
     )
 from .context import TriggerContext, TriggerEvent
-from .cv_stubs import (
-    cv_detect_boss_blind,
-    cv_detect_card_destroyed,
-    cv_detect_glass_card_shattered,
-    cv_detect_lucky_card_triggered,
-    cv_detect_target_poker_hand,
-    cv_detect_target_rank,
-    cv_detect_target_suit,
-)
 from .poker_hands import evaluate_poker_hand
+
+try:
+    from game.engine.rng_sim.events import (
+        EventResolver,
+        evaluate_lucky_hit,
+        get_ancient_joker_suit,
+        get_castle_suit,
+        get_idol_card,
+        get_mail_in_rebate_target,
+        get_to_do_list_hand,
+        predict_cartomancer_tarot,
+        predict_certificate,
+        predict_eight_ball_tarot,
+        predict_marble_joker_card,
+        predict_riff_raff_jokers,
+        predict_seance_spectral,
+        predict_sixth_sense_spectral,
+        predict_superposition_tarot,
+        predict_vagabond_tarot,
+    )
+    from game.engine.rng_sim.state import SimDeck
+    from game.balatro_models import Spectral, SpectralName, Tarot
+except ImportError:
+    from engine.rng_sim.events import (
+        EventResolver,
+        evaluate_lucky_hit,
+        get_ancient_joker_suit,
+        get_castle_suit,
+        get_idol_card,
+        get_mail_in_rebate_target,
+        get_to_do_list_hand,
+        predict_cartomancer_tarot,
+        predict_certificate,
+        predict_eight_ball_tarot,
+        predict_marble_joker_card,
+        predict_riff_raff_jokers,
+        predict_seance_spectral,
+        predict_sixth_sense_spectral,
+        predict_superposition_tarot,
+        predict_vagabond_tarot,
+    )
+    from engine.rng_sim.state import SimDeck
+    from balatro_models import Spectral, SpectralName, Tarot
+
+
+def get_oops_multiplier(state) -> float:
+    """Calculates active probability multiplier from all non-debuffed Oops! All 6s Jokers."""
+    if not state or not state.inventory:
+        return 1.0
+    oops_count = sum(
+        1
+        for j in state.inventory.jokers
+        if j.name == JokerName.OOPS_ALL_6S and not j.debuffed
+    )
+    return float(2 ** oops_count)
 
 
 JOKER_EFFECTS: dict[JokerName, Callable[[Joker, TriggerContext], None]] = {}
@@ -316,12 +362,33 @@ def sync_dynamic_joker_states(state) -> None:
 # 1. TARGET-SHIFTING & ROTATING JOKERS
 # =========================================================================
 
+def _is_end_of_round_phase(ctx: TriggerContext) -> bool:
+    """True when END_OF_ROUND is dispatched at round evaluation (or standalone without phase)."""
+    if ctx.event != TriggerEvent.END_OF_ROUND:
+        return False
+    return ctx.extra is None or ctx.extra.get("phase") == "end_of_round"
+
+
+def _is_cash_out_dollars_phase(ctx: TriggerContext) -> bool:
+    """True when END_OF_ROUND is dispatched for Cash Out dollar payouts (or standalone without phase)."""
+    if ctx.event != TriggerEvent.END_OF_ROUND:
+        return False
+    return ctx.extra is None or ctx.extra.get("phase") == "cash_out_dollars"
+
+
 @joker_hook(JokerName.ANCIENT_JOKER)
 def handle_ancient_joker(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event in (TriggerEvent.SETTING_BLIND, TriggerEvent.END_OF_ROUND):
-        suit = cv_detect_target_suit(None, joker)
+    if ctx.event == TriggerEvent.SETTING_BLIND or _is_end_of_round_phase(ctx):
+        if ctx.state.rng:
+            suit = get_ancient_joker_suit(
+                ctx.state.rng,
+                ante=ctx.state.ante,
+                current_suit=ctx.state.ancient_suit,
+            )
+        else:
+            suit = ctx.state.ancient_suit
         ctx.state.ancient_suit = suit
         joker.state["target_suit"] = suit
 
@@ -330,7 +397,14 @@ def handle_ancient_joker(joker: Joker, ctx: TriggerContext):
 def handle_to_do_list(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.SETTING_BLIND and not ctx.is_blueprint:
         if "target_hand" not in joker.state:
-            hand = cv_detect_target_poker_hand(None, joker)
+            if ctx.state.rng:
+                hand = get_to_do_list_hand(
+                    ctx.state.rng,
+                    current_hand=ctx.state.to_do_poker_hand,
+                    is_initial_spawn=True,
+                )
+            else:
+                hand = ctx.state.to_do_poker_hand
             ctx.state.to_do_poker_hand = hand
             joker.state["target_hand"] = hand
     elif ctx.event == TriggerEvent.BEFORE_PLAY:
@@ -341,8 +415,14 @@ def handle_to_do_list(joker: Joker, ctx: TriggerContext):
         )
         if played_hand == target:
             ctx.state.money += 4
-    elif ctx.event == TriggerEvent.END_OF_ROUND and not ctx.is_blueprint:
-        next_hand = cv_detect_target_poker_hand(None, joker)
+    elif _is_end_of_round_phase(ctx) and not ctx.is_blueprint:
+        if ctx.state.rng:
+            next_hand = get_to_do_list_hand(
+                ctx.state.rng,
+                current_hand=joker.state.get("target_hand", ctx.state.to_do_poker_hand),
+            )
+        else:
+            next_hand = joker.state.get("target_hand", ctx.state.to_do_poker_hand)
         ctx.state.to_do_poker_hand = next_hand
         joker.state["target_hand"] = next_hand
 
@@ -351,9 +431,13 @@ def handle_to_do_list(joker: Joker, ctx: TriggerContext):
 def handle_the_idol(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event in (TriggerEvent.SETTING_BLIND, TriggerEvent.END_OF_ROUND):
-        rank = cv_detect_target_rank(None, joker)
-        suit = cv_detect_target_suit(None, joker)
+    if ctx.event == TriggerEvent.SETTING_BLIND or _is_end_of_round_phase(ctx):
+        if ctx.state.rng:
+            sdeck = SimDeck(ctx.state.full_deck)
+            target = get_idol_card(ctx.state.rng, sdeck, ante=ctx.state.ante)
+            rank, suit = target.rank, target.suit
+        else:
+            rank, suit = ctx.state.idol_card
         ctx.state.idol_card = (rank, suit)
         joker.state["target_rank"] = rank
         joker.state["target_suit"] = suit
@@ -370,8 +454,12 @@ def handle_castle(joker: Joker, ctx: TriggerContext):
         matching = sum(1 for c in discarded if card_matches_suit(c, target_suit, jokers))
         if matching > 0:
             joker.state["chips"] = joker.state.get("chips", 0) + (matching * 3)
-    elif ctx.event == TriggerEvent.END_OF_ROUND:
-        suit = cv_detect_target_suit(None, joker)
+    elif _is_end_of_round_phase(ctx):
+        if ctx.state.rng:
+            sdeck = SimDeck(ctx.state.full_deck)
+            suit = get_castle_suit(ctx.state.rng, sdeck, ante=ctx.state.ante)
+        else:
+            suit = ctx.state.castle_suit
         ctx.state.castle_suit = suit
         joker.state["target_suit"] = suit
 
@@ -390,8 +478,12 @@ def handle_mail_in_rebate(joker: Joker, ctx: TriggerContext):
         )
         if matches > 0:
             ctx.state.money += matches * 5
-    elif ctx.event == TriggerEvent.END_OF_ROUND and not ctx.is_blueprint:
-        rank = cv_detect_target_rank(None, joker)
+    elif _is_end_of_round_phase(ctx) and not ctx.is_blueprint:
+        if ctx.state.rng:
+            sdeck = SimDeck(ctx.state.full_deck)
+            rank = get_mail_in_rebate_target(ctx.state.rng, sdeck, ante=ctx.state.ante)
+        else:
+            rank = ctx.state.mail_card_rank
         ctx.state.mail_card_rank = rank
         joker.state["target_rank"] = rank
 
@@ -421,7 +513,7 @@ def handle_ceremonial_dagger(joker: Joker, ctx: TriggerContext):
 def handle_gift_card(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         for c in ctx.state.inventory.jokers:
             c.extra_value += 1
         for c in ctx.state.inventory.consumables:
@@ -432,7 +524,7 @@ def handle_gift_card(joker: Joker, ctx: TriggerContext):
 def handle_egg(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         joker.extra_value += 3
 
 
@@ -548,7 +640,7 @@ def handle_campfire(joker: Joker, ctx: TriggerContext):
         return
     if ctx.event == TriggerEvent.CARD_SOLD:
         joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.25, 2)
-    elif ctx.event == TriggerEvent.END_OF_ROUND:
+    elif _is_end_of_round_phase(ctx):
         if ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG):
             joker.state["x_mult"] = 1.0
 
@@ -569,13 +661,18 @@ def handle_lucky_cat(joker: Joker, ctx: TriggerContext):
         return
     if ctx.event == TriggerEvent.INDIVIDUAL_CARD_SCORED:
         if ctx.target_card and not getattr(ctx.target_card, "debuffed", False):
-            mult_trig, money_trig = cv_detect_lucky_card_triggered(None)
-            if ctx.extra and ctx.extra.get("lucky_triggered"):
-                mult_trig = True
-            if mult_trig or money_trig:
-                joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.25, 2)
-            if ctx.target_card.enhancement == Enhancement.LUCKY:
-                ctx.state.pending_cv_checks.add("money")
+            if ctx.extra and "lucky_triggered" in ctx.extra:
+                if ctx.extra.get("lucky_triggered"):
+                    joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.25, 2)
+            elif ctx.target_card.enhancement == Enhancement.LUCKY and ctx.state.rng:
+                oops = get_oops_multiplier(ctx.state)
+                hit = evaluate_lucky_hit(ctx.state.rng, probability_modifier=oops)
+                if hit.mult:
+                    ctx.target_card.bonus_mult = getattr(ctx.target_card, "bonus_mult", 0) + 20
+                if hit.money:
+                    ctx.state.money += 20
+                if hit.any_hit:
+                    joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.25, 2)
 
 
 @joker_hook(JokerName.HIKER)
@@ -656,20 +753,14 @@ def handle_obelisk(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.GLASS_JOKER)
 def handle_glass_joker(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
-        return
-    if ctx.event == TriggerEvent.AFTER_PLAY:
-        if cv_detect_glass_card_shattered(None):
-            joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.75, 2)
+    # State update is handled deterministically in GameState.remove_card_from_deck when a Glass Card shatters.
+    pass
 
 
 @joker_hook(JokerName.CANIO)
 def handle_canio(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
-        return
-    if ctx.event in (TriggerEvent.DISCARD, TriggerEvent.AFTER_PLAY):
-        if cv_detect_card_destroyed(None):
-            joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 1.0, 2)
+    # State update is handled deterministically in GameState.remove_card_from_deck when a face card is destroyed.
+    pass
 
 
 @joker_hook(JokerName.YORICK)
@@ -710,7 +801,12 @@ def handle_loyalty_card(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
     if ctx.event == TriggerEvent.BEFORE_PLAY:
-        rem = joker.state.get("remaining", 5) - 1
+        rem = joker.state.get("remaining", 5)
+        if isinstance(rem, str):
+            import re
+            m = re.search(r"\d+", rem)
+            rem = int(m.group(0)) if m else 5
+        rem = int(rem) - 1
         if rem < 0:
             rem = 5
         joker.state["remaining"] = rem
@@ -724,7 +820,7 @@ def handle_loyalty_card(joker: Joker, ctx: TriggerContext):
 def handle_popcorn(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         current_mult = joker.state.get("mult", 20)
         new_mult = current_mult - 4
         if new_mult <= 0:
@@ -754,7 +850,7 @@ def handle_ice_cream(joker: Joker, ctx: TriggerContext):
 def handle_turtle_bean(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         current_size = joker.state.get("h_size", 5)
         new_size = current_size - 1
         ctx.state.hand.max_size = max(0, ctx.state.hand.max_size - 1)
@@ -784,7 +880,7 @@ def handle_seltzer(joker: Joker, ctx: TriggerContext):
 def handle_invisible_joker(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         joker.state["rounds"] = joker.state.get("rounds", 0) + 1
     elif ctx.event == TriggerEvent.CARD_SOLD:
         if ctx.target_card == joker and joker.state.get("rounds", 0) >= 2:
@@ -795,16 +891,31 @@ def handle_invisible_joker(joker: Joker, ctx: TriggerContext):
 def handle_gros_michel(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
-        ctx.state.pending_cv_checks.add("jokers")
+    if _is_end_of_round_phase(ctx):
+        if ctx.state.rng:
+            oops = get_oops_multiplier(ctx.state)
+            if ctx.state.rng.poll_odds("gros_michel", 1, 6, oops):
+                ctx.state.gros_michel_extinct = True
+                if joker in ctx.state.inventory.jokers:
+                    on_joker_removed(ctx.state, joker)
+                    ctx.state.inventory.jokers.remove(joker)
+        else:
+            ctx.state.pending_cv_checks.add("jokers")
 
 
 @joker_hook(JokerName.CAVENDISH)
 def handle_cavendish(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
-        ctx.state.pending_cv_checks.add("jokers")
+    if _is_end_of_round_phase(ctx):
+        if ctx.state.rng:
+            oops = get_oops_multiplier(ctx.state)
+            if ctx.state.rng.poll_odds("cavendish", 1, 1000, oops):
+                if joker in ctx.state.inventory.jokers:
+                    on_joker_removed(ctx.state, joker)
+                    ctx.state.inventory.jokers.remove(joker)
+        else:
+            ctx.state.pending_cv_checks.add("jokers")
 
 
 # =========================================================================
@@ -845,11 +956,19 @@ def handle_troubadour(joker: Joker, ctx: TriggerContext):
 @joker_hook(JokerName.MARBLE_JOKER)
 def handle_marble_joker(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.SETTING_BLIND:
-        stone_card = PlayingCard(
-            rank=Rank.NONE,
-            suit=Suit.NONE,
-            enhancement=Enhancement.STONE,
-        )
+        if ctx.state.rng:
+            res = predict_marble_joker_card(ctx.state.rng)
+            stone_card = PlayingCard(
+                rank=res.rank,
+                suit=res.suit,
+                enhancement=Enhancement.STONE,
+            )
+        else:
+            stone_card = PlayingCard(
+                rank=Rank.NONE,
+                suit=Suit.NONE,
+                enhancement=Enhancement.STONE,
+            )
         ctx.state.add_card_to_deck(stone_card, add_to_hand=False)
 
 
@@ -857,33 +976,53 @@ def handle_marble_joker(joker: Joker, ctx: TriggerContext):
 def handle_cartomancer(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.SETTING_BLIND:
         if ctx.state.inventory and ctx.state.inventory.can_add_consumable:
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng:
+                active = {c.name for c in ctx.state.inventory.consumables if isinstance(c, Tarot)}
+                has_showman = any(
+                    j.name == JokerName.SHOWMAN and not j.debuffed
+                    for j in ctx.state.inventory.jokers
+                )
+                pred = predict_cartomancer_tarot(
+                    ctx.state.rng,
+                    ante=ctx.state.ante,
+                    active_tarots=active,
+                    has_showman=has_showman,
+                )
+                ctx.state.inventory.consumables.append(pred.to_tarot_card())
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.RIFF_RAFF)
 def handle_riff_raff(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.SETTING_BLIND:
         if ctx.state.inventory and ctx.state.inventory.can_add_joker:
-            ctx.state.pending_cv_checks.add("jokers")
+            if ctx.state.rng:
+                space = ctx.state.inventory.joker_slots - len(ctx.state.inventory.jokers)
+                spawn_count = min(2, space)
+                spawned = predict_riff_raff_jokers(
+                    ctx.state.rng, ante=ctx.state.ante, count=spawn_count
+                )
+                for sj in spawned:
+                    ctx.state.inventory.jokers.append(sj)
+                    on_joker_added(ctx.state, sj)
+            else:
+                ctx.state.pending_cv_checks.add("jokers")
 
 
 @joker_hook(JokerName.CERTIFICATE)
 def handle_certificate(joker: Joker, ctx: TriggerContext):
     if ctx.event in (TriggerEvent.FIRST_HAND_DRAWN, TriggerEvent.SETTING_BLIND):
-        ranks = [
-            Rank.TWO, Rank.THREE, Rank.FOUR, Rank.FIVE, Rank.SIX,
-            Rank.SEVEN, Rank.EIGHT, Rank.NINE, Rank.TEN,
-            Rank.JACK, Rank.QUEEN, Rank.KING, Rank.ACE,
-        ]
-        suits = [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]
-        seals = [Seal.RED, Seal.BLUE, Seal.GOLD, Seal.PURPLE]
-        cert_card = PlayingCard(
-            rank=random.choice(ranks),
-            suit=random.choice(suits),
-            seal=random.choice(seals),
-        )
+        if ctx.state.rng:
+            res = predict_certificate(ctx.state.rng, ante=ctx.state.ante)
+            cert_card = PlayingCard(
+                rank=res.rank,
+                suit=res.suit,
+                seal=res.seal,
+            )
+        else:
+            cert_card = PlayingCard(rank=Rank.ACE, suit=Suit.SPADES, seal=Seal.RED)
         ctx.state.add_card_to_deck(cert_card, add_to_hand=True)
-        ctx.state.pending_cv_checks.add("hand")
 
 
 @joker_hook(JokerName.CHICOT)
@@ -957,7 +1096,7 @@ def handle_burnt_joker(joker: Joker, ctx: TriggerContext):
 def handle_golden_joker(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_cash_out_dollars_phase(ctx):
         ctx.state.money += 4
 
 
@@ -965,7 +1104,7 @@ def handle_golden_joker(joker: Joker, ctx: TriggerContext):
 def handle_delayed_gratification(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_cash_out_dollars_phase(ctx):
         if ctx.state.discards_used_this_round == 0:
             ctx.state.money += ctx.state.discards_left * 2
 
@@ -974,19 +1113,20 @@ def handle_delayed_gratification(joker: Joker, ctx: TriggerContext):
 def handle_rocket(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         payout = joker.state.get("payout", 1)
         if ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG):
             payout += 2
             joker.state["payout"] = payout
-        ctx.state.money += payout
+    if _is_cash_out_dollars_phase(ctx):
+        ctx.state.money += joker.state.get("payout", 1)
 
 
 @joker_hook(JokerName.CLOUD_9)
 def handle_cloud_9(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_cash_out_dollars_phase(ctx):
         deck_to_check = ctx.state.full_deck if ctx.state.full_deck else [c.card for c in ctx.state.hand.cards]
         nines = sum(
             1 for c in deck_to_check if c.rank == Rank.NINE and c.enhancement != Enhancement.STONE
@@ -998,7 +1138,7 @@ def handle_cloud_9(joker: Joker, ctx: TriggerContext):
 def handle_satellite(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_cash_out_dollars_phase(ctx):
         ctx.state.money += len(ctx.state.unique_planets_used)
 
 
@@ -1011,7 +1151,7 @@ def handle_to_the_moon(joker: Joker, ctx: TriggerContext):
 def handle_chaos_the_clown(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.END_OF_ROUND:
+    if _is_end_of_round_phase(ctx):
         ctx.state.free_rerolls += 1
 
 
@@ -1047,12 +1187,11 @@ def handle_sixth_sense(joker: Joker, ctx: TriggerContext):
             if c.rank == Rank.SIX and c.enhancement != Enhancement.STONE:
                 ctx.state.remove_card_from_deck(c)
                 if ctx.state.inventory and ctx.state.inventory.can_add_consumable:
-                    try:
-                        from game.balatro_models import Spectral, SpectralName
-                    except ImportError:
-                        from balatro_models import Spectral, SpectralName
-                    ctx.state.inventory.consumables.append(Spectral(name=SpectralName.ANKH))
-                    ctx.state.pending_cv_checks.add("consumables")
+                    if ctx.state.rng:
+                        sp = predict_sixth_sense_spectral(ctx.state.rng, ante=ctx.state.ante)
+                        ctx.state.inventory.consumables.append(sp)
+                    else:
+                        ctx.state.inventory.consumables.append(Spectral(name=SpectralName.ANKH))
 
 
 @joker_hook(JokerName.SEANCE)
@@ -1063,7 +1202,11 @@ def handle_seance(joker: Joker, ctx: TriggerContext):
             ctx.state.inventory.jokers,
         )
         if hand == PokerHand.STRAIGHT_FLUSH and ctx.state.inventory.can_add_consumable:
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng:
+                sp = predict_seance_spectral(ctx.state.rng, ante=ctx.state.ante)
+                ctx.state.inventory.consumables.append(sp)
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.SUPERPOSITION)
@@ -1077,21 +1220,38 @@ def handle_superposition(joker: Joker, ctx: TriggerContext):
         has_ace = any(c.rank == Rank.ACE and c.enhancement != Enhancement.STONE for c in scoring)
         if hand in (PokerHand.STRAIGHT, PokerHand.STRAIGHT_FLUSH) and has_ace:
             if ctx.state.inventory.can_add_consumable:
-                ctx.state.pending_cv_checks.add("consumables")
+                if ctx.state.rng:
+                    pred = predict_superposition_tarot(ctx.state.rng, ante=ctx.state.ante)
+                    ctx.state.inventory.consumables.append(pred.to_tarot_card())
+                else:
+                    ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.VAGABOND)
 def handle_vagabond(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.BEFORE_PLAY:
         if ctx.state.money <= 4 and ctx.state.inventory.can_add_consumable:
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng:
+                pred = predict_vagabond_tarot(ctx.state.rng, ante=ctx.state.ante)
+                ctx.state.inventory.consumables.append(pred.to_tarot_card())
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.HALLUCINATION)
 def handle_hallucination(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.OPEN_BOOSTER:
         if ctx.state.inventory and ctx.state.inventory.can_add_consumable:
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng and ctx.state.resolver:
+                oops = get_oops_multiplier(ctx.state)
+                if ctx.state.resolver.hallucination(oops_multiplier=oops, ante=ctx.state.ante):
+                    from game.engine.rng_sim.events import poll_tarot_pool
+                    pred = poll_tarot_pool(
+                        ctx.state.rng, ante=ctx.state.ante, key_append=f"halu{ctx.state.ante}"
+                    )
+                    ctx.state.inventory.consumables.append(pred.to_tarot_card())
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.EIGHT_BALL)
@@ -1104,13 +1264,28 @@ def handle_eight_ball(joker: Joker, ctx: TriggerContext):
             and ctx.target_card.rank == Rank.EIGHT
             and ctx.state.inventory.can_add_consumable
         ):
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng:
+                oops = get_oops_multiplier(ctx.state)
+                if ctx.state.rng.poll_odds("8ball", 1, 4, oops):
+                    pred = predict_eight_ball_tarot(ctx.state.rng, ante=ctx.state.ante)
+                    ctx.state.inventory.consumables.append(pred.to_tarot_card())
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.SPACE_JOKER)
 def handle_space_joker(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.BEFORE_PLAY:
-        ctx.state.pending_cv_checks.add("hand_levels")
+        if ctx.state.rng:
+            oops = get_oops_multiplier(ctx.state)
+            if ctx.state.rng.poll_odds("space", 1, 4, oops):
+                hand = ctx.poker_hand or evaluate_poker_hand(
+                    ctx.full_hand or ctx.state.hand.selected_cards,
+                    ctx.state.inventory.jokers,
+                )
+                ctx.state.hand_levels[hand] = ctx.state.hand_levels.get(hand, 1) + 1
+        else:
+            ctx.state.pending_cv_checks.add("hand_levels")
 
 
 @joker_hook(JokerName.BUSINESS_CARD)
@@ -1118,7 +1293,12 @@ def handle_business_card(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.INDIVIDUAL_CARD_SCORED:
         jokers = ctx.state.inventory.jokers if ctx.state and ctx.state.inventory else None
         if ctx.target_card and is_card_face(ctx.target_card, jokers):
-            ctx.state.pending_cv_checks.add("money")
+            if ctx.state.rng:
+                oops = get_oops_multiplier(ctx.state)
+                if ctx.state.rng.poll_odds("business", 1, 2, oops):
+                    ctx.state.money += 2
+            else:
+                ctx.state.pending_cv_checks.add("money")
 
 
 @joker_hook(JokerName.RESERVED_PARKING)
@@ -1126,7 +1306,13 @@ def handle_reserved_parking(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.BEFORE_PLAY:
         jokers = ctx.state.inventory.jokers if ctx.state and ctx.state.inventory else None
         held = [hc.card for hc in ctx.state.hand.cards if not hc.selected]
-        if any(is_card_face(c, jokers) for c in held):
+        if ctx.state.rng:
+            oops = get_oops_multiplier(ctx.state)
+            for c in held:
+                if is_card_face(c, jokers) and not getattr(c, "debuffed", False):
+                    if ctx.state.rng.poll_odds("parking", 1, 2, oops):
+                        ctx.state.money += 1
+        elif any(is_card_face(c, jokers) for c in held):
             ctx.state.pending_cv_checks.add("money")
 
 
@@ -1144,7 +1330,7 @@ def handle_matador(joker: Joker, ctx: TriggerContext):
 def handle_midas_mask(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.AFTER_PLAY:
+    if ctx.event == TriggerEvent.BEFORE_PLAY:
         jokers = ctx.state.inventory.jokers if ctx.state and ctx.state.inventory else None
         scoring = ctx.scoring_cards or (
             ctx.state.hand.get_scoring_cards(jokers) if ctx.state and ctx.state.hand else []
@@ -1208,7 +1394,7 @@ def handle_hit_the_road(joker: Joker, ctx: TriggerContext):
         )
         if jacks > 0:
             joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + (jacks * 0.5), 2)
-    elif ctx.event == TriggerEvent.END_OF_ROUND:
+    elif _is_end_of_round_phase(ctx):
         joker.state["x_mult"] = 1.0
 
 

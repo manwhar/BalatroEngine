@@ -177,6 +177,123 @@ function UI.clear_all_jokers(mod)
     print(string.format("GDCV_JOKER_SPAWN: Cleared %d jokers from active joker bar", count))
 end
 
+function UI.setup_custom_test_suite(mod)
+    if not G.jokers or not G.consumeables or not G.playing_cards then
+        mod.capture_flash = 2.0
+        mod.capture_flash_text = "START A RUN FIRST TO POPULATE TEST SUITE!"
+        print("GDCV_TEST_SUITE: Failed - Not in an active run")
+        return
+    end
+
+    -- 1. All custom Jokers for which the Python engine tracks state / hooks
+    local custom_joker_keys = {
+        -- Rotating targets
+        "j_castle", "j_ancient", "j_mail", "j_idol", "j_todo_list",
+        -- Scaling mult
+        "j_green_joker", "j_ride_the_bus", "j_flash", "j_red_card",
+        "j_trousers", "j_popcorn", "j_ceremonial",
+        -- Scaling x_mult
+        "j_campfire", "j_constellation", "j_hologram", "j_vampire", "j_obelisk",
+        "j_yorick", "j_hit_the_road", "j_caino", "j_glass", "j_lucky_cat", "j_madness",
+        -- Scaling chips & count-dependent chips
+        "j_runner", "j_square", "j_wee", "j_ice_cream", "j_stone", "j_bull",
+        "j_blue_joker", "j_stuntman", "j_steel_joker", "j_erosion",
+        -- Sell value
+        "j_egg", "j_gift", "j_swashbuckler",
+        -- Spawners & card generation
+        "j_riff_raff", "j_cartomancer", "j_vagabond", "j_sixth_sense", "j_seance",
+        "j_superposition", "j_certificate", "j_marble", "j_hallucination", "j_8_ball",
+        "j_dna", "j_trading", "j_perkeo",
+        -- Mechanics & rules modifiers
+        "j_midas_mask", "j_pareidolia", "j_oops", "j_four_fingers", "j_shortcut",
+        "j_smeared", "j_splash", "j_mime", "j_blueprint", "j_brainstorm", "j_hack",
+        "j_hanging_chad", "j_dusk", "j_sock_and_buskin", "j_burnt", "j_selzer",
+        "j_turtle_bean", "j_ramen", "j_invisible", "j_burglar", "j_luchador",
+        "j_mr_bones", "j_space", "j_business", "j_reserved_parking",
+        "j_gros_michel", "j_cavendish", "j_cloud_9", "j_rocket", "j_satellite",
+        "j_fortune_teller", "j_supernova", "j_throwback", "j_loyalty_card",
+        "j_card_sharp", "j_to_the_moon", "j_astronomer", "j_diet_cola", "j_hiker",
+        "j_photograph"
+    }
+
+    local owned_joker_keys = {}
+    for _, j in ipairs(G.jokers.cards) do
+        local k = j.config and j.config.center and j.config.center.key
+        if k then owned_joker_keys[k] = true end
+    end
+
+    local jokers_spawned = 0
+    for _, k in ipairs(custom_joker_keys) do
+        if not owned_joker_keys[k] and G.P_CENTERS[k] then
+            local card = create_card('Joker', G.jokers, nil, nil, true, nil, k, 'deck')
+            if card then
+                card:set_edition({negative = true}, true, true)
+                if card.set_eternal then
+                    card:set_eternal(true)
+                else
+                    card.ability.eternal = true
+                end
+                card:add_to_deck()
+                G.jokers:emplace(card)
+                jokers_spawned = jokers_spawned + 1
+            end
+        end
+    end
+    G.jokers.config.card_limit = math.max(G.jokers.config.card_limit or 5, #G.jokers.cards)
+
+    -- 2. Convert half of all cards in deck to Lucky Cards, half to Glass Cards
+    local total_cards = #G.playing_cards
+    local half_cards = math.floor(total_cards / 2)
+    for i, c in ipairs(G.playing_cards) do
+        if i <= half_cards then
+            c:set_ability(G.P_CENTERS.m_lucky)
+        else
+            c:set_ability(G.P_CENTERS.m_glass)
+        end
+    end
+
+    -- 3. Give Negative copies of all custom consumables (deck destruction / card manipulation)
+    local custom_consumables = {
+        -- Tarots
+        "c_hanged_man", "c_death", "c_strength", "c_magician", "c_empress",
+        "c_heirophant", "c_lovers", "c_chariot", "c_justice", "c_tower",
+        "c_devil", "c_sun", "c_moon", "c_star", "c_world", "c_wheel_of_fortune",
+        "c_fool", "c_hermit", "c_temperance",
+        -- Spectrals
+        "c_familiar", "c_grim", "c_incantation", "c_immolate", "c_cryptid",
+        "c_ouija", "c_sigil", "c_aura", "c_deja_vu", "c_trance", "c_medium",
+        "c_talisman", "c_ankh", "c_hex", "c_ectoplasm"
+    }
+
+    local owned_consumable_keys = {}
+    for _, c in ipairs(G.consumeables.cards) do
+        local k = c.config and c.config.center and c.config.center.key
+        if k then owned_consumable_keys[k] = true end
+    end
+
+    local consumables_spawned = 0
+    for _, k in ipairs(custom_consumables) do
+        if not owned_consumable_keys[k] and G.P_CENTERS[k] then
+            local c_set = (G.P_CENTERS[k] and G.P_CENTERS[k].set) or "Tarot"
+            local card = create_card(c_set, G.consumeables, nil, nil, true, nil, k, 'deck')
+            if card then
+                card:set_edition({negative = true}, true, true)
+                card:add_to_deck()
+                G.consumeables:emplace(card)
+                consumables_spawned = consumables_spawned + 1
+            end
+        end
+    end
+    G.consumeables.config.card_limit = math.max(G.consumeables.config.card_limit or 2, #G.consumeables.cards)
+
+    if play_sound then pcall(play_sound, 'card1') end
+    mod.capture_flash = 2.5
+    mod.capture_flash_text = string.format("TEST SUITE: +%d JOKERS, +%d CONSUMABLES, %d CARDS 50/50 LUCKY/GLASS!",
+        jokers_spawned, consumables_spawned, total_cards)
+    print(string.format("GDCV_TEST_SUITE: Spawned %d Jokers (Neg/Eternal), %d Consumables (Neg), converted %d deck cards (half Lucky / half Glass)",
+        jokers_spawned, consumables_spawned, total_cards))
+end
+
 -- ==========================================
 -- SMODS CONFIG TAB & MENU CALLBACKS
 -- ==========================================
@@ -337,6 +454,10 @@ function UI.init_callbacks(mod)
 
     G.FUNCS.gdcv_clear_all_jokers = function(e)
         UI.clear_all_jokers(mod)
+    end
+
+    G.FUNCS.gdcv_setup_custom_test_suite = function(e)
+        UI.setup_custom_test_suite(mod)
     end
 end
 
@@ -644,6 +765,21 @@ function UI.create_config_tab()
                                         minh = 0.55,
                                         scale = 0.32,
                                         colour = G.C.RED
+                                    })
+                                }
+                            },
+                            -- Custom Test Suite Setup: Spawn All Custom Jokers & Consumables, Split Deck Lucky/Glass
+                            {
+                                n = G.UIT.R,
+                                config = {align = "cm", padding = 0.03},
+                                nodes = {
+                                    UIBox_button({
+                                        button = 'gdcv_setup_custom_test_suite',
+                                        label = {'Setup Custom Engine Test Suite'},
+                                        minw = 6.0,
+                                        minh = 0.55,
+                                        scale = 0.32,
+                                        colour = G.C.PURPLE
                                     })
                                 }
                             }

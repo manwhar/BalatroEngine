@@ -132,6 +132,7 @@ POKER_HAND_BY_STR: dict[str, bm.PokerHand] = {h.value: h for h in bm.PokerHand}
 TAROT_NAME_BY_STR: dict[str, bm.TarotName] = {t.value: t for t in bm.TarotName}
 PLANET_NAME_BY_STR: dict[str, bm.PlanetName] = {p.value: p for p in bm.PlanetName}
 SPECTRAL_NAME_BY_STR: dict[str, bm.SpectralName] = {s.value: s for s in bm.SpectralName}
+VOUCHER_NAME_BY_STR: dict[str, bm.VoucherName] = {v.value: v for v in bm.VoucherName}
 
 
 def parse_playing_card(d: dict) -> bm.PlayingCard:
@@ -167,6 +168,7 @@ def parse_joker(d: dict) -> bm.Joker | None:
         return None
     j = bm.Joker(
         name=j_name,
+        id=int(d.get("id", 0)),
         edition=EDITION_MAP.get(d.get("edition", "none"), bm.Edition.NONE),
         extra_value=int(d.get("extra_value", 0)),
         debuffed=bool(d.get("debuffed", False)),
@@ -193,9 +195,19 @@ def parse_joker(d: dict) -> bm.Joker | None:
     extra = d.get("extra")
     if isinstance(extra, dict):
         if "dollars" in extra and j_name == bm.JokerName.ROCKET:
-            j.state["payout"] = extra["dollars"]
+            try:
+                j.state["payout"] = int(extra["dollars"])
+            except (ValueError, TypeError):
+                pass
         if "remaining" in extra and j_name == bm.JokerName.LOYALTY_CARD:
-            j.state["remaining"] = extra["remaining"]
+            val = extra["remaining"]
+            if isinstance(val, (int, float)):
+                j.state["remaining"] = int(val)
+            elif isinstance(val, str):
+                import re
+                m = re.search(r"\d+", val)
+                if m:
+                    j.state["remaining"] = int(m.group(0))
     return j
 
 
@@ -203,17 +215,22 @@ def parse_any_card(d: dict):
     if not isinstance(d, dict):
         return None
     s = d.get("set", "")
+    ed = EDITION_MAP.get(d.get("edition", "none"), bm.Edition.NONE)
+    ev = int(d.get("extra_value", 0))
     if s == "Joker":
         return parse_joker(d)
     elif s == "Tarot":
         t_name = TAROT_NAME_BY_STR.get(d.get("name"), bm.TarotName.FOOL)
-        return bm.Tarot(name=t_name)
+        return bm.Tarot(name=t_name, edition=ed, extra_value=ev)
     elif s == "Planet":
         p_name = PLANET_NAME_BY_STR.get(d.get("name"), bm.PlanetName.MERCURY)
-        return bm.Planet(name=p_name)
+        return bm.Planet(name=p_name, edition=ed, extra_value=ev)
     elif s == "Spectral":
         sp_name = SPECTRAL_NAME_BY_STR.get(d.get("name"), bm.SpectralName.FAMILIAR)
-        return bm.Spectral(name=sp_name)
+        return bm.Spectral(name=sp_name, edition=ed, extra_value=ev)
+    elif s == "Voucher":
+        v_name = VOUCHER_NAME_BY_STR.get(d.get("name"), bm.VoucherName.OVERSTOCK)
+        return bm.Voucher(name=v_name)
     elif s in ("Default", "Enhanced") or d.get("value") in RANK_MAP:
         return parse_playing_card(d)
     return None
@@ -298,17 +315,52 @@ def sync_cv_observations_before_action(sim_state: gs.GameState, lua_state: dict)
         s = SUIT_MAP.get(idol_data.get("suit", "Spades"), bm.Suit.SPADES)
         sim_state.idol_card = (r, s)
 
-    # 4. If Joker count changed externally (e.g. mod test generator or RNG spawn queued in pending_cv_checks)
+    # 4. If Joker lineup or order changed externally (e.g. player dragged Jokers, mod generator, or RNG spawn),
+    # preserve existing Python Joker instances by ID so closed-loop accumulator/extra_value predictions are kept.
     lua_jokers_raw = lua_state.get("jokers", [])
     if (
         "jokers" in sim_state.pending_cv_checks
-        or len(lua_jokers_raw) != len(sim_state.inventory.jokers)
+        or [getattr(j, "id", 0) for j in sim_state.inventory.jokers]
+        != [int(d.get("id", 0)) for d in lua_jokers_raw]
     ):
-        parsed_jokers = [pj for d in lua_jokers_raw if (pj := parse_joker(d)) is not None]
-        sim_state.inventory.jokers = parsed_jokers
+        existing_by_id = {j.id: j for j in sim_state.inventory.jokers if getattr(j, "id", 0) != 0}
+        updated_jokers: list[bm.Joker] = []
+        for d in lua_jokers_raw:
+            j_id = int(d.get("id", 0))
+            if j_id != 0 and j_id in existing_by_id:
+                updated_jokers.append(existing_by_id.pop(j_id))
+            else:
+                pj = parse_joker(d)
+                if pj is not None:
+                    updated_jokers.append(pj)
+                    on_joker_added(sim_state, pj)
+        sim_state.inventory.jokers = updated_jokers
         sim_state.pending_cv_checks.discard("jokers")
 
-    # 5. Screen-visible Consumables and Booster pack contents
+    # Sync per-Joker rotating To Do List target poker hand (visible on Joker tooltip)
+    todo_targets = [
+        POKER_HAND_BY_STR[d["to_do_poker_hand"]]
+        for d in lua_jokers_raw
+        if d.get("name") == "To Do List" and d.get("to_do_poker_hand") in POKER_HAND_BY_STR
+    ]
+    todo_idx = 0
+    for j in sim_state.inventory.jokers:
+        if j.name == bm.JokerName.TO_DO_LIST and todo_idx < len(todo_targets):
+            j.state["target_hand"] = todo_targets[todo_idx]
+            sim_state.to_do_poker_hand = todo_targets[todo_idx]
+            todo_idx += 1
+
+    # 5. Screen-visible Shop, Consumables, and Booster pack contents
+    if "shop" in lua_state:
+        sim_state.shop_cards = [
+            c for d in lua_state["shop"]
+            if (c := parse_any_card(d)) is not None
+        ]
+    if "shop_vouchers" in lua_state:
+        sim_state.shop_vouchers = [
+            c for d in lua_state["shop_vouchers"]
+            if isinstance(c := parse_any_card(d), bm.Voucher)
+        ]
     if "consumables" in lua_state:
         sim_state.inventory.consumables = [
             c for d in lua_state["consumables"]
@@ -349,6 +401,7 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
 
     sim_state = gs.GameState(
         step_idx=0,
+        seed=first_state.get("seed", ""),
         ante=first_state.get("ante", 1),
         round=first_state.get("round", 1),
         money=first_state.get("money", 4),
@@ -382,6 +435,30 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
 
         # 2. Record (S_i, A_i) pair and step the Python simulation engine
         action = parse_lua_action(act_name, meta, frame_idx=step, timestamp=ts)
+        if i + 1 < len(entries):
+            next_entry_peek = entries[i + 1]
+            next_act_peek = next_entry_peek.get("action", "")
+            next_lua_peek = next_entry_peek.get("state", {})
+            # Detect The Hook mid-play discard logged before evaluate_play
+            if (
+                act_name == "Play Hand"
+                and sim_state.current_blind == bm.BlindName.THE_HOOK
+                and not sim_state.boss_disabled
+                and next_act_peek == "Discard"
+                and next_lua_peek.get("hands_left") == sim_state.hands_left - 1
+            ):
+                action.metadata["defer_play_for_hook"] = True
+            elif act_name == "Discard" and getattr(sim_state, "_hook_pending_cards", None) is not None:
+                action.metadata["hook"] = True
+
+            # Detect when Play Hand (or The Hook's mid-play Discard) beats the blind and triggers end_round()
+            if (
+                (act_name == "Play Hand" and not action.metadata.get("defer_play_for_hook"))
+                or (act_name == "Discard" and action.metadata.get("hook"))
+            ):
+                if lua_state.get("blind", "") != "" and next_lua_peek.get("blind", "") == "":
+                    action.metadata["won_round"] = True
+
         trajectory.record_step(sim_state.copy(), action)
         sim_state, _ = gs.step_simulation(sim_state, action)
 
@@ -460,6 +537,8 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
                 for j_idx, (py_j, lua_j) in enumerate(zip(sim_state.inventory.jokers, next_jokers_raw)):
                     if py_j.name.value != lua_j.get("name"):
                         continue
+                    if py_j.id != 0 and lua_j.get("id", 0) != 0 and py_j.id != lua_j.get("id"):
+                        continue
                     # Compare extra_value (Egg, Gift Card)
                     if "extra_value" in lua_j and py_j.extra_value != lua_j["extra_value"]:
                         print(
@@ -496,7 +575,7 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
                         bm.JokerName.RAMEN,
                         bm.JokerName.HIT_THE_ROAD,
                         bm.JokerName.CANIO,
-                    ):
+                    ) or (py_j.name == bm.JokerName.GLASS_JOKER and bool(sim_state.seed)):
                         py_xm = round(float(py_j.state.get("x_mult", 1.0)), 2)
                         lua_xm = round(float(lua_j.get("x_mult", 1.0)), 2)
                         if abs(py_xm - lua_xm) > 1e-2:

@@ -16,14 +16,19 @@ from game.engine.rng_sim.state import (
     BlindName,
     Card,
     Deck,
+    Edition,
     Enhancement,
     GameState,
+    Joker,
+    JokerName,
     PlayingCard,
     PokerHand,
     Rank,
     Seal,
     SimCard,
     SkipTag,
+    Spectral,
+    SpectralName,
     Suit,
     Tarot,
     TarotName,
@@ -1260,3 +1265,265 @@ class EventResolver:
 
     def hallucination(self, oops_multiplier: float = 1.0, ante: int = 1) -> bool:
         return self.check_odds(f"halu{ante}", 1, 2, oops_multiplier)
+
+
+# ---------------------------------------------------------------------------
+# 15. Pools and Deterministic Generators (Common Jokers, Spectrals, Edition Polling)
+# ---------------------------------------------------------------------------
+
+P_COMMON_JOKERS: list[tuple[str, JokerName]] = [
+    ("j_joker", JokerName.JOKER),
+    ("j_greedy_joker", JokerName.GREEDY_JOKER),
+    ("j_lusty_joker", JokerName.LUSTY_JOKER),
+    ("j_wrathful_joker", JokerName.WRATHFUL_JOKER),
+    ("j_gluttenous_joker", JokerName.GLUTTONOUS_JOKER),
+    ("j_jolly", JokerName.JOLLY_JOKER),
+    ("j_zany", JokerName.ZANY_JOKER),
+    ("j_mad", JokerName.MAD_JOKER),
+    ("j_crazy", JokerName.CRAZY_JOKER),
+    ("j_droll", JokerName.DROLL_JOKER),
+    ("j_sly", JokerName.SLY_JOKER),
+    ("j_wily", JokerName.WILY_JOKER),
+    ("j_clever", JokerName.CLEVER_JOKER),
+    ("j_devious", JokerName.DEVIOUS_JOKER),
+    ("j_crafty", JokerName.CRAFTY_JOKER),
+    ("j_half", JokerName.HALF_JOKER),
+    ("j_credit_card", JokerName.CREDIT_CARD),
+    ("j_banner", JokerName.BANNER),
+    ("j_mystic_summit", JokerName.MYSTIC_SUMMIT),
+    ("j_8_ball", JokerName.EIGHT_BALL),
+    ("j_misprint", JokerName.MISPRINT),
+    ("j_raised_fist", JokerName.RAISED_FIST),
+    ("j_chaos", JokerName.CHAOS_THE_CLOWN),
+    ("j_scary_face", JokerName.SCARY_FACE),
+    ("j_abstract", JokerName.ABSTRACT_JOKER),
+    ("j_delayed_grat", JokerName.DELAYED_GRATIFICATION),
+    ("j_gros_michel", JokerName.GROS_MICHEL),
+    ("j_even_steven", JokerName.EVEN_STEVEN),
+    ("j_odd_todd", JokerName.ODD_TODD),
+    ("j_scholar", JokerName.SCHOLAR),
+    ("j_business", JokerName.BUSINESS_CARD),
+    ("j_supernova", JokerName.SUPERNOVA),
+    ("j_ride_the_bus", JokerName.RIDE_THE_BUS),
+    ("j_egg", JokerName.EGG),
+    ("j_runner", JokerName.RUNNER),
+    ("j_ice_cream", JokerName.ICE_CREAM),
+    ("j_splash", JokerName.SPLASH),
+    ("j_blue_joker", JokerName.BLUE_JOKER),
+    ("j_faceless", JokerName.FACELESS_JOKER),
+    ("j_green_joker", JokerName.GREEN_JOKER),
+    ("j_superposition", JokerName.SUPERPOSITION),
+    ("j_todo_list", JokerName.TO_DO_LIST),
+    ("j_cavendish", JokerName.CAVENDISH),
+    ("j_red_card", JokerName.RED_CARD),
+    ("j_square", JokerName.SQUARE_JOKER),
+    ("j_riff_raff", JokerName.RIFF_RAFF),
+    ("j_photograph", JokerName.PHOTOGRAPH),
+    ("j_reserved_parking", JokerName.RESERVED_PARKING),
+    ("j_mail", JokerName.MAIL_IN_REBATE),
+    ("j_hallucination", JokerName.HALLUCINATION),
+    ("j_fortune_teller", JokerName.FORTUNE_TELLER),
+    ("j_juggler", JokerName.JUGGLER),
+    ("j_drunkard", JokerName.DRUNKARD),
+    ("j_golden", JokerName.GOLDEN_JOKER),
+    ("j_popcorn", JokerName.POPCORN),
+    ("j_walkie_talkie", JokerName.WALKIE_TALKIE),
+    ("j_smiley", JokerName.SMILEY_FACE),
+    ("j_ticket", JokerName.GOLDEN_TICKET),
+    ("j_swashbuckler", JokerName.SWASHBUCKLER),
+    ("j_hanging_chad", JokerName.HANGING_CHAD),
+    ("j_shoot_the_moon", JokerName.SHOOT_THE_MOON),
+]
+
+P_SPECTRALS: list[tuple[str, SpectralName]] = [
+    ("c_familiar", SpectralName.FAMILIAR),
+    ("c_grim", SpectralName.GRIM),
+    ("c_incantation", SpectralName.INCANTATION),
+    ("c_talisman", SpectralName.TALISMAN),
+    ("c_aura", SpectralName.AURA),
+    ("c_wraith", SpectralName.WRAITH),
+    ("c_sigil", SpectralName.SIGIL),
+    ("c_ouija", SpectralName.OUIJA),
+    ("c_ectoplasm", SpectralName.ECTOPLASM),
+    ("c_immolate", SpectralName.IMMOLATE),
+    ("c_ankh", SpectralName.ANKH),
+    ("c_deja_vu", SpectralName.DEJA_VU),
+    ("c_hex", SpectralName.HEX),
+    ("c_trance", SpectralName.TRANCE),
+    ("c_medium", SpectralName.MEDIUM),
+    ("c_cryptid", SpectralName.CRYPTID),
+]
+
+
+def poll_edition(
+    rng: BalatroRNG,
+    stream_key: str,
+    mod: float = 1.0,
+    no_neg: bool = False,
+    guaranteed: bool = False,
+) -> Edition:
+    """Replicates Balatro's `poll_edition(_key, _mod, _no_neg, _guaranteed)` (common_events.lua:2055-2076)."""
+    poll = rng.random(stream_key)
+    if guaranteed:
+        if not no_neg and poll > 1.0 - (0.003 * 25):
+            return Edition.NEGATIVE
+        elif poll > 1.0 - (0.006 * 25):
+            return Edition.POLYCHROME
+        elif poll > 1.0 - (0.02 * 25):
+            return Edition.HOLOGRAPHIC
+        elif poll > 1.0 - (0.04 * 25):
+            return Edition.FOIL
+        return Edition.FOIL
+    if not no_neg and poll > 1.0 - (0.003 * mod):
+        return Edition.NEGATIVE
+    elif poll > 1.0 - (0.006 * mod):
+        return Edition.POLYCHROME
+    elif poll > 1.0 - (0.02 * mod):
+        return Edition.HOLOGRAPHIC
+    elif poll > 1.0 - (0.04 * mod):
+        return Edition.FOIL
+    return Edition.NONE
+
+
+def predict_riff_raff_jokers(
+    rng: BalatroRNG,
+    ante: int = 1,
+    count: int = 2,
+) -> list[Joker]:
+    """Generates 1 or 2 Common Jokers for Riff-Raff (card.lua:2534-2541)."""
+    pool = [j[1] for j in P_COMMON_JOKERS]
+    jokers = []
+    for _ in range(count):
+        chosen, _ = rng.choice("Joker1rif", pool)
+        ed = poll_edition(rng, f"edirif{ante}")
+        jokers.append(Joker(name=chosen, edition=ed))
+    return jokers
+
+
+def poll_spectral_pool(
+    rng: BalatroRNG,
+    ante: int = 1,
+    key_append: str = "",
+) -> Spectral:
+    """Polls G.P_CENTER_POOLS['Spectral'] matching `get_current_pool('Spectral', nil, nil, key_append)`."""
+    pool = [s[1] for s in P_SPECTRALS]
+    pool_key = f"Spectral{key_append}{ante}"
+    chosen, _ = rng.choice(pool_key, pool)
+    return Spectral(name=chosen)
+
+
+def predict_sixth_sense_spectral(rng: BalatroRNG, ante: int = 1) -> Spectral:
+    return poll_spectral_pool(rng, ante=ante, key_append="sixth")
+
+
+def predict_seance_spectral(rng: BalatroRNG, ante: int = 1) -> Spectral:
+    return poll_spectral_pool(rng, ante=ante, key_append="sea")
+
+
+def predict_superposition_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
+    return poll_tarot_pool(rng, ante=ante, key_append="sup", source_label="Superposition")
+
+
+def predict_purple_seal_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
+    return poll_tarot_pool(rng, ante=ante, key_append="pur", source_label="Purple Seal")
+
+
+def predict_eight_ball_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
+    return poll_tarot_pool(rng, ante=ante, key_append="8ba", source_label="8 Ball")
+
+
+# ---------------------------------------------------------------------------
+# 11. Spectral Destruction & Card Generation Mechanics
+# ---------------------------------------------------------------------------
+
+_SPECTRAL_SUITS: list[Suit] = [Suit.SPADES, Suit.HEARTS, Suit.DIAMONDS, Suit.CLUBS]
+_ENHANCED_CENTERS: list[Enhancement] = [
+    Enhancement.BONUS,
+    Enhancement.MULT,
+    Enhancement.WILD,
+    Enhancement.GLASS,
+    Enhancement.STEEL,
+    Enhancement.GOLD,
+    Enhancement.LUCKY,
+]
+
+
+def predict_random_destroy(rng: BalatroRNG, hand_cards: list[Any]) -> Any | None:
+    """Predicts which card in hand is destroyed by Familiar, Grim, or Incantation.
+    
+    Replicates:
+    `destroyed_cards[#destroyed_cards+1] = pseudorandom_element(G.hand.cards, pseudoseed('random_destroy'))`
+    (card.lua:1293)
+    """
+    if not hand_cards:
+        return None
+    pseed = rng.step_seed("random_destroy")
+    tw = Tw223(pseed)
+    idx = tw.random_range(1, len(hand_cards)) - 1
+    return hand_cards[idx]
+
+
+def predict_immolate_destructions(
+    rng: BalatroRNG, hand_cards: list[Any], count: int = 5
+) -> list[Any]:
+    """Predicts which cards in hand are destroyed by Immolate.
+    
+    Replicates:
+    `table.sort(temp_hand, function (a, b) return not a.playing_card or not b.playing_card or a.playing_card < b.playing_card end)`
+    `pseudoshuffle(temp_hand, pseudoseed('immolate'))`
+    (card.lua:1341-1346)
+    """
+    if not hand_cards:
+        return []
+    temp = list(hand_cards)
+    temp.sort(key=lambda c: getattr(c, "id", getattr(c, "sort_id", 0)))
+    pseed = rng.step_seed("immolate")
+    tw = Tw223(pseed)
+    for i in range(len(temp) - 1, 0, -1):
+        j = tw.random_range(1, i + 1) - 1
+        temp[i], temp[j] = temp[j], temp[i]
+    return temp[:count]
+
+
+def predict_familiar_spawns(rng: BalatroRNG, count: int = 3) -> list[PlayingCard]:
+    """Generates 3 enhanced face cards for Familiar (card.lua:1319-1336)."""
+    cards: list[PlayingCard] = []
+    for _ in range(count):
+        r, _ = rng.choice("familiar_create", [Rank.JACK, Rank.QUEEN, Rank.KING])
+        s, _ = rng.choice("familiar_create", _SPECTRAL_SUITS)
+        enh, _ = rng.choice("spe_card", _ENHANCED_CENTERS)
+        cards.append(PlayingCard(rank=r, suit=s, enhancement=enh))
+    return cards
+
+
+def predict_grim_spawns(rng: BalatroRNG, count: int = 2) -> list[PlayingCard]:
+    """Generates 2 enhanced Aces for Grim (card.lua:1323-1336)."""
+    cards: list[PlayingCard] = []
+    for _ in range(count):
+        s, _ = rng.choice("grim_create", _SPECTRAL_SUITS)
+        enh, _ = rng.choice("spe_card", _ENHANCED_CENTERS)
+        cards.append(PlayingCard(rank=Rank.ACE, suit=s, enhancement=enh))
+    return cards
+
+
+def predict_incantation_spawns(rng: BalatroRNG, count: int = 4) -> list[PlayingCard]:
+    """Generates 4 enhanced numbered cards for Incantation (card.lua:1326-1336)."""
+    ranks = [
+        Rank.TWO,
+        Rank.THREE,
+        Rank.FOUR,
+        Rank.FIVE,
+        Rank.SIX,
+        Rank.SEVEN,
+        Rank.EIGHT,
+        Rank.NINE,
+        Rank.TEN,
+    ]
+    cards: list[PlayingCard] = []
+    for _ in range(count):
+        r, _ = rng.choice("incantation_create", ranks)
+        s, _ = rng.choice("incantation_create", _SPECTRAL_SUITS)
+        enh, _ = rng.choice("spe_card", _ENHANCED_CENTERS)
+        cards.append(PlayingCard(rank=r, suit=s, enhancement=enh))
+    return cards
+
