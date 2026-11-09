@@ -975,6 +975,9 @@ def on_action(state, action: Action):
         case ActionType.SELECT_BLIND:
             state.round_won = False
             state.location = Location.BLIND
+            if state.boss_blind is None and (state.seed or getattr(state, "rng", None)):
+                if hasattr(state, "roll_boss_blind"):
+                    state.roll_boss_blind(is_reroll=False)
             state.hands_played_this_round = 0
             state.discards_used_this_round = 0
 
@@ -1033,7 +1036,24 @@ def on_action(state, action: Action):
 
         case ActionType.REROLL_BOSS:
             state.money -= 10
-            state.pending_cv_checks.add("boss_blind")
+            if hasattr(state, "roll_boss_blind"):
+                state.roll_boss_blind(is_reroll=True)
+            elif state.seed or getattr(state, "rng", None):
+                if getattr(state, "rng", None) is None and state.seed:
+                    state.set_seed(state.seed)
+                try:
+                    from game.engine.rng_sim.events import get_next_boss_blind
+                except ImportError:
+                    from engine.rng_sim.events import get_next_boss_blind
+                if not hasattr(state, "bosses_used") or state.bosses_used is None:
+                    state.bosses_used = {}
+                pred = get_next_boss_blind(
+                    state.rng,
+                    ante=state.ante,
+                    bosses_used=state.bosses_used,
+                    is_reroll=True,
+                )
+                state.boss_blind = pred.blind_name
 
         case ActionType.REORDER_JOKERS:
             order = action.joker_order or (action.metadata and action.metadata.get("joker_order"))

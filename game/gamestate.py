@@ -271,11 +271,35 @@ class GameState:
     seed: str = ""
     rng: Any = None
     resolver: Any = None
+    bosses_used: dict[str, int] = field(default_factory=dict)
     _next_slot_uid: int = field(default=1, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.seed and self.rng is None:
             self.set_seed(self.seed)
+        elif self.seed and self.boss_blind is None:
+            self.roll_boss_blind(is_reroll=False)
+
+    def roll_boss_blind(self, is_reroll: bool = False) -> BlindName | None:
+        """Deterministically evaluates or updates the Boss Blind using Balatro PRNG based on seed."""
+        if not self.seed and self.rng is None:
+            return self.boss_blind
+        if self.rng is None and self.seed:
+            self.set_seed(self.seed)
+        try:
+            from game.engine.rng_sim.events import get_next_boss_blind
+        except ImportError:
+            from engine.rng_sim.events import get_next_boss_blind
+        if not hasattr(self, "bosses_used") or self.bosses_used is None:
+            self.bosses_used = {}
+        pred = get_next_boss_blind(
+            self.rng,
+            ante=self.ante,
+            bosses_used=self.bosses_used,
+            is_reroll=is_reroll,
+        )
+        self.boss_blind = pred.blind_name
+        return self.boss_blind
 
     def set_seed(self, seed: str) -> None:
         """Initializes or resets the deterministic BalatroRNG and EventResolver on this GameState."""
@@ -288,6 +312,8 @@ class GameState:
             from engine.rng_sim.events import EventResolver
         self.rng = BalatroRNG(self.seed)
         self.resolver = EventResolver(self.rng)
+        if self.boss_blind is None and self.seed:
+            self.roll_boss_blind(is_reroll=False)
 
     @property
     def discount_percent(self) -> int:
@@ -913,12 +939,28 @@ class RunTrajectory:
         return curr
 
     def impute_retroactive_boss_blinds(self):
-        """Backward-propagates discovered boss blinds to all preceding steps in the same ante."""
+        """Backward-propagates discovered boss blinds to all preceding steps in the same ante,
+        using PRNG simulation from seed when available."""
         ante_bosses: dict[int, BlindName] = {}
         for s in range(len(self.deltas)):
             st = self.get_state(s)
             if st.boss_blind:
                 ante_bosses[st.ante] = st.boss_blind
+
+        # PRNG fallback based on seed if any step has a seed
+        first_state = self.get_state(0) if self.deltas else None
+        seed = getattr(first_state, "seed", "") if first_state else ""
+        if seed:
+            try:
+                from game.engine.rng_sim.api import BalatroRun
+                run = BalatroRun(seed)
+                max_ante = max((self.get_state(s).ante for s in range(len(self.deltas))), default=1)
+                bosses = run.predict_boss_blinds(max_ante=max(8, max_ante))
+                for a_idx, b_pred in enumerate(bosses, start=1):
+                    if a_idx not in ante_bosses:
+                        ante_bosses[a_idx] = b_pred.blind_name
+            except Exception:
+                pass
 
         for delta in self.deltas:
             step_state = self.get_state(delta.step_idx)
