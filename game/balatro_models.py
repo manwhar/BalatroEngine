@@ -14,6 +14,7 @@ class Location(StrEnum):
     SHOP = "shop"
     SELECT = "select"
     PACK = "pack"
+    CASH_OUT = "cash out"
 
 
 class PokerHand(StrEnum):
@@ -320,7 +321,6 @@ class ActionType(StrEnum):
     REROLL_SHOP = "Reroll Shop"
     RUN_INFO = "Open Run Info Menu"
     SELECT_BLIND = "Select Blind"
-    SELECT_CARD = "Select Card"
     SELL_CARD = "Sell Card"
     SKIP_BLIND = "Skip Blind"
     SKIP_PACK = "Skip Pack"
@@ -329,8 +329,8 @@ class ActionType(StrEnum):
     USE_CONSUMABLE = "Use Consumable"
     USE_IN_PACK = "Use In Pack"
     PLAY_GAME = "Play Game"
-    REORDER_JOKERS = "Reorder Jokers"
-    REORDER_HAND = "Reorder Hand"
+    END_ROUND = "End Round"
+    SETUP_TEST_SUITE = "Setup Test Suite"
 
 
 @dataclass(kw_only=True)
@@ -341,6 +341,7 @@ class Action:
     target_idx: int | None = None
     selected_cards: list["PlayingCard"] = field(default_factory=list)
     joker_order: list[int] = field(default_factory=list)
+    hand_order: list[int] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
 
@@ -479,7 +480,9 @@ class CardBounds:
     is_face_down: bool = True
     possible_ranks: set[Rank] = field(default_factory=lambda: set(Rank) - {Rank.NONE})
     possible_suits: set[Suit] = field(default_factory=lambda: set(Suit) - {Suit.NONE})
-    possible_enhancements: set[Enhancement] = field(default_factory=lambda: set(Enhancement))
+    possible_enhancements: set[Enhancement] = field(
+        default_factory=lambda: set(Enhancement)
+    )
     possible_editions: set[Edition] = field(default_factory=lambda: set(Edition))
     possible_seals: set[Seal] = field(default_factory=lambda: set(Seal))
     candidate_card_ids: set[int] = field(default_factory=set)
@@ -539,12 +542,18 @@ class CardBounds:
             else:
                 self.possible_seals = c_seals
 
-    def get_rank_probabilities(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> dict[Rank, float]:
+    def get_rank_probabilities(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> dict[Rank, float]:
         """Returns marginal probability P(Rank) for each of the 13 ranks."""
         ranks = [r for r in Rank if r != Rank.NONE]
         pool = candidate_pool if candidate_pool is not None else self.candidate_cards
         if pool:
-            valid_pool = [c for c in pool if not self.candidate_card_ids or c.id in self.candidate_card_ids]
+            valid_pool = [
+                c
+                for c in pool
+                if not self.candidate_card_ids or c.id in self.candidate_card_ids
+            ]
             if valid_pool:
                 total = len(valid_pool)
                 counts = {r: 0 for r in ranks}
@@ -557,12 +566,18 @@ class CardBounds:
             return {r: 0.0 for r in ranks}
         return {r: (1.0 / total if r in self.possible_ranks else 0.0) for r in ranks}
 
-    def get_suit_probabilities(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> dict[Suit, float]:
+    def get_suit_probabilities(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> dict[Suit, float]:
         """Returns marginal probability P(Suit) for each of the 4 suits."""
         suits = [s for s in Suit if s != Suit.NONE]
         pool = candidate_pool if candidate_pool is not None else self.candidate_cards
         if pool:
-            valid_pool = [c for c in pool if not self.candidate_card_ids or c.id in self.candidate_card_ids]
+            valid_pool = [
+                c
+                for c in pool
+                if not self.candidate_card_ids or c.id in self.candidate_card_ids
+            ]
             if valid_pool:
                 total = len(valid_pool)
                 counts = {s: 0 for s in suits}
@@ -575,12 +590,18 @@ class CardBounds:
             return {s: 0.0 for s in suits}
         return {s: (1.0 / total if s in self.possible_suits else 0.0) for s in suits}
 
-    def get_seal_probabilities(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> dict[Seal, float]:
+    def get_seal_probabilities(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> dict[Seal, float]:
         """Returns marginal probability P(Seal) for each of the 5 seals."""
         seals = list(Seal)
         pool = candidate_pool if candidate_pool is not None else self.candidate_cards
         if pool:
-            valid_pool = [c for c in pool if not self.candidate_card_ids or c.id in self.candidate_card_ids]
+            valid_pool = [
+                c
+                for c in pool
+                if not self.candidate_card_ids or c.id in self.candidate_card_ids
+            ]
             if valid_pool:
                 total = len(valid_pool)
                 counts = {s: 0 for s in seals}
@@ -593,7 +614,9 @@ class CardBounds:
             return {s: 0.0 for s in seals}
         return {s: (1.0 / total if s in self.possible_seals else 0.0) for s in seals}
 
-    def get_rank_vector(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> list[float]:
+    def get_rank_vector(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> list[float]:
         """Fixed 13-dim probability vector in order: 2, 3, 4, 5, 6, 7, 8, 9, 10, Jack, Queen, King, Ace."""
         ordered_ranks = [
             Rank.TWO,
@@ -613,13 +636,17 @@ class CardBounds:
         probs = self.get_rank_probabilities(candidate_pool)
         return [probs.get(r, 0.0) for r in ordered_ranks]
 
-    def get_suit_vector(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> list[float]:
+    def get_suit_vector(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> list[float]:
         """Fixed 4-dim probability vector in order: Spades, Hearts, Clubs, Diamonds."""
         ordered_suits = [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]
         probs = self.get_suit_probabilities(candidate_pool)
         return [probs.get(s, 0.0) for s in ordered_suits]
 
-    def get_seal_vector(self, candidate_pool: Sequence["PlayingCard"] | None = None) -> list[float]:
+    def get_seal_vector(
+        self, candidate_pool: Sequence["PlayingCard"] | None = None
+    ) -> list[float]:
         """Fixed 5-dim probability vector in order: None, Red, Gold, Blue, Purple."""
         ordered_seals = [Seal.NONE, Seal.RED, Seal.GOLD, Seal.BLUE, Seal.PURPLE]
         probs = self.get_seal_probabilities(candidate_pool)
@@ -639,7 +666,9 @@ class HandCard:
     def __post_init__(self) -> None:
         if self.facing_back:
             if self._real_card is None and (
-                self.card.rank != Rank.NONE or self.card.suit != Suit.NONE or self.card.id != 0
+                self.card.rank != Rank.NONE
+                or self.card.suit != Suit.NONE
+                or self.card.id != 0
             ):
                 self._real_card = copy.deepcopy(self.card)
             if self.bounds is None:
@@ -650,7 +679,9 @@ class HandCard:
                 self.card.suit = Suit.NONE
                 self.card.id = 0
 
-    def resolve_face_down(self, resolved_card: PlayingCard, lift_facing_back: bool = False) -> None:
+    def resolve_face_down(
+        self, resolved_card: PlayingCard, lift_facing_back: bool = False
+    ) -> None:
         """Resolves a face-down card to an exact PlayingCard, lifting hidden-state masks."""
         if lift_facing_back:
             self.facing_back = False

@@ -649,11 +649,21 @@ def on_action(state, action: Action):
                 state.inventory.jokers = [by_id[jid] for jid in j_order]
         sync_dynamic_joker_states(state)
 
-    match action.type:
-        case ActionType.SELECT_CARD:
-            if action.target_idx is not None:
-                state.hand.select(action.target_idx)
+    # Implicit hand reordering: if the action specifies a hand order, apply it before evaluating the action!
+    h_order = action.hand_order or (action.metadata and action.metadata.get("hand_order"))
+    if h_order and state.hand and state.hand.cards:
+        current_hand = state.hand.cards
+        if len(h_order) == len(current_hand) and all(
+            isinstance(x, int) and 0 <= x < len(current_hand) for x in h_order
+        ):
+            state.hand.cards = [current_hand[i] for i in h_order]
+        else:
+            by_id = {c.card.id: c for c in current_hand if c.card and c.card.id != 0}
+            if all(cid in by_id for cid in h_order):
+                state.hand.cards = [by_id[cid] for cid in h_order]
+        state.reconcile_face_down_adjacencies()
 
+    match action.type:
         case ActionType.SORT_RANK:
             state.apply_sort_observation(
                 sort_type="rank",
@@ -1055,27 +1065,7 @@ def on_action(state, action: Action):
                 )
                 state.boss_blind = pred.blind_name
 
-        case ActionType.REORDER_JOKERS:
-            order = action.joker_order or (action.metadata and action.metadata.get("joker_order"))
-            if order:
-                current_jokers = state.inventory.jokers
-                if len(order) == len(current_jokers) and all(isinstance(x, int) and 0 <= x < len(current_jokers) for x in order):
-                    state.inventory.jokers = [current_jokers[i] for i in order]
-                else:
-                    by_id = {j.id: j for j in current_jokers if j.id != 0}
-                    if all(jid in by_id for jid in order):
-                        state.inventory.jokers = [by_id[jid] for jid in order]
-
-        case ActionType.REORDER_HAND:
-            order = action.metadata and action.metadata.get("hand_order")
-            if order:
-                current_hand = state.hand.cards
-                if len(order) == len(current_hand) and all(isinstance(x, int) and 0 <= x < len(current_hand) for x in order):
-                    state.hand.cards = [current_hand[i] for i in order]
-                else:
-                    by_id = {c.card.id: c for c in current_hand if c.card and c.card.id != 0}
-                    if all(cid in by_id for cid in order):
-                        state.hand.cards = [by_id[cid] for cid in order]
-                state.reconcile_face_down_adjacencies()
+        case ActionType.END_ROUND:
+            trigger_end_of_round_effects(state, action)
 
     sync_dynamic_joker_states(state)

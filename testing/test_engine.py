@@ -277,9 +277,8 @@ def parse_lua_action(
         "Reroll Boss": bm.ActionType.REROLL_BOSS,
         "Sort by Rank": bm.ActionType.SORT_RANK,
         "Sort by Suit": bm.ActionType.SORT_SUIT,
-        "Reorder Jokers": bm.ActionType.REORDER_JOKERS,
-        "Reorder Hand": bm.ActionType.REORDER_HAND,
-        "Setup Test Suite": bm.ActionType.SELECT_CARD,
+        "End Round": bm.ActionType.END_ROUND,
+        "Setup Test Suite": bm.ActionType.SETUP_TEST_SUITE,
     }
     act_type = action_map.get(action_name, bm.ActionType.PLAY_HAND)
     if act_type == bm.ActionType.CASH_OUT:
@@ -1715,14 +1714,11 @@ class TestTelemetryParityAndLoggingAudit(unittest.TestCase):
         self.assertEqual(act_suit.type, bm.ActionType.SORT_SUIT)
         self.assertEqual(act_suit.metadata.get("selected_card_id"), 10)
 
-        act_reorder_j = parse_lua_action("Reorder Jokers", {"joker_order": [102, 101]}, 3, 0.0)
-        self.assertEqual(act_reorder_j.type, bm.ActionType.REORDER_JOKERS)
-
-        act_reorder_h = parse_lua_action("Reorder Hand", {"hand_order": [5, 4]}, 4, 0.0)
-        self.assertEqual(act_reorder_h.type, bm.ActionType.REORDER_HAND)
+        act_end_round = parse_lua_action("End Round", {"joker_order": [102, 101]}, 3, 0.0)
+        self.assertEqual(act_end_round.type, bm.ActionType.END_ROUND)
 
         act_setup = parse_lua_action("Setup Test Suite", {}, 5, 0.0)
-        self.assertEqual(act_setup.type, bm.ActionType.SELECT_CARD)
+        self.assertEqual(act_setup.type, bm.ActionType.SETUP_TEST_SUITE)
 
     def test_parse_joker_loyalty_and_payout(self):
         """Validates that Loyalty Card loyalty_remaining and Rocket payout are properly extracted."""
@@ -1747,7 +1743,7 @@ class TestTelemetryParityAndLoggingAudit(unittest.TestCase):
         self.assertEqual(j_rocket.state.get("payout"), 6)
 
     def test_reorder_actions_execution(self):
-        """REORDER_JOKERS and REORDER_HAND reorder elements by card IDs, and implicit joker_order works on any action."""
+        """Implicit joker_order and hand_order reorder elements by card IDs or indices on any action, and END_ROUND evaluates end of round triggers."""
         j1 = bm.Joker(name=bm.JokerName.JOKER, id=1)
         j2 = bm.Joker(name=bm.JokerName.BLUEPRINT, id=2)
         state = gs.GameState(inventory=bm.Inventory(jokers=[j1, j2]))
@@ -1764,28 +1760,33 @@ class TestTelemetryParityAndLoggingAudit(unittest.TestCase):
         )
         self.assertEqual([j.id for j in state.inventory.jokers], [2, 1])
 
-        # Explicit REORDER_JOKERS action
-        state, _ = gs.step_simulation(
-            state,
-            bm.Action(
-                type=bm.ActionType.REORDER_JOKERS,
-                metadata={"joker_order": [1, 2]},
-            ),
-        )
-        self.assertEqual([j.id for j in state.inventory.jokers], [1, 2])
-
-        # Reorder hand cards by ID
+        # Implicit hand_order reorder on an action
         c2 = bm.PlayingCard(rank=bm.Rank.THREE, suit=bm.Suit.SPADES, id=12)
         state.hand = bm.Hand(cards=[bm.HandCard(card=c1), bm.HandCard(card=c2)])
-
         state, _ = gs.step_simulation(
             state,
             bm.Action(
-                type=bm.ActionType.REORDER_HAND,
-                metadata={"hand_order": [12, 11]},
+                type=bm.ActionType.SORT_RANK,
+                hand_order=[12, 11],
             ),
         )
         self.assertEqual([hc.card.id for hc in state.hand.cards], [12, 11])
+
+        # END_ROUND action applies joker_order and triggers end-of-round effects
+        mime = bm.Joker(name=bm.JokerName.MIME, id=3)
+        state.inventory.jokers.append(mime)
+        state.hand.cards[0].card.enhancement = bm.Enhancement.GOLD
+        state, _ = gs.step_simulation(
+            state,
+            bm.Action(
+                type=bm.ActionType.END_ROUND,
+                joker_order=[2, 3, 1],  # Put Blueprint next to Mime
+            ),
+        )
+        self.assertEqual([j.id for j in state.inventory.jokers], [2, 3, 1])
+        self.assertTrue(state.round_won)
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(state.location, bm.Location.SHOP)
 
     def test_sync_observations_and_setup_test_suite(self):
         """Validates that sync_cv_observations_before_action updates state variables and refreshes deck on Setup Test Suite."""

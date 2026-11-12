@@ -15,7 +15,6 @@ Deterministic non-visible state, RNG rolls, and Boss Blinds are resolved via PRN
 
 from __future__ import annotations
 
-import copy
 import re
 from typing import Any
 
@@ -77,7 +76,6 @@ except ImportError:
 
 class InvalidLocationError(ValueError):
     """Raised when CV card detection is invoked in an invalid game location or UI state."""
-    pass
 
 
 # =========================================================================
@@ -248,6 +246,7 @@ class ShopCardsResult(list):
 # LOCATION VALIDATION
 # =========================================================================
 
+
 def _resolve_state_and_frame(first: Any, second: Any = None) -> tuple[Any, Any]:
     """Helper to extract (state, frame) flexibly from either cv_detect(state, frame) or cv_detect(frame, state)."""
     if hasattr(first, "location"):
@@ -346,7 +345,11 @@ def validate_shop_cards_location(state: Any) -> None:
 
     # 4. Inside a booster pack (whether in shop or opened from skip tag)
     if loc in (Location.PACK, "pack") or active_pack is not None:
-        pack_type = getattr(active_pack, "booster_type", "unknown") if active_pack else "unknown"
+        pack_type = (
+            getattr(active_pack, "booster_type", "unknown")
+            if active_pack
+            else "unknown"
+        )
         raise InvalidLocationError(
             f"Cannot detect shop cards: currently inside a booster pack ({pack_type}) (location='pack')."
         )
@@ -363,6 +366,7 @@ def validate_shop_cards_location(state: Any) -> None:
 # =========================================================================
 # ITEM DESERIALIZERS
 # =========================================================================
+
 
 def _convert_card_result_to_hand_card(card_res: Any) -> HandCard:
     """Converts a CardResult dataclass from card recognition pipeline into HandCard."""
@@ -417,13 +421,25 @@ def _convert_shop_item_result(item: Any) -> Any:
     # 1. Booster Pack
     if key.startswith("p_") or card_type == "Booster":
         tokens = key.split("_")
-        b_type = _BOOSTER_TYPE_MAP.get(tokens[1] if len(tokens) > 1 else "", BoosterType.ARCANA)
-        b_size = _BOOSTER_SIZE_MAP.get(tokens[2] if len(tokens) > 2 else "", BoosterSize.REGULAR)
+        b_type = _BOOSTER_TYPE_MAP.get(
+            tokens[1] if len(tokens) > 1 else "", BoosterType.ARCANA
+        )
+        b_size = _BOOSTER_SIZE_MAP.get(
+            tokens[2] if len(tokens) > 2 else "", BoosterSize.REGULAR
+        )
         cost = 4
         if b_type in (BoosterType.BUFFOON, BoosterType.SPECTRAL):
-            cost = 6 if b_size == BoosterSize.REGULAR else (8 if b_size == BoosterSize.JUMBO else 10)
+            cost = (
+                6
+                if b_size == BoosterSize.REGULAR
+                else (8 if b_size == BoosterSize.JUMBO else 10)
+            )
         else:
-            cost = 4 if b_size == BoosterSize.REGULAR else (6 if b_size == BoosterSize.JUMBO else 8)
+            cost = (
+                4
+                if b_size == BoosterSize.REGULAR
+                else (6 if b_size == BoosterSize.JUMBO else 8)
+            )
         choose = 2 if b_size == BoosterSize.MEGA else 1
         extra = 5 if b_size in (BoosterSize.JUMBO, BoosterSize.MEGA) else 3
         if b_type in (BoosterType.BUFFOON, BoosterType.SPECTRAL):
@@ -473,6 +489,7 @@ def _convert_shop_item_result(item: Any) -> Any:
 # PUBLIC CV DETECTION APIs
 # =========================================================================
 
+
 def cv_detect_hand_cards(
     state_or_frame: Any,
     frame_or_state: Any = None,
@@ -499,19 +516,24 @@ def cv_detect_hand_cards(
     validate_hand_cards_location(state)
 
     if frame is None:
-        raise ValueError("A valid video frame must be provided for cv_detect_hand_cards.")
+        raise ValueError(
+            "A valid video frame must be provided for cv_detect_hand_cards."
+        )
 
     try:
         from classifiers.inference import recognize_hand_cards
     except ImportError:
         import sys
         from pathlib import Path
+
         repo_root = Path(__file__).resolve().parent.parent.parent
         if str(repo_root) not in sys.path:
             sys.path.insert(0, str(repo_root))
         from classifiers.inference import recognize_hand_cards
 
-    rec_output = recognize_hand_cards(frame, conf_threshold=conf_threshold, device=device)
+    rec_output = recognize_hand_cards(
+        frame, conf_threshold=conf_threshold, device=device
+    )
     return [_convert_card_result_to_hand_card(c) for c in rec_output.cards]
 
 
@@ -542,25 +564,46 @@ def cv_detect_shop_cards(
     validate_shop_cards_location(state)
 
     if frame is None:
-        raise ValueError("A valid video frame must be provided for cv_detect_shop_cards.")
+        raise ValueError(
+            "A valid video frame must be provided for cv_detect_shop_cards."
+        )
 
     try:
         from classifiers.inference import recognize_shop
     except ImportError:
         import sys
         from pathlib import Path
+
         repo_root = Path(__file__).resolve().parent.parent.parent
         if str(repo_root) not in sys.path:
             sys.path.insert(0, str(repo_root))
         from classifiers.inference import recognize_shop
 
-    rec_output = recognize_shop(frame, mode="shop", conf_threshold=conf_threshold, device=device)
+    rec_output = recognize_shop(
+        frame, mode="shop", conf_threshold=conf_threshold, device=device
+    )
 
     shop_cards = [_convert_shop_item_result(item) for item in rec_output.shop_items]
-    vouchers = [_convert_shop_item_result(item) for item in rec_output.vouchers if isinstance(_convert_shop_item_result(item), Voucher)]
-    packs = [_convert_shop_item_result(item) for item in rec_output.boosters if isinstance(_convert_shop_item_result(item), BoosterPack)]
-    jokers = [_convert_shop_item_result(item) for item in rec_output.joker_bar if isinstance(_convert_shop_item_result(item), Joker)]
-    consumables = [_convert_shop_item_result(item) for item in rec_output.consumeables if isinstance(_convert_shop_item_result(item), (Tarot, Planet, Spectral))]
+    vouchers = [
+        _convert_shop_item_result(item)
+        for item in rec_output.vouchers
+        if isinstance(_convert_shop_item_result(item), Voucher)
+    ]
+    packs = [
+        _convert_shop_item_result(item)
+        for item in rec_output.boosters
+        if isinstance(_convert_shop_item_result(item), BoosterPack)
+    ]
+    jokers = [
+        _convert_shop_item_result(item)
+        for item in rec_output.joker_bar
+        if isinstance(_convert_shop_item_result(item), Joker)
+    ]
+    consumables = [
+        _convert_shop_item_result(item)
+        for item in rec_output.consumeables
+        if isinstance(_convert_shop_item_result(item), (Tarot, Planet, Spectral))
+    ]
 
     return ShopCardsResult(
         cards=shop_cards,
@@ -576,6 +619,7 @@ def cv_detect_shop_cards(
 # PRNG BOSS BLIND RESOLVER (Replaces cv_detect_boss_blind)
 # =========================================================================
 
+
 def get_boss_blind_from_seed(
     seed: str,
     ante: int = 1,
@@ -587,11 +631,11 @@ def get_boss_blind_from_seed(
     Replaces former `cv_detect_boss_blind()` queries.
     """
     try:
-        from game.engine.rng_sim.rng import BalatroRNG
         from game.engine.rng_sim.events import get_next_boss_blind
+        from game.engine.rng_sim.rng import BalatroRNG
     except ImportError:
-        from engine.rng_sim.rng import BalatroRNG
         from engine.rng_sim.events import get_next_boss_blind
+        from engine.rng_sim.rng import BalatroRNG
 
     clean_seed = str(seed).strip().upper()
     rng = BalatroRNG(clean_seed)

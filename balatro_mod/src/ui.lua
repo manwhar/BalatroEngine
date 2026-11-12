@@ -350,6 +350,11 @@ function UI.init_callbacks(mod)
         mod.config.perkeo_max_consumables = max_c
     end
 
+    G.FUNCS.gdcv_change_card_selection_chance = function(args)
+        mod.config.card_selection_chance = args.to_val or '50%'
+        print("DATASET: Card selection chance set to " .. tostring(mod.config.card_selection_chance))
+    end
+
     G.FUNCS.gdcv_save_config = function(e)
         mod:save_config()
         mod.capture_flash = 1.5
@@ -508,6 +513,13 @@ function UI.create_config_tab()
         if val == current_pm_str then current_pm_idx = idx; break end
     end
 
+    local selection_chance_options = {'0%', '50%', '100%'}
+    local current_sc_str = tostring(mod.config.card_selection_chance or '50%')
+    local current_sc_idx = 2
+    for idx, val in ipairs(selection_chance_options) do
+        if val == current_sc_str then current_sc_idx = idx; break end
+    end
+
     -- Initialize Joker Generator State
     mod.test_joker_rarity_filter = mod.test_joker_rarity_filter or "All"
     mod.test_joker_edition = mod.test_joker_edition or "None"
@@ -641,6 +653,27 @@ function UI.create_config_tab()
                             options = perkeo_max_options,
                             current_option = current_pm_idx,
                             opt_callback = 'gdcv_change_perkeo_max',
+                            w = 2.8,
+                            h = 0.6,
+                            scale = 0.65
+                        })
+                    }}
+                }
+            },
+            -- Card Selection Chance Cycle
+            {
+                n = G.UIT.R,
+                config = {align = "cr", padding = 0.02},
+                nodes = {
+                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
+                        {n = G.UIT.T, config = {text = "Card Selection Chance", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
+                    }},
+                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                        create_option_cycle({
+                            id = 'gdcv_sc_cycle',
+                            options = selection_chance_options,
+                            current_option = current_sc_idx,
+                            opt_callback = 'gdcv_change_card_selection_chance',
                             w = 2.8,
                             h = 0.6,
                             scale = 0.65

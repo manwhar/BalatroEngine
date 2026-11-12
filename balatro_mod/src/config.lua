@@ -9,6 +9,7 @@ local DEFAULT_CONFIG = {
     frames_per_phase = 100, -- 100 shop screens, then 100 pack screens
     perkeo_max_consumables = 10, -- Max consumables in perkeo mode (configurable)
     show_shop_prices = false, -- Synchronously render price labels below shop items (disabled for fast animation-free generation)
+    card_selection_chance = '50%', -- '0%', '50%', '100%'
     rois = {
         card_hand    = {x = 508.319934, y = 567.839093, w = 1071.056521, h = 322.734447},
         joker_bar    = {x = 320.0,      y = 10.0,       w = 1280.0,      h = 260.0},
@@ -36,6 +37,7 @@ function Config.init(mod)
         frames_per_phase = DEFAULT_CONFIG.frames_per_phase,
         perkeo_max_consumables = DEFAULT_CONFIG.perkeo_max_consumables,
         show_shop_prices = DEFAULT_CONFIG.show_shop_prices,
+        card_selection_chance = DEFAULT_CONFIG.card_selection_chance,
         rois = {},
         boxes = {}
     }
@@ -160,6 +162,7 @@ function G.DATASET_MOD:save_config()
     content = content .. string.format("  frames_per_phase = %d,\n", self.config.frames_per_phase or 100)
     content = content .. string.format("  perkeo_max_consumables = %d,\n", self.config.perkeo_max_consumables or 10)
     content = content .. string.format("  show_shop_prices = %s,\n", self.config.show_shop_prices ~= false and "true" or "false")
+    content = content .. string.format("  card_selection_chance = %q,\n", self.config.card_selection_chance or '50%')
     
     content = content .. "  rois = {\n"
     for k, v in pairs(self.config.rois) do
@@ -192,6 +195,7 @@ function G.DATASET_MOD:load_config()
                 if t.frames_per_phase then self.config.frames_per_phase = tonumber(t.frames_per_phase) or 100 end
                 if t.perkeo_max_consumables then self.config.perkeo_max_consumables = tonumber(t.perkeo_max_consumables) or 10 end
                 if t.show_shop_prices ~= nil then self.config.show_shop_prices = (t.show_shop_prices == true) end
+                if t.card_selection_chance then self.config.card_selection_chance = tostring(t.card_selection_chance) end
 
                 -- Backwards compatibility: single 'roi' table
                 if t.roi and type(t.roi) == "table" and not t.rois then
