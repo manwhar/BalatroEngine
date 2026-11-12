@@ -24,12 +24,20 @@ from classifiers.common.dataset_sync import sync_mod_dataset
 
 
 def sync_dataset(clean: bool = False):
-    return sync_mod_dataset(
+    hand_count = sync_mod_dataset(
         source_subfolder="dataset",
         target_dataset_dir=TARGET_DATASET_DIR,
         labels_subdir_name="labels_card",
         clean=clean
     )
+    crops_count = sync_mod_dataset(
+        source_subfolder="dataset_card_crops",
+        target_dataset_dir=TARGET_DATASET_DIR / "shop_crops",
+        labels_subdir_name="labels",
+        clean=clean
+    )
+    print(f"[Card Dataset Sync] Synced {hand_count} hand frames and {crops_count} shop/pack card crops.")
+    return hand_count + crops_count
 
 
 if __name__ == "__main__":

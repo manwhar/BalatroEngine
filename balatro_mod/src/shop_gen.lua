@@ -317,6 +317,64 @@ function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_cent
     return card
 end
 
+-- Create a randomized playing card (Shop Magic Trick offering or Standard pack card)
+function G.DATASET_MOD:create_random_playing_card(area, spawn_x, spawn_y)
+    local base_card = self:get_random_card_center()
+    if not base_card then return nil end
+
+    local center = G.P_CENTERS.c_base
+    if math.random() < 0.10 and G.P_CENTERS['m_stone'] then
+        center = G.P_CENTERS['m_stone']
+    else
+        local enhancement = self:get_random_enhancement()
+        if enhancement and G.P_CENTERS[enhancement] then
+            center = G.P_CENTERS[enhancement]
+        end
+    end
+
+    local sx = spawn_x or (area.T.x + area.T.w / 2)
+    local sy = spawn_y or area.T.y
+
+    local card = Card(
+        sx, sy,
+        G.CARD_W, G.CARD_H,
+        base_card, center,
+        {
+            bypass_discovery_center = true,
+            bypass_discovery_ui = true,
+            bypass_back = G.GAME and G.GAME.selected_back and G.GAME.selected_back.pos
+        }
+    )
+
+    -- Force re-application of base card to guarantee sprite atlas is loaded (vanilla blank art fix)
+    if base_card and card.set_base then
+        card:set_base(base_card)
+    end
+
+    -- Edition: None, Foil, Holo, Polychrome
+    local edition = self:get_random_edition()
+    if edition then card:set_edition({[edition] = true}, true, true) end
+
+    -- Seal: Gold, Red, Blue, Purple
+    local seal = self:get_random_seal()
+    if seal then card:set_seal(seal, true, true) end
+
+    -- Debuff: ~5% chance
+    if math.random() < 0.05 then
+        if card.set_debuff then
+            card:set_debuff(true)
+        else
+            card.debuff = true
+        end
+    end
+
+    card.ability = card.ability or {}
+    card.ability.set = (center and center.set) or 'Enhanced'
+    card.custom_art_variant = "default"
+
+    return card
+end
+
 -- Create a voucher card
 function G.DATASET_MOD:create_random_voucher_card(area, forced_center, spawn_x, spawn_y)
     local vouchers = ShopGen.get_all_vouchers()
@@ -1180,7 +1238,7 @@ function G.DATASET_MOD:setup_shop_screen()
 
         local jokers, tarots, spectrals, planets = self:get_joker_pools()
 
-        -- Populate slots: 70% Joker, 10% Tarot, 10% Spectral, 10% Planet
+        -- Populate slots: 60% Joker, 15% Playing Card (Magic Trick / Illusion voucher), 10% Tarot, 8% Spectral, 7% Planet
         -- Note: Legendary jokers do NOT appear in the shop
         local non_leg_jokers = ShopGen.get_all_jokers(false)
         for i = 1, num_slots do
@@ -1191,7 +1249,7 @@ function G.DATASET_MOD:setup_shop_screen()
             local slot_x = G.shop_jokers.T.x + (G.shop_jokers.T.w - G.shop_jokers.card_w) * ((i - 1) / math.max(num_slots - 1, 1)) + 0.5 * (G.shop_jokers.card_w - G.CARD_W)
             local slot_y = G.shop_jokers.T.y + G.shop_jokers.T.h / 2 - G.CARD_H / 2
 
-            if roll < 0.70 then
+            if roll < 0.60 then
                 card_type = 'Joker'
                 local chosen_center = nil
                 if #non_leg_jokers > 0 then
@@ -1209,11 +1267,14 @@ function G.DATASET_MOD:setup_shop_screen()
                     end
                 end
                 card = self:create_random_joker_card(G.shop_jokers, chosen_center, false, slot_x, slot_y)
+            elseif roll < 0.75 then
+                card_type = 'PlayingCard'
+                card = self:create_random_playing_card(G.shop_jokers, slot_x, slot_y)
             else
                 local pool
-                if roll < 0.80 then
+                if roll < 0.85 then
                     card_type = 'Tarot'; pool = tarots
-                elseif roll < 0.90 then
+                elseif roll < 0.93 then
                     card_type = 'Spectral'; pool = spectrals
                 else
                     card_type = 'Planet'; pool = planets
@@ -1438,18 +1499,19 @@ function G.DATASET_MOD:setup_pack_screen()
         prune_engine_tables()
     end
 
-    -- 80% Buffoon pack, 20% evenly split between Tarot (Arcana), Spectral, and Planet (Celestial)
+    -- 50% Buffoon pack, 15% Standard pack, 15% Arcana, 10% Celestial, 10% Spectral
     local pack_roll = math.random()
     local pack_kind = 'Buffoon'
-    if pack_roll >= 0.80 then
-        local sub_roll = math.random()
-        if sub_roll < 0.333 then
-            pack_kind = 'Arcana'
-        elseif sub_roll < 0.666 then
-            pack_kind = 'Spectral'
-        else
-            pack_kind = 'Celestial'
-        end
+    if pack_roll < 0.50 then
+        pack_kind = 'Buffoon'
+    elseif pack_roll < 0.65 then
+        pack_kind = 'Standard'
+    elseif pack_roll < 0.80 then
+        pack_kind = 'Arcana'
+    elseif pack_roll < 0.90 then
+        pack_kind = 'Celestial'
+    else
+        pack_kind = 'Spectral'
     end
     self.current_pack_kind = pack_kind
 
@@ -1514,6 +1576,14 @@ function G.DATASET_MOD:setup_pack_screen()
         pool = {}
         for _, c in ipairs(base_planets) do table.insert(pool, c) end
         if black_hole_center then table.insert(pool, black_hole_center) end
+    elseif pack_kind == 'Standard' then
+        -- Standard Pack: 3 (Normal), 5 (Jumbo/Mega)
+        self.standard_size_cycle = (self.standard_size_cycle == 3) and 5 or 3
+        pack_size = self.standard_size_cycle
+        uibox_fn = create_UIBox_standard_pack
+        pack_state = G.STATES.STANDARD_PACK
+        card_type = 'PlayingCard'
+        pool = nil
     end
 
     G.GAME.pack_size = pack_size
@@ -1560,6 +1630,8 @@ function G.DATASET_MOD:setup_pack_screen()
             local card
             if card_type == 'Joker' then
                 card = self:create_random_joker_card(G.pack_cards, chosen_center, false, slot_x, slot_y)
+            elseif card_type == 'PlayingCard' then
+                card = self:create_random_playing_card(G.pack_cards, slot_x, slot_y)
             else
                 local set_name = (chosen_center and chosen_center.set) or card_type
                 card = self:create_random_consumable_card(G.pack_cards, set_name, chosen_center, slot_x, slot_y)

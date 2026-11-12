@@ -75,6 +75,21 @@ class CardCropDataset(Dataset):
             if img_path.exists():
                 valid_frames.append((img_path, jf))
 
+        # Also discover shop & pack playing card crops (from self.data_root / "shop_crops")
+        shop_crops_dir = self.data_root / "shop_crops"
+        if shop_crops_dir.exists():
+            shop_images = shop_crops_dir / "images"
+            shop_labels = shop_crops_dir / "labels_json"
+            if not shop_labels.exists():
+                shop_labels = shop_crops_dir / "labels"
+            if shop_labels.exists() and shop_images.exists():
+                for jf in sorted(list(shop_labels.glob("*.json"))):
+                    img_path = shop_images / f"{jf.stem}.png"
+                    if not img_path.exists():
+                        img_path = shop_images / f"{jf.stem}.jpg"
+                    if img_path.exists():
+                        valid_frames.append((img_path, jf))
+
         # 2. Split by frame to prevent data leakage between train and val
         rng = random.Random(seed)
         shuffled = list(valid_frames)
@@ -121,13 +136,15 @@ class CardCropDataset(Dataset):
             with Image.open(item["img_path"]) as full_img:
                 full_img = full_img.convert("RGB")
                 px, py, pw, ph = item["box_pixel"]
-                # Safeguard against out-of-bound coords
                 iw, ih = full_img.size
-                x1 = max(0, min(iw - 1, px))
-                y1 = max(0, min(ih - 1, py))
-                x2 = max(x1 + 1, min(iw, x1 + pw))
-                y2 = max(y1 + 1, min(ih, y1 + ph))
-                crop = full_img.crop((x1, y1, x2, y2))
+                if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+                    crop = full_img.copy()
+                else:
+                    x1 = max(0, min(iw - 1, px))
+                    y1 = max(0, min(ih - 1, py))
+                    x2 = max(x1 + 1, min(iw, x1 + pw))
+                    y2 = max(y1 + 1, min(ih, y1 + ph))
+                    crop = full_img.crop((x1, y1, x2, y2))
         except Exception:
             crop = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (128, 128, 128))
 

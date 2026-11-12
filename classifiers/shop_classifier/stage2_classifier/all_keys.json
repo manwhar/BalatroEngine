@@ -1,5 +1,4 @@
 [
-  "unknown",
   "c_ankh",
   "c_aura",
   "c_black_hole",
@@ -261,6 +260,8 @@
   "p_standard_normal_2",
   "p_standard_normal_3",
   "p_standard_normal_4",
+  "playing_card",
+  "unknown",
   "v_antimatter",
   "v_blank",
   "v_clearance_sale",

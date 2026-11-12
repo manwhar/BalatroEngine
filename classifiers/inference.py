@@ -386,9 +386,11 @@ def batch_recognize_shops(
                 verbose=False
             )
 
-            # Collect Stage 2 crops across the chunk
+            # Collect Stage 2 crops across the chunk, separating regular items and playing cards
             all_stage2_tensors = []
-            item_metadata = []  # (frame_idx_in_all, box, card_type, det_conf)
+            shop_metadata = []        # (global_idx, box, card_type, det_conf)
+            playing_card_crops = []
+            card_metadata = []        # (global_idx, box, card_type, det_conf)
 
             for local_idx, det in enumerate(det_results):
                 global_idx = chunk_indices[local_idx]
@@ -410,23 +412,39 @@ def batch_recognize_shops(
                     y2 = max(y1 + 1, min(ih, int(round(b[3]))))
 
                     crop = cur_pil.crop((x1, y1, x2, y2))
-                    all_stage2_tensors.append(pipeline.transform(crop))
-                    item_metadata.append((
-                        global_idx,
-                        [x1, y1, x2, y2],
-                        pipeline.class_names.get(int(c_id), "Joker"),
-                        float(conf)
-                    ))
+                    c_type = pipeline.class_names.get(int(c_id), "Joker")
+                    if c_type == "PlayingCard":
+                        playing_card_crops.append(crop)
+                        card_metadata.append((
+                            global_idx,
+                            [x1, y1, x2, y2],
+                            c_type,
+                            float(conf)
+                        ))
+                    else:
+                        all_stage2_tensors.append(pipeline.transform(crop))
+                        shop_metadata.append((
+                            global_idx,
+                            [x1, y1, x2, y2],
+                            c_type,
+                            float(conf)
+                        ))
 
-            # Batch Stage 2 MobileNet inference
+            # Batch Stage 2 MobileNet inference for shop items
             attr_preds = []
             if all_stage2_tensors:
                 batched_tensor = torch.stack(all_stage2_tensors).to(pipeline.device)
                 with torch.no_grad():
                     attr_preds = pipeline.classifier.predict_attributes(batched_tensor)
 
-            # Distribute items back into their respective frame output
-            for (g_idx, box, card_type, det_conf), attrs in zip(item_metadata, attr_preds):
+            # Classify playing cards via CardRecognitionPipeline
+            card_preds = []
+            if playing_card_crops:
+                card_pipe = get_card_pipeline(device=device)
+                card_preds = card_pipe.classify_crops(playing_card_crops)
+
+            # Distribute regular shop items back into their respective frame output
+            for (g_idx, box, card_type, det_conf), attrs in zip(shop_metadata, attr_preds):
                 item_res = ShopItemResult(
                     index=0,  # Ordered below
                     card_type=card_type,
@@ -445,7 +463,8 @@ def batch_recognize_shops(
                         "perishable": attrs["perishable_conf"],
                         "rental": attrs["rental_conf"],
                         "debuffed": attrs["debuffed_conf"],
-                    }
+                    },
+                    card_details=None
                 )
 
                 out_obj = outputs[g_idx]
@@ -461,6 +480,32 @@ def batch_recognize_shops(
                     out_obj.boosters.append(item_res)
                 elif shelf_key == "pack":
                     out_obj.pack_items.append(item_res)
+
+            # Distribute playing cards back into their respective frame output
+            for (g_idx, box, card_type, det_conf), c_res in zip(card_metadata, card_preds):
+                card_key = f"{c_res.rank} of {c_res.suit}" if c_res.rank != "Stone" else "Stone Card"
+                item_res = ShopItemResult(
+                    index=0,
+                    card_type=card_type,
+                    key=card_key,
+                    edition=c_res.edition,
+                    eternal=False,
+                    perishable=False,
+                    rental=False,
+                    debuffed=c_res.debuffed,
+                    box=box,
+                    confidences={
+                        "detection": det_conf,
+                        **c_res.confidences
+                    },
+                    card_details=c_res
+                )
+
+                out_obj = outputs[g_idx]
+                if shelf_key == "pack":
+                    out_obj.pack_items.append(item_res)
+                else:
+                    out_obj.shop_items.append(item_res)
 
         # Sort items in each shelf left-to-right
         for out_obj in outputs:

@@ -231,6 +231,7 @@ class ShopCardsResult(list):
         packs: list[BoosterPack] | None = None,
         joker_bar: list[Joker] | None = None,
         consumables: list[Any] | None = None,
+        pack_cards: list[Any] | None = None,
         raw_output: Any = None,
     ) -> None:
         super().__init__(cards)
@@ -239,6 +240,7 @@ class ShopCardsResult(list):
         self.packs = packs or []
         self.joker_bar = joker_bar or []
         self.consumables = consumables or []
+        self.pack_cards = pack_cards or []
         self.raw_output = raw_output
 
 
@@ -481,6 +483,44 @@ def _convert_shop_item_result(item: Any) -> Any:
             sp_name = _SPECTRAL_LOOKUP.get(clean_key, SpectralName.FAMILIAR)
             return Spectral(name=sp_name, edition=ed)
 
+    # 5. Playing Card (from Standard pack or Shop Magic Trick / Illusion voucher)
+    if card_type in ("PlayingCard", "playing_card") or getattr(item, "card_details", None) is not None:
+        details = getattr(item, "card_details", None)
+        if details is not None:
+            r_str = getattr(details, "rank", "None")
+            s_str = getattr(details, "suit", "None")
+            enh_str = getattr(details, "enhancement", "None")
+            ed_str = getattr(details, "edition", edition_str)
+            seal_str = getattr(details, "seal", "None")
+            p_debuffed = bool(getattr(details, "debuffed", debuffed))
+        else:
+            r_str = "None"
+            s_str = "None"
+            enh_str = "None"
+            ed_str = edition_str
+            seal_str = "None"
+            p_debuffed = debuffed
+
+        rank = _RANK_MAP.get(r_str, Rank.NONE)
+        suit = _SUIT_MAP.get(s_str.lower(), Suit.NONE)
+        enh = _ENHANCEMENT_MAP.get(enh_str.lower(), Enhancement.NONE)
+        ed = _EDITION_MAP.get(ed_str.lower(), Edition.NONE)
+        seal = _SEAL_MAP.get(seal_str.lower(), Seal.NONE)
+
+        if r_str == "Stone" or enh == Enhancement.STONE:
+            rank = Rank.NONE
+            suit = Suit.NONE
+            enh = Enhancement.STONE
+
+        return PlayingCard(
+            rank=rank,
+            suit=suit,
+            enhancement=enh,
+            edition=ed,
+            seal=seal,
+            debuffed=p_debuffed,
+        )
+
     # Fallback to generic Joker
     return Joker(name=JokerName.JOKER, edition=ed)
 
@@ -604,6 +644,10 @@ def cv_detect_shop_cards(
         for item in rec_output.consumeables
         if isinstance(_convert_shop_item_result(item), (Tarot, Planet, Spectral))
     ]
+    pack_items = [
+        _convert_shop_item_result(item)
+        for item in rec_output.pack_items
+    ] if hasattr(rec_output, "pack_items") and rec_output.pack_items else []
 
     return ShopCardsResult(
         cards=shop_cards,
@@ -611,6 +655,7 @@ def cv_detect_shop_cards(
         packs=packs,
         joker_bar=jokers,
         consumables=consumables,
+        pack_cards=pack_items,
         raw_output=rec_output,
     )
 

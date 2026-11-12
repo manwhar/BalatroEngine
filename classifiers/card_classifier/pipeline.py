@@ -283,3 +283,55 @@ class CardRecognitionPipeline:
         if return_timing:
             return results, timings
         return results
+
+    def classify_crops(self, pil_crops: list[Image.Image], boxes: list[list[int]] | None = None) -> list[CardResult]:
+        """
+        Runs Stage 2 multi-head card classifier directly on pre-cropped card images.
+        Bypasses Stage 1 YOLO detection entirely.
+        """
+        if not pil_crops:
+            return []
+
+        crop_tensors = [self.crop_transform(c.convert("RGB")) for c in pil_crops]
+        batched_crops = torch.stack(crop_tensors, dim=0).to(self.device)
+
+        with torch.no_grad():
+            preds = self.classifier.predict_attributes(batched_crops)
+
+        results = []
+        for i in range(len(pil_crops)):
+            rank = IDX_TO_RANK.get(preds["rank_idx"][i].item(), "Unknown")
+            suit = IDX_TO_SUIT.get(preds["suit_idx"][i].item(), "Unknown")
+            edition = IDX_TO_EDITION.get(preds["edition_idx"][i].item(), "None")
+            enhancement = IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][i].item(), "None")
+            seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
+            debuffed = bool(preds["debuffed"][i].item()) if "debuffed" in preds else False
+            face_down = bool(preds["face_down"][i].item()) if "face_down" in preds else False
+
+            confs = {
+                "rank": float(preds["rank_conf"][i].item()),
+                "suit": float(preds["suit_conf"][i].item()),
+                "edition": float(preds["edition_conf"][i].item()),
+                "enhancement": float(preds["enhancement_conf"][i].item()),
+                "seal": float(preds["seal_conf"][i].item()),
+                "selected": 1.0,
+                "debuffed": float(preds["debuffed_conf"][i].item()) if "debuffed_conf" in preds else 1.0,
+                "face_down": float(preds["face_down_conf"][i].item()) if "face_down_conf" in preds else 1.0
+            }
+
+            b = boxes[i] if boxes and i < len(boxes) else [0, 0, pil_crops[i].width, pil_crops[i].height]
+            results.append(CardResult(
+                index=i + 1,
+                rank=rank,
+                suit=suit,
+                edition=edition,
+                enhancement=enhancement,
+                seal=seal,
+                selected=False,
+                debuffed=debuffed,
+                face_down=face_down,
+                box=b,
+                confidences=confs
+            ))
+
+        return results

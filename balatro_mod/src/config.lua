@@ -65,7 +65,10 @@ function Config.init_directories()
         "Mods/gamestate_dataset_cv/dataset/labels",
         "Mods/gamestate_dataset_cv/dataset_shop",
         "Mods/gamestate_dataset_cv/dataset_shop/images",
-        "Mods/gamestate_dataset_cv/dataset_shop/labels"
+        "Mods/gamestate_dataset_cv/dataset_shop/labels",
+        "Mods/gamestate_dataset_cv/dataset_card_crops",
+        "Mods/gamestate_dataset_cv/dataset_card_crops/images",
+        "Mods/gamestate_dataset_cv/dataset_card_crops/labels"
     }
     for _, dir in ipairs(dirs) do
         love.filesystem.createDirectory(dir)
@@ -112,10 +115,8 @@ end
 
 function Config.init_classes(mod)
     local shop_classes_path = "Mods/gamestate_dataset_cv/dataset_shop/classes.txt"
-    if not love.filesystem.getInfo(shop_classes_path) then
-        local shop_classes = "Joker\nTarot\nSpectral\nPlanet\n"
-        love.filesystem.write(shop_classes_path, shop_classes)
-    end
+    local shop_classes = "Joker\nTarot\nSpectral\nPlanet\nVoucher\nBooster\nPlayingCard\n"
+    love.filesystem.write(shop_classes_path, shop_classes)
 end
 
 function Config.clear_all_dataset_data(mod)
@@ -123,7 +124,9 @@ function Config.clear_all_dataset_data(mod)
         "Mods/gamestate_dataset_cv/dataset/images",
         "Mods/gamestate_dataset_cv/dataset/labels",
         "Mods/gamestate_dataset_cv/dataset_shop/images",
-        "Mods/gamestate_dataset_cv/dataset_shop/labels"
+        "Mods/gamestate_dataset_cv/dataset_shop/labels",
+        "Mods/gamestate_dataset_cv/dataset_card_crops/images",
+        "Mods/gamestate_dataset_cv/dataset_card_crops/labels"
     }
     local removed_count = 0
     for _, dir in ipairs(dirs) do

@@ -79,6 +79,7 @@ names:
   3: Planet
   4: Voucher
   5: Booster
+  6: PlayingCard
 """
     with open(DATA_YAML, "w", encoding="utf-8") as f:
         f.write(yaml_content)

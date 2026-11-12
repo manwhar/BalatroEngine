@@ -36,8 +36,8 @@ except ImportError:
 @dataclass
 class ShopItemResult:
     index: int
-    card_type: str  # 'Joker', 'Tarot', 'Spectral', 'Planet'
-    key: str        # 'j_blueprint', 'c_fool', etc.
+    card_type: str  # 'Joker', 'Tarot', 'Spectral', 'Planet', 'Voucher', 'Booster', 'PlayingCard'
+    key: str        # 'j_blueprint', 'c_fool', 'King of Hearts', etc.
     edition: str    # 'None', 'Foil', 'Holo', 'Polychrome', 'Negative'
     eternal: bool
     perishable: bool
@@ -45,9 +45,13 @@ class ShopItemResult:
     debuffed: bool
     box: list[int]  # [x1, y1, x2, y2]
     confidences: dict[str, float]
+    card_details: Any = None
 
     @property
     def display_name(self) -> str:
+        if self.card_type == "PlayingCard" and self.card_details is not None:
+            return getattr(self.card_details, "display_name", f"Playing Card ({self.key})")
+
         parts = []
         if self.debuffed:
             parts.append("[DEBUFFED]")
@@ -71,12 +75,13 @@ class ShopItemResult:
 
 
 class ShopRecognitionPipeline:
-    def __init__(self, detector_path=None, classifier_path=None, backbone="mobilenet_v3_small", device=None):
+    def __init__(self, detector_path=None, classifier_path=None, backbone="mobilenet_v3_small", device=None, card_pipeline=None):
         if device is None:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
+        self.card_pipeline = card_pipeline
         detector_path = Path(detector_path) if detector_path else WEIGHTS_DIR / "detector_best.pt"
         classifier_path = Path(classifier_path) if classifier_path else WEIGHTS_DIR / "classifier_best.pt"
 
@@ -107,7 +112,8 @@ class ShopRecognitionPipeline:
             2: "Spectral",
             3: "Planet",
             4: "Voucher",
-            5: "Booster"
+            5: "Booster",
+            6: "PlayingCard"
         }
 
     def predict(self, image_input, conf_threshold=0.35, iou_threshold=0.45) -> list[ShopItemResult]:
@@ -155,10 +161,14 @@ class ShopRecognitionPipeline:
         # Sort items strictly left-to-right by horizontal coordinate x1
         boxes_with_info.sort(key=lambda item: item[0][0])
 
-        # 2. Stage 2 Multi-Head Classification
-        crop_tensors = []
+        # Separate regular shop items and playing cards
+        shop_indices = []
+        shop_crop_tensors = []
+        playing_card_indices = []
+        playing_card_crops = []
+
         iw, ih = pil_img.size
-        for box, _, _ in boxes_with_info:
+        for i, (box, card_type, det_conf) in enumerate(boxes_with_info):
             x1, y1, x2, y2 = box
             x1 = max(0, min(iw - 1, x1))
             y1 = max(0, min(ih - 1, y1))
@@ -166,33 +176,93 @@ class ShopRecognitionPipeline:
             y2 = max(y1 + 1, min(ih, y2))
 
             crop = pil_img.crop((x1, y1, x2, y2))
-            crop_tensors.append(self.transform(crop))
+            if card_type == "PlayingCard":
+                playing_card_indices.append(i)
+                playing_card_crops.append(crop)
+            else:
+                shop_indices.append(i)
+                shop_crop_tensors.append(self.transform(crop))
 
-        batch_tensor = torch.stack(crop_tensors).to(self.device)
-        attr_predictions = self.classifier.predict_attributes(batch_tensor)
+        item_predictions = {}
+        if shop_crop_tensors:
+            batch_tensor = torch.stack(shop_crop_tensors).to(self.device)
+            attr_preds = self.classifier.predict_attributes(batch_tensor)
+            for idx, attrs in zip(shop_indices, attr_preds):
+                item_predictions[idx] = attrs
 
-        # 3. Assemble Output Results
+        card_predictions = {}
+        if playing_card_crops:
+            if self.card_pipeline is None:
+                try:
+                    from classifiers.inference import get_card_pipeline
+                    self.card_pipeline = get_card_pipeline(device=str(self.device))
+                except Exception as e:
+                    print(f"[Pipeline Warning] Could not load CardRecognitionPipeline: {e}")
+
+            if self.card_pipeline and hasattr(self.card_pipeline, "classify_crops"):
+                card_boxes = [boxes_with_info[idx][0] for idx in playing_card_indices]
+                card_results = self.card_pipeline.classify_crops(playing_card_crops, boxes=card_boxes)
+                for idx, c_res in zip(playing_card_indices, card_results):
+                    card_predictions[idx] = c_res
+
+        # 3. Assemble Output Results in original sorted left-to-right order
         results = []
-        for idx, ((box, card_type, det_conf), attrs) in enumerate(zip(boxes_with_info, attr_predictions)):
-            results.append(ShopItemResult(
-                index=idx,
-                card_type=card_type,
-                key=attrs["key"],
-                edition=attrs["edition"],
-                eternal=attrs["eternal"],
-                perishable=attrs["perishable"],
-                rental=attrs["rental"],
-                debuffed=attrs["debuffed"],
-                box=box,
-                confidences={
-                    "detection": det_conf,
-                    "key": attrs["key_conf"],
-                    "edition": attrs["edition_conf"],
-                    "eternal": attrs["eternal_conf"],
-                    "perishable": attrs["perishable_conf"],
-                    "rental": attrs["rental_conf"],
-                    "debuffed": attrs["debuffed_conf"],
-                }
-            ))
+        for idx, (box, card_type, det_conf) in enumerate(boxes_with_info):
+            if card_type == "PlayingCard":
+                c_res = card_predictions.get(idx)
+                if c_res is not None:
+                    card_key = f"{c_res.rank} of {c_res.suit}" if c_res.rank != "Stone" else "Stone Card"
+                    edition = c_res.edition
+                    debuffed = c_res.debuffed
+                    conf_dict = {"detection": det_conf, **c_res.confidences}
+                    card_det = c_res
+                else:
+                    card_key = "playing_card"
+                    edition = "None"
+                    debuffed = False
+                    conf_dict = {"detection": det_conf}
+                    card_det = None
+
+                results.append(ShopItemResult(
+                    index=idx,
+                    card_type=card_type,
+                    key=card_key,
+                    edition=edition,
+                    eternal=False,
+                    perishable=False,
+                    rental=False,
+                    debuffed=debuffed,
+                    box=box,
+                    confidences=conf_dict,
+                    card_details=card_det
+                ))
+            else:
+                attrs = item_predictions.get(idx, {
+                    "key": "unknown", "edition": "None", "eternal": False,
+                    "perishable": False, "rental": False, "debuffed": False,
+                    "key_conf": 0.0, "edition_conf": 0.0, "eternal_conf": 0.0,
+                    "perishable_conf": 0.0, "rental_conf": 0.0, "debuffed_conf": 0.0
+                })
+                results.append(ShopItemResult(
+                    index=idx,
+                    card_type=card_type,
+                    key=attrs["key"],
+                    edition=attrs["edition"],
+                    eternal=attrs["eternal"],
+                    perishable=attrs["perishable"],
+                    rental=attrs["rental"],
+                    debuffed=attrs["debuffed"],
+                    box=box,
+                    confidences={
+                        "detection": det_conf,
+                        "key": attrs["key_conf"],
+                        "edition": attrs["edition_conf"],
+                        "eternal": attrs["eternal_conf"],
+                        "perishable": attrs["perishable_conf"],
+                        "rental": attrs["rental_conf"],
+                        "debuffed": attrs["debuffed_conf"],
+                    },
+                    card_details=None
+                ))
 
         return results

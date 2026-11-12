@@ -281,7 +281,11 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
         ['Spectral'] = 2,
         ['Planet'] = 3,
         ['Voucher'] = 4,
-        ['Booster'] = 5
+        ['Booster'] = 5,
+        ['PlayingCard'] = 6,
+        ['Default'] = 6,
+        ['Enhanced'] = 6,
+        ['Base'] = 6
     }
 
     if card_list then
@@ -293,13 +297,20 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
                 if clamped[1] then
                     local nx, ny, nw, nh = to_yolo(roi, clamped[1], clamped[2], clamped[3], clamped[4])
 
-                    local card_type = (card.ability and card.ability.set) or (card.config and card.config.center and card.config.center.set) or "Joker"
+                    local is_playing_card = (card.base ~= nil) or (card.ability and (card.ability.set == 'Default' or card.ability.set == 'Enhanced')) or (card.config and card.config.center and (card.config.center.set == 'Default' or card.config.center.set == 'Enhanced'))
+                    local card_type = is_playing_card and "PlayingCard" or ((card.ability and card.ability.set) or (card.config and card.config.center and card.config.center.set) or "Joker")
                     local class_id = class_id_map[card_type] or 0
 
                     table.insert(yolo_labels, string.format("%d %.6f %.6f %.6f %.6f", class_id, nx, ny, nw, nh))
 
                     local name = (card.config and card.config.center and card.config.center.name) or "Unknown"
+                    if is_playing_card and card.base then
+                        name = tostring(card.base.value or "") .. " of " .. tostring(card.base.suit or "")
+                    end
                     local key = (card.config and card.config.center and card.config.center.key) or "unknown"
+                    if is_playing_card and card.base then
+                        key = tostring(card.base.suit or "") .. "_" .. tostring(card.base.value or "")
+                    end
                     local rarity = get_rarity_str(card)
                     local edition = get_edition_str(card)
                     local is_negative = (card.edition and card.edition.negative == true) or (card.ability and card.ability.negative == true)
@@ -316,6 +327,77 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
                         json_escape(art_variant),
                         nx, ny, nw, nh, clamped[1] - roi.x, clamped[2] - roi.y, clamped[3], clamped[4]
                     ))
+
+                    -- If playing card in shop or pack, also export cropped card sub-region to dataset_card_crops
+                    if is_playing_card and img then
+                        local cx1 = math.max(0, math.floor(min_x))
+                        local cy1 = math.max(0, math.floor(min_y))
+                        local cx2 = math.min(img:getWidth(), math.ceil(min_x + bw))
+                        local cy2 = math.min(img:getHeight(), math.ceil(min_y + bh))
+                        local cw = math.max(1, cx2 - cx1)
+                        local ch = math.max(1, cy2 - cy1)
+
+                        local card_crop = love.image.newImageData(cw, ch)
+                        card_crop:paste(img, 0, 0, cx1, cy1, cw, ch)
+                        local crop_data = card_crop:encode("png")
+
+                        local crop_filename = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/images/crop_%04d_%s_%d.png", current_frame, file_suffix, idx)
+                        love.filesystem.write(crop_filename, crop_data)
+                        if crop_data and crop_data.release then crop_data:release() end
+                        if card_crop and card_crop.release then card_crop:release() end
+
+                        local p_rank = "None"
+                        local p_suit = "None"
+                        local p_edition = "None"
+                        local p_enhancement = "None"
+                        local p_seal = "None"
+                        local p_debuffed = (card.debuff == true)
+                        local p_face_down = (card.facing == 'back' or card.sprite_facing == 'back')
+
+                        if not p_face_down then
+                            if card.config.center and card.config.center.name == "Stone Card" then
+                                p_rank = "Stone"
+                                p_suit = "None"
+                            elseif card.base then
+                                p_rank = tostring(card.base.value or "None")
+                                p_suit = tostring(card.base.suit or "None")
+                            end
+
+                            if card.edition then
+                                if card.edition.foil then p_edition = "Foil"
+                                elseif card.edition.holo then p_edition = "Holo"
+                                elseif card.edition.polychrome then p_edition = "Polychrome"
+                                elseif card.edition.negative then p_edition = "Negative"
+                                end
+                            end
+
+                            if card.config.center and card.config.center.name ~= "Default Base" and card.config.center.name ~= "Stone Card" then
+                                p_enhancement = string.gsub(card.config.center.name, " Card", "")
+                                p_enhancement = string.gsub(p_enhancement, " ", "")
+                            elseif card.config.center and card.config.center.name == "Stone Card" then
+                                p_enhancement = "Stone"
+                            end
+
+                            p_seal = card.seal or "None"
+                        end
+
+                        local p_selected = card.highlighted and true or false
+                        local p_card_skin = "None"
+                        local p_is_suit_hc = false
+                        if p_suit ~= "None" and not p_face_down then
+                            p_card_skin = (G.SETTINGS.CUSTOM_DECK and G.SETTINGS.CUSTOM_DECK.Collabs and G.SETTINGS.CUSTOM_DECK.Collabs[p_suit]) or "default"
+                            p_is_suit_hc = (G.SETTINGS.colour_palettes and G.SETTINGS.colour_palettes[p_suit] == "hc") or false
+                        end
+
+                        local crop_json_content = string.format(
+                            '[\n  {"card_index": %d, "box_yolo": [0.5, 0.5, 1.0, 1.0], "box_pixel": [0, 0, %d, %d], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "debuffed": %s, "face_down": %s, "skin": "%s", "high_contrast": %s}\n]\n',
+                            idx, cw, ch,
+                            p_rank, p_suit, p_edition, p_enhancement, p_seal, p_selected and "true" or "false", p_debuffed and "true" or "false", p_face_down and "true" or "false",
+                            json_escape(p_card_skin), p_is_suit_hc and "true" or "false"
+                        )
+                        local crop_json_path = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/labels/crop_%04d_%s_%d.json", current_frame, file_suffix, idx)
+                        love.filesystem.write(crop_json_path, crop_json_content)
+                    end
                 end
             end
         end
