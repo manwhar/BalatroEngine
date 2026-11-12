@@ -46,7 +46,7 @@ def process_actions(d: dict[str, dict[str, int]]):
         # Action-specific offsets
         A.PLAY_HAND: 0,
         A.DISCARD: 0,
-        A.BUY_CARD: -2,
+        A.BUY_CARD: 0,
         A.BUY_AND_USE: -2,
         A.OPEN_PACK: -2,
         A.USE_IN_PACK: -2,

@@ -395,7 +395,7 @@ function G.DATASET_MOD:create_random_booster_card(area, forced_center, spawn_x, 
     return card
 end
 
--- Helper to attach shop card price tag synchronously without queuing delayed events in G.E_MANAGER
+-- Helper to attach shop card price tag and action buttons synchronously without queuing delayed events in G.E_MANAGER
 local function attach_shop_card_ui_sync(card)
     if not card then return end
     if card.set_cost then card:set_cost() end
@@ -403,6 +403,14 @@ local function attach_shop_card_ui_sync(card)
     if card.children and card.children.price then
         pcall(function() card.children.price:remove() end)
         card.children.price = nil
+    end
+    if card.children and card.children.buy_button then
+        pcall(function() card.children.buy_button:remove() end)
+        card.children.buy_button = nil
+    end
+    if card.children and card.children.buy_and_use_button then
+        pcall(function() card.children.buy_and_use_button:remove() end)
+        card.children.buy_and_use_button = nil
     end
 
     local t1 = {
@@ -431,6 +439,67 @@ local function attach_shop_card_ui_sync(card)
         card.children.price.alignment.offset.y = target_offset_y
         if card.children.price.align_to_major then card.children.price:align_to_major() end
         if card.children.price.hard_set_VT then card.children.price:hard_set_VT() end
+    end
+
+    local t2 = (card.ability and card.ability.set == 'Voucher') and {
+        n=G.UIT.ROOT, config = {ref_table = card, minw = 1.1, maxw = 1.3, padding = 0.1, align = 'bm', colour = G.C.GREEN, shadow = true, r = 0.08, minh = 0.94, func = 'can_redeem', one_press = true, button = 'redeem_from_shop', hover = true}, nodes={
+            {n=G.UIT.T, config={text = localize('b_redeem'), colour = G.C.WHITE, scale = 0.4}}
+        }
+    } or (card.ability and card.ability.set == 'Booster') and {
+        n=G.UIT.ROOT, config = {ref_table = card, minw = 1.1, maxw = 1.3, padding = 0.1, align = 'bm', colour = G.C.GREEN, shadow = true, r = 0.08, minh = 0.94, func = 'can_open', one_press = true, button = 'open_booster', hover = true}, nodes={
+            {n=G.UIT.T, config={text = localize('b_open'), colour = G.C.WHITE, scale = 0.5}}
+        }
+    } or {
+        n=G.UIT.ROOT, config = {ref_table = card, minw = 1.1, maxw = 1.3, padding = 0.1, align = 'bm', colour = G.C.GOLD, shadow = true, r = 0.08, minh = 0.94, func = 'can_buy', one_press = true, button = 'buy_from_shop', hover = true}, nodes={
+            {n=G.UIT.T, config={text = localize('b_buy'), colour = G.C.WHITE, scale = 0.5}}
+        }
+    }
+
+    card.children.buy_button = UIBox{
+        definition = t2,
+        config = {
+            align = "bm",
+            offset = {x=0, y=-0.3},
+            major = card,
+            bond = 'Weak',
+            parent = card
+        }
+    }
+    if card.children.buy_button then
+        card.children.buy_button.states.visible = false
+        if card.children.buy_button.align_to_major then card.children.buy_button:align_to_major() end
+        if card.children.buy_button.hard_set_VT then card.children.buy_button:hard_set_VT() end
+    end
+
+    if card.ability and card.ability.consumeable then
+        local t3 = {
+            n=G.UIT.ROOT, config = {id = 'buy_and_use', ref_table = card, minh = 1.1, padding = 0.1, align = 'cr', colour = G.C.RED, shadow = true, r = 0.08, minw = 1.1, func = 'can_buy_and_use', one_press = true, button = 'buy_from_shop', hover = true, focus_args = {type = 'none'}}, nodes={
+                {n=G.UIT.B, config = {w=0.1, h=0.6}},
+                {n=G.UIT.C, config = {align = 'cm'}, nodes={
+                    {n=G.UIT.R, config = {align = 'cm', maxw = 1}, nodes={
+                        {n=G.UIT.T, config={text = localize('b_buy'), colour = G.C.WHITE, scale = 0.5}}
+                    }},
+                    {n=G.UIT.R, config = {align = 'cm', maxw = 1}, nodes={
+                        {n=G.UIT.T, config={text = localize('b_and_use'), colour = G.C.WHITE, scale = 0.3}}
+                    }},
+                }} 
+            }
+        }
+        card.children.buy_and_use_button = UIBox{
+            definition = t3,
+            config = {
+                align = "cr",
+                offset = {x=-0.3, y=0},
+                major = card,
+                bond = 'Weak',
+                parent = card
+            }
+        }
+        if card.children.buy_and_use_button then
+            card.children.buy_and_use_button.states.visible = false
+            if card.children.buy_and_use_button.align_to_major then card.children.buy_and_use_button:align_to_major() end
+            if card.children.buy_and_use_button.hard_set_VT then card.children.buy_and_use_button:hard_set_VT() end
+        end
     end
 end
 
@@ -572,6 +641,16 @@ function ShopGen.cleanup_cycle()
     collectgarbage("collect")
 end
 
+local function snap_ui_node(n)
+    if not n then return end
+    if n.hard_set_VT then n:hard_set_VT() end
+    if n.children then
+        for _, c in pairs(n.children) do
+            snap_ui_node(c)
+        end
+    end
+end
+
 -- Helper to immediately snap cards and areas to avoid easing/sliding delays and eliminate tilt/rotation
 local function snap_card_area(area)
     if not area then return end
@@ -606,6 +685,7 @@ local function snap_card_area(area)
                         if child.align_to_major then child:align_to_major() end
                         if child.hard_set_VT then child:hard_set_VT() end
                         if child.VT then child.VT.r = 0 end
+                        if child.UIRoot then snap_ui_node(child.UIRoot) end
                     end
                 end
             end
@@ -781,6 +861,246 @@ function G.DATASET_MOD:populate_consumables_area()
 
     if G.consumeables.align_cards then
         G.consumeables:align_cards()
+    end
+end
+
+-- =========================================================
+-- CARD SELECTION & BUTTON STATE SIMULATION
+-- =========================================================
+local BUTTON_STATES = {"Normal", "Hovered", "Clicked", "Grayed Out"}
+
+local function collect_button_nodes(node, list)
+    if not node then return end
+    if node.config and (node.config.button or (node.config.func and (
+        node.config.func:find('buy') or node.config.func:find('sell') or 
+        node.config.func:find('use') or node.config.func:find('select') or 
+        node.config.func:find('redeem') or node.config.func:find('open')
+    ))) then
+        table.insert(list, node)
+        return
+    end
+    if node.children then
+        for _, child in pairs(node.children) do
+            collect_button_nodes(child, list)
+        end
+    end
+end
+
+local function collect_text_nodes(node, list)
+    if not node then return end
+    if node.UIT == G.UIT.T or (node.config and node.config.text_drawable) then
+        table.insert(list, node)
+    end
+    if node.children then
+        for _, child in pairs(node.children) do
+            collect_text_nodes(child, list)
+        end
+    end
+end
+
+local function get_card_button_nodes(card)
+    local buttons = {}
+    if card.children then
+        if card.children.buy_button and card.children.buy_button.UIRoot then
+            collect_button_nodes(card.children.buy_button.UIRoot, buttons)
+        end
+        if card.children.buy_and_use_button and card.children.buy_and_use_button.UIRoot then
+            collect_button_nodes(card.children.buy_and_use_button.UIRoot, buttons)
+        end
+        if card.children.use_button and card.children.use_button.UIRoot then
+            collect_button_nodes(card.children.use_button.UIRoot, buttons)
+        end
+    end
+    return buttons
+end
+
+local function apply_state_to_button(card, btn_node, state_name)
+    local default_col = G.C.ORANGE
+    local default_action = btn_node.config.button or 'buy_from_shop'
+
+    if btn_node.config.button == 'sell_card' or (btn_node.config.func and btn_node.config.func:find('sell')) then
+        default_col = G.C.GREEN
+        default_action = 'sell_card'
+    elseif btn_node.config.id == 'buy_and_use' or (btn_node.config.func and btn_node.config.func:find('buy_and_use')) then
+        default_col = G.C.RED
+        default_action = 'buy_from_shop'
+    elseif btn_node.config.button == 'buy_from_shop' or (btn_node.config.func and btn_node.config.func:find('buy')) then
+        default_col = G.C.ORANGE
+        default_action = 'buy_from_shop'
+    elseif btn_node.config.func == 'can_use_consumeable' or (btn_node.config.button == 'use_card' and card.ability and card.ability.consumeable) then
+        default_col = G.C.RED
+        default_action = 'use_card'
+    elseif btn_node.config.func == 'can_select_card' or btn_node.config.button == 'use_card' then
+        default_col = G.C.GREEN
+        default_action = 'use_card'
+    elseif btn_node.config.func == 'can_redeem' or btn_node.config.button == 'redeem_from_shop' then
+        default_col = G.C.GREEN
+        default_action = 'redeem_from_shop'
+    elseif btn_node.config.func == 'can_open' or btn_node.config.button == 'open_booster' then
+        default_col = G.C.GREEN
+        default_action = 'open_booster'
+    end
+
+    -- Clear func so Balatro update callbacks do not overwrite our state
+    btn_node.config.func = nil
+
+    local text_nodes = {}
+    collect_text_nodes(btn_node, text_nodes)
+
+    if state_name == "Normal" then
+        btn_node.config.colour = default_col
+        btn_node.config.button = default_action
+        btn_node.config.shadow = true
+        btn_node.states.hover.is = false
+        btn_node.last_clicked = nil
+        for _, tn in ipairs(text_nodes) do
+            tn.config.colour = (default_action == 'sell_card') and G.C.UI.TEXT_LIGHT or G.C.WHITE
+        end
+    elseif state_name == "Hovered" then
+        btn_node.config.colour = default_col
+        btn_node.config.button = default_action
+        btn_node.config.shadow = true
+        btn_node.config.hover = true
+        btn_node.states.hover.is = true
+        btn_node.last_clicked = nil
+        for _, tn in ipairs(text_nodes) do
+            tn.config.colour = (default_action == 'sell_card') and G.C.UI.TEXT_LIGHT or G.C.WHITE
+        end
+    elseif state_name == "Clicked" then
+        btn_node.config.colour = default_col
+        btn_node.config.button = default_action
+        btn_node.config.shadow = true
+        btn_node.config.hover = true
+        btn_node.states.hover.is = true
+        btn_node.last_clicked = (G.TIMERS and G.TIMERS.REAL or 0) + 100
+        for _, tn in ipairs(text_nodes) do
+            tn.config.colour = (default_action == 'sell_card') and G.C.UI.TEXT_LIGHT or G.C.WHITE
+        end
+    elseif state_name == "Grayed Out" then
+        btn_node.config.colour = G.C.UI.BACKGROUND_INACTIVE
+        btn_node.config.button = nil
+        btn_node.config.shadow = true
+        btn_node.states.hover.is = false
+        btn_node.last_clicked = nil
+        for _, tn in ipairs(text_nodes) do
+            tn.config.colour = G.C.UI.TEXT_INACTIVE
+        end
+    end
+end
+
+local function apply_random_button_states_to_card(card)
+    local buttons = get_card_button_nodes(card)
+    if #buttons == 0 then return end
+
+    -- Reset all buttons to Normal initially
+    for _, btn in ipairs(buttons) do
+        apply_state_to_button(card, btn, "Normal")
+    end
+
+    -- If 1 button: pick among {"Normal", "Hovered", "Clicked", "Grayed Out"} (25% each)
+    -- If multiple buttons: pick a random one to receive the state; keep the other Normal
+    local target_btn = buttons[math.random(#buttons)]
+    local chosen_state = BUTTON_STATES[math.random(#BUTTON_STATES)]
+    apply_state_to_button(card, target_btn, chosen_state)
+end
+
+local function select_card_in_area(area, card)
+    if not area or not card then return end
+
+    -- Unhighlight other cards in this area
+    if area.highlighted then
+        for i = #area.highlighted, 1, -1 do
+            local other = area.highlighted[i]
+            if other ~= card then
+                other:highlight(false)
+                if other.children and other.children.buy_button then
+                    other.children.buy_button.states.visible = false
+                end
+                if other.children and other.children.buy_and_use_button then
+                    other.children.buy_and_use_button.states.visible = false
+                end
+            end
+            table.remove(area.highlighted, i)
+        end
+    end
+    area.highlighted = {card}
+
+    if card.set_cost then card:set_cost() end
+    card:highlight(true)
+
+    if area.align_cards then
+        area:align_cards()
+    end
+
+    if card.children then
+        if card.children.buy_button then
+            card.children.buy_button.states.visible = true
+            if card.children.buy_button.align_to_major then card.children.buy_button:align_to_major() end
+        end
+        if card.children.buy_and_use_button then
+            card.children.buy_and_use_button.states.visible = true
+            if card.children.buy_and_use_button.align_to_major then card.children.buy_and_use_button:align_to_major() end
+        end
+        if card.children.use_button then
+            card.children.use_button.states.visible = true
+            if card.children.use_button.align_to_major then card.children.use_button:align_to_major() end
+        end
+    end
+
+    apply_random_button_states_to_card(card)
+end
+
+function G.DATASET_MOD:apply_shop_card_selections()
+    local chance_str = tostring(self.config and self.config.card_selection_chance or '50%')
+    local chance = 0.50
+    if chance_str == '0%' or chance_str == '0' then
+        chance = 0.0
+    elseif chance_str == '100%' or chance_str == '100' then
+        chance = 1.0
+    else
+        chance = 0.50
+    end
+
+    local regions = {
+        G.jokers,
+        G.consumeables,
+        (self.shop_phase == 'pack') and G.pack_cards or G.shop_jokers
+    }
+
+    for _, area in ipairs(regions) do
+        if area and area.cards and #area.cards > 0 then
+            -- Unhighlight all cards in this area first
+            if area.highlighted then
+                for i = #area.highlighted, 1, -1 do
+                    local c = area.highlighted[i]
+                    if c then
+                        c:highlight(false)
+                        if c.children and c.children.buy_button then
+                            c.children.buy_button.states.visible = false
+                        end
+                        if c.children and c.children.buy_and_use_button then
+                            c.children.buy_and_use_button.states.visible = false
+                        end
+                    end
+                    table.remove(area.highlighted, i)
+                end
+            end
+            for _, c in ipairs(area.cards) do
+                c.highlighted = false
+                if c.children and c.children.buy_button then
+                    c.children.buy_button.states.visible = false
+                end
+                if c.children and c.children.buy_and_use_button then
+                    c.children.buy_and_use_button.states.visible = false
+                end
+            end
+
+            -- Roll chance to select a card in this region
+            if chance > 0 and (chance >= 1.0 or math.random() < chance) then
+                local chosen_card = area.cards[math.random(#area.cards)]
+                select_card_in_area(area, chosen_card)
+            end
+        end
     end
 end
 
@@ -1090,6 +1410,9 @@ function G.DATASET_MOD:setup_shop_screen()
 
     self:randomize_background()
 
+    -- Apply card selection in each region (jokers, consumables, shop items)
+    self:apply_shop_card_selections()
+
     -- Snap all cards and areas immediately to eliminate sliding animations
     snap_card_area(G.shop_jokers)
     snap_card_area(G.shop_vouchers)
@@ -1261,6 +1584,9 @@ function G.DATASET_MOD:setup_pack_screen()
     self:populate_consumables_area()
 
     self:randomize_background()
+
+    -- Apply card selection in each region (jokers, consumables, shop items)
+    self:apply_shop_card_selections()
 
     -- Snap all cards and areas immediately to eliminate sliding animations
     snap_card_area(G.pack_cards)
