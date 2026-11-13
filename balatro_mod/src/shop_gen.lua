@@ -151,6 +151,34 @@ function ShopGen.get_quad(x, y, w, h, sw, sh)
     return ShopGen.cached_quads[k]
 end
 
+local function apply_custom_center_sprite(card, asset_key, img, pos_x, pos_y, frame_w, frame_h)
+    if not card or not img or not card.children or not card.children.center then return false end
+    local center_sprite = card.children.center
+    local orig_atlas = center_sprite.atlas
+    local orig_px = (orig_atlas and orig_atlas.px and orig_atlas.px > 0) and orig_atlas.px or 71
+    local orig_py = (orig_atlas and orig_atlas.py and orig_atlas.py > 0) and orig_atlas.py or 95
+    local ratio_x = (center_sprite.scale and center_sprite.scale.x) and (center_sprite.scale.x / orig_px) or 1
+    local ratio_y = (center_sprite.scale and center_sprite.scale.y) and (center_sprite.scale.y / orig_py) or 1
+
+    center_sprite.atlas = {
+        name = "gdcv_bu_" .. tostring(asset_key),
+        image = img,
+        px = frame_w,
+        py = frame_h
+    }
+    center_sprite.scale = {
+        x = frame_w * ratio_x,
+        y = frame_h * ratio_y
+    }
+    if center_sprite.T and center_sprite.T.w and center_sprite.T.w > 0 and center_sprite.T.h and center_sprite.T.h > 0 then
+        center_sprite.scale_mag = math.min(center_sprite.scale.x / center_sprite.T.w, center_sprite.scale.y / center_sprite.T.h)
+    end
+    if center_sprite.set_sprite_pos then
+        center_sprite:set_sprite_pos({x = pos_x or 0, y = pos_y or 0})
+    end
+    return true
+end
+
 function G.DATASET_MOD:get_joker_pools()
     if not ShopGen.cached_tarots or #ShopGen.cached_tarots == 0 then
         ShopGen.cached_tarots = ShopGen.get_all_consumables('Tarot', false)
@@ -227,6 +255,21 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
         if card.set_rental then card:set_rental(true) else card.ability.rental = true end
     end
 
+    -- Joker Stake Win Stickers (top-right sticker visible to YOLO detector):
+    -- ~50% chance to display one of the 8 stake stickers (White..Gold)
+    if math.random() < 0.50 then
+        local stake_stickers = G.sticker_map or {'White', 'Red', 'Green', 'Black', 'Blue', 'Purple', 'Orange', 'Gold'}
+        if #stake_stickers > 0 then
+            local chosen_sticker = stake_stickers[math.random(#stake_stickers)]
+            card.sticker = chosen_sticker
+            card.sticker_run = chosen_sticker
+        end
+    else
+        -- Prevent Card:update() from populating profile win stickers on un-stickered jokers
+        card.sticker = nil
+        card.sticker_run = 'NONE'
+    end
+
     -- BUMod Variant Selection:
     -- Check if this Joker has historical BUMod sprite variations
     local bu_manifest = ShopGen.load_bu_variants()
@@ -243,16 +286,13 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
         if math.random() < 0.50 then
             local chosen_var = variants[math.random(#variants)]
             local img = ShopGen.get_variant_image(chosen_var.filename)
-            if img and card.children and card.children.center then
-                card.children.center.image = img
-                -- Set quad to entire 142x190 texture (or 1st/2nd half if jokers_trans)
+            if img then
                 local w, h = img:getDimensions()
-                if c_key == 'j_banner' and w > 200 then
-                    card.children.center.quad = ShopGen.get_quad(71 * 2, 0, 71 * 2, 95 * 2, w, h)
-                else
-                    card.children.center.quad = ShopGen.get_quad(0, 0, 71 * 2, 95 * 2, w, h)
+                local frame_w = (w > 200) and 142 or w
+                local pos_x = (c_key == 'j_banner' and w > 200) and 1 or 0
+                if apply_custom_center_sprite(card, chosen_var.filename, img, pos_x, 0, frame_w, h) then
+                    card.custom_art_variant = string.format("bumod_v%d_%s", chosen_var.version or 1, chosen_var.commit or "hist")
                 end
-                card.custom_art_variant = string.format("bumod_v%d_%s", chosen_var.version or 1, chosen_var.commit or "hist")
             end
         end
     end
@@ -294,6 +334,16 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
     return card
 end
 
+-- Helper to initialize Card:update()-populated fields before synchronous UIBox/highlight calls
+local function ensure_consumable_ready(card)
+    if not card then return end
+    card.eligible_strength_jokers = card.eligible_strength_jokers or {}
+    card.eligible_editionless_jokers = card.eligible_editionless_jokers or {}
+    if card.ability and card.ability.consumeable and card.ability.consumeable.max_highlighted then
+        card.ability.consumeable.mod_num = card.ability.consumeable.mod_num or math.min(5, card.ability.consumeable.max_highlighted)
+    end
+end
+
 -- Create a consumable card (Tarot, Spectral, Planet)
 function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_center, spawn_x, spawn_y)
     local _, tarots, spectrals, planets = self:get_joker_pools()
@@ -314,6 +364,7 @@ function G.DATASET_MOD:create_random_consumable_card(area, set_type, forced_cent
             bypass_back = G.GAME and G.GAME.selected_back and G.GAME.selected_back.pos
         }
     )
+    ensure_consumable_ready(card)
     return card
 end
 
@@ -347,9 +398,11 @@ function G.DATASET_MOD:create_random_playing_card(area, spawn_x, spawn_y)
     )
 
     -- Force re-application of base card to guarantee sprite atlas is loaded (vanilla blank art fix)
+    -- Pass initial=true so active blind never debuffs shop/pack playing cards
     if base_card and card.set_base then
-        card:set_base(base_card)
+        card:set_base(base_card, true)
     end
+    card.debuff = false
 
     -- Edition: None, Foil, Holo, Polychrome
     local edition = self:get_random_edition()
@@ -358,15 +411,6 @@ function G.DATASET_MOD:create_random_playing_card(area, spawn_x, spawn_y)
     -- Seal: Gold, Red, Blue, Purple
     local seal = self:get_random_seal()
     if seal then card:set_seal(seal, true, true) end
-
-    -- Debuff: ~5% chance
-    if math.random() < 0.05 then
-        if card.set_debuff then
-            card:set_debuff(true)
-        else
-            card.debuff = true
-        end
-    end
 
     card.ability = card.ability or {}
     card.ability.set = (center and center.set) or 'Enhanced'
@@ -399,10 +443,11 @@ function G.DATASET_MOD:create_random_voucher_card(area, forced_center, spawn_x, 
     -- BUMod v_hone variant integration if v_hone rolled
     if center.key == 'v_hone' and math.random() < 0.50 then
         local img = ShopGen.get_variant_image("v_hone.png")
-        if img and card.children and card.children.center then
-            card.children.center.image = img
-            card.children.center.quad = ShopGen.get_quad(0, 0, 71 * 2, 95 * 2, 142, 190)
-            card.custom_art_variant = "bumod_v_hone"
+        if img then
+            local w, h = img:getDimensions()
+            if apply_custom_center_sprite(card, "v_hone", img, 0, 0, w, h) then
+                card.custom_art_variant = "bumod_v_hone"
+            end
         end
     end
 
@@ -443,20 +488,32 @@ function G.DATASET_MOD:create_random_booster_card(area, forced_center, spawn_x, 
     local spec_idx = spectral_frame_map[center.key]
     if spec_idx ~= nil and math.random() < 0.50 then
         local img = ShopGen.get_variant_image("spectral_trans.png")
-        if img and card.children and card.children.center then
-            card.children.center.image = img
-            card.children.center.quad = ShopGen.get_quad(spec_idx * 142, 0, 142, 190, 568, 190)
-            card.custom_art_variant = "bumod_spectral_trans"
+        if img then
+            local w, h = img:getDimensions()
+            local frame_w = math.floor(w / 4)
+            if apply_custom_center_sprite(card, "spectral_trans", img, spec_idx, 0, frame_w, h) then
+                card.custom_art_variant = "bumod_spectral_trans"
+            end
         end
     end
 
     return card
 end
 
+-- Helper to randomize shop price ($0-$15) and sell value ($0-$15) as integers
+local function randomize_card_costs(card)
+    if not card then return end
+    if card.set_cost then card:set_cost() end
+    card.cost = math.random(0, 15)
+    card.sell_cost = math.random(0, 15)
+    card.sell_cost_label = (card.facing == 'back') and '?' or card.sell_cost
+    card._gdcv_cost_randomized = true
+end
+
 -- Helper to attach shop card price tag and action buttons synchronously without queuing delayed events in G.E_MANAGER
 local function attach_shop_card_ui_sync(card)
     if not card then return end
-    if card.set_cost then card:set_cost() end
+    randomize_card_costs(card)
 
     if card.children and card.children.price then
         pcall(function() card.children.price:remove() end)
@@ -530,6 +587,7 @@ local function attach_shop_card_ui_sync(card)
     end
 
     if card.ability and card.ability.consumeable then
+        ensure_consumable_ready(card)
         local t3 = {
             n=G.UIT.ROOT, config = {id = 'buy_and_use', ref_table = card, minh = 1.1, padding = 0.1, align = 'cr', colour = G.C.RED, shadow = true, r = 0.08, minw = 1.1, func = 'can_buy_and_use', one_press = true, button = 'buy_from_shop', hover = true, focus_args = {type = 'none'}}, nodes={
                 {n=G.UIT.B, config = {w=0.1, h=0.6}},
@@ -701,7 +759,17 @@ end
 
 local function snap_ui_node(n)
     if not n then return end
+    if n.velocity then
+        n.velocity.x = 0
+        n.velocity.y = 0
+        n.velocity.r = 0
+        n.velocity.scale = 0
+    end
     if n.hard_set_VT then n:hard_set_VT() end
+    if n.VT and n.T then
+        n.VT.scale = n.T.scale
+        n.VT.r = n.T.r
+    end
     if n.children then
         for _, c in pairs(n.children) do
             snap_ui_node(c)
@@ -714,6 +782,10 @@ local function snap_card_area(area)
     if not area then return end
     if area.align_cards then area:align_cards() end
     if area.hard_set_VT then area:hard_set_VT() end
+    if area.VT and area.T then
+        area.VT.scale = area.T.scale
+        area.VT.r = area.T.r
+    end
     if area.cards then
         for _, card in ipairs(area.cards) do
             -- Keep cards completely upright without ambient wobbling or fan-tilt
@@ -732,17 +804,30 @@ local function snap_card_area(area)
                 card.velocity.r = 0
                 card.velocity.scale = 0
             end
+            card.juice = nil
+            card.pinch = {x = false, y = false}
             if card.hard_set_VT then card:hard_set_VT() end
-            if card.VT then card.VT.r = 0 end
+            if card.VT and card.T then
+                card.VT.r = 0
+                card.VT.scale = card.T.scale
+            end
 
             if card.children then
                 for _, child in pairs(card.children) do
                     if child then
                         if child.T then child.T.r = 0 end
-                        if child.velocity then child.velocity.r = 0 end
+                        if child.velocity then
+                            child.velocity.x = 0
+                            child.velocity.y = 0
+                            child.velocity.r = 0
+                            child.velocity.scale = 0
+                        end
                         if child.align_to_major then child:align_to_major() end
                         if child.hard_set_VT then child:hard_set_VT() end
-                        if child.VT then child.VT.r = 0 end
+                        if child.VT and child.T then
+                            child.VT.r = 0
+                            child.VT.scale = child.T.scale
+                        end
                         if child.UIRoot then snap_ui_node(child.UIRoot) end
                     end
                 end
@@ -751,12 +836,318 @@ local function snap_card_area(area)
     end
 end
 
+-- =========================================================
+-- JOKER DISPLAY MOD INTEGRATION (OPTIONAL RUNTIME SUPPORT)
+-- Randomizes all displayed JokerDisplay values in 30% of frames;
+-- cleanly hides all tooltips in the other 70% as if mod is absent.
+-- =========================================================
+local JD_SUITS = {'Spades', 'Hearts', 'Clubs', 'Diamonds'}
+local JD_RANKS = {'2', '3', '4', '5', '6', '7', '8', '9', '10', 'Jack', 'Queen', 'King', 'Ace'}
+local JD_RANK_IDS = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+local JD_POKER_HANDS = {
+    'High Card', 'Pair', 'Two Pair', 'Three of a Kind', 'Straight', 'Flush',
+    'Full House', 'Four of a Kind', 'Straight Flush', 'Five of a Kind', 'Flush House', 'Flush Five'
+}
+
+local function is_joker_display_available()
+    return JokerDisplay ~= nil
+        and type(JokerDisplay.Definitions) == 'table'
+        and type(JokerDisplay.config) == 'table'
+        and type(Card) == 'table'
+        and type(Card.update_joker_display) == 'function'
+end
+
+function G.DATASET_MOD:save_joker_display_config()
+    if not is_joker_display_available() then return end
+    if self._saved_jd_config == nil then
+        self._saved_jd_config = {
+            enabled = JokerDisplay.config.enabled,
+            hide_by_default = JokerDisplay.config.hide_by_default
+        }
+    end
+end
+
+function G.DATASET_MOD:restore_joker_display_config()
+    if not is_joker_display_available() then
+        self._saved_jd_config = nil
+        return
+    end
+    if self._saved_jd_config ~= nil then
+        JokerDisplay.config.enabled = self._saved_jd_config.enabled
+        JokerDisplay.config.hide_by_default = self._saved_jd_config.hide_by_default
+        self._saved_jd_config = nil
+    end
+    if G.jokers and G.jokers.cards then
+        for _, card in ipairs(G.jokers.cards) do
+            if card then
+                card._jd_randomized_override = nil
+                if JokerDisplay.config.enabled then
+                    if card.joker_display_values then
+                        card.joker_display_values.disabled = JokerDisplay.config.hide_by_default or false
+                    end
+                    pcall(function() card:update_joker_display(true, true, "gdcv_restore") end)
+                elseif card.joker_display_remove then
+                    pcall(function() card:joker_display_remove() end)
+                end
+            end
+        end
+    end
+end
+
+local function safe_localize(arg, category, fallback)
+    if type(localize) ~= 'function' then return fallback or tostring(arg) end
+    local ok, res = pcall(localize, arg, category)
+    if ok and res ~= nil and res ~= 'ERROR' then return res end
+    return fallback or tostring(arg)
+end
+
+local function pick_jd_chips()
+    local r = math.random()
+    if r < 0.12 then return 0
+    elseif r < 0.52 then return math.random(4, 60)
+    elseif r < 0.80 then return math.random(65, 350)
+    elseif r < 0.95 then return math.random(360, 2500)
+    else return ({12500, 48000, 125000, 1.4e6, 2.5e11})[math.random(5)]
+    end
+end
+
+local function pick_jd_mult()
+    local r = math.random()
+    if r < 0.12 then return 0
+    elseif r < 0.57 then return math.random(2, 25)
+    elseif r < 0.85 then return math.random(26, 150)
+    elseif r < 0.95 then return math.random(155, 600)
+    else return ({1200, 5400, 24000, 1.5e6})[math.random(4)]
+    end
+end
+
+local function pick_jd_xmult()
+    local r = math.random()
+    if r < 0.14 then return 1
+    elseif r < 0.44 then return math.random(2, 12)
+    elseif r < 0.82 then
+        if math.random() < 0.5 then
+            return 1 + math.random(1, 35) * 0.25
+        else
+            return math.random(11, 150) / 10
+        end
+    elseif r < 0.94 then
+        return math.random(20, 400) + ({0, 0.25, 0.5, 0.75})[math.random(4)]
+    else
+        return ({1.2e11, 3.8e12, 7.4e15, 1.9e24, 6.2e42})[math.random(5)]
+    end
+end
+
+local function pick_jd_dollars()
+    local r = math.random()
+    if r < 0.20 then return 0
+    elseif r < 0.75 then return math.random(1, 20)
+    elseif r < 0.95 then return math.random(21, 75)
+    else return math.random(80, 250)
+    end
+end
+
+local function randomize_jd_round_state()
+    if not G.GAME then return end
+    G.GAME.probabilities = G.GAME.probabilities or {normal = 1}
+    G.GAME.probabilities.normal = ({1, 1, 1, 2, 4, 8})[math.random(6)]
+
+    G.GAME.current_round = G.GAME.current_round or {}
+    G.GAME.current_round.hands_left = math.random(0, 5)
+    G.GAME.current_round.hands_played = math.random(0, 4)
+    G.GAME.current_round.discards_left = math.random(0, 5)
+    G.GAME.current_round.discards_used = math.random(0, 3)
+
+    G.GAME.current_round.ancient_card = G.GAME.current_round.ancient_card or {}
+    G.GAME.current_round.ancient_card.suit = JD_SUITS[math.random(#JD_SUITS)]
+
+    G.GAME.current_round.castle_card = G.GAME.current_round.castle_card or {}
+    G.GAME.current_round.castle_card.suit = JD_SUITS[math.random(#JD_SUITS)]
+
+    local mail_idx = math.random(#JD_RANKS)
+    G.GAME.current_round.mail_card = G.GAME.current_round.mail_card or {}
+    G.GAME.current_round.mail_card.rank = JD_RANKS[mail_idx]
+    G.GAME.current_round.mail_card.id = JD_RANK_IDS[mail_idx]
+
+    local idol_idx = math.random(#JD_RANKS)
+    G.GAME.current_round.idol_card = G.GAME.current_round.idol_card or {}
+    G.GAME.current_round.idol_card.rank = JD_RANKS[idol_idx]
+    G.GAME.current_round.idol_card.id = JD_RANK_IDS[idol_idx]
+    G.GAME.current_round.idol_card.suit = JD_SUITS[math.random(#JD_SUITS)]
+end
+
+local function apply_jd_override_to_card(card)
+    local ov = card and card._jd_randomized_override
+    if not ov then return end
+    if ov.sell_cost ~= nil then
+        card.sell_cost = ov.sell_cost
+    end
+    if card.ability and ov.ability then
+        for k, v in pairs(ov.ability) do
+            if type(card.ability[k]) == type(v) then
+                card.ability[k] = v
+            end
+        end
+        if type(card.ability.extra) == 'table' and ov.ability_extra then
+            for k, v in pairs(ov.ability_extra) do
+                if type(card.ability.extra[k]) == type(v) then
+                    card.ability.extra[k] = v
+                end
+            end
+        end
+    end
+    local jvals = card.joker_display_values
+    if jvals and ov.jvals then
+        for k, v in pairs(ov.jvals) do
+            if k == 'active' then
+                if type(jvals.active) == 'boolean' and ov.jvals.active_bool ~= nil then
+                    jvals.active = ov.jvals.active_bool
+                elseif type(jvals.active) == 'string' and ov.jvals.active_str ~= nil then
+                    jvals.active = ov.jvals.active_str
+                end
+            elseif k == 'dollars' then
+                if type(jvals.dollars) == 'number' and type(v) == 'number' then
+                    jvals.dollars = v
+                elseif type(jvals.dollars) == 'string' and ov.jvals.trading_dollars ~= nil then
+                    jvals.dollars = ov.jvals.trading_dollars
+                end
+            elseif k ~= 'active_bool' and k ~= 'active_str' and k ~= 'trading_dollars' then
+                if type(jvals[k]) == type(v) then
+                    jvals[k] = v
+                end
+            end
+        end
+    end
+end
+
+local function ensure_joker_display_hook()
+    if not is_joker_display_available() then return end
+    if Card._gdcv_jd_calc_hooked or type(Card.calculate_joker_display) ~= 'function' then return end
+    Card._gdcv_jd_calc_hooked = true
+    local orig_calc_jd = Card.calculate_joker_display
+    function Card:calculate_joker_display(custom_parent)
+        local ret = orig_calc_jd(self, custom_parent)
+        if not custom_parent and self._jd_randomized_override then
+            apply_jd_override_to_card(self)
+        end
+        return ret
+    end
+end
+
+local function build_jd_override_for_card(card)
+    local c_key = card.config and card.config.center and card.config.center.key or ""
+    local active_bool = (math.random() < 0.55)
+    local chips = pick_jd_chips()
+    local mult = pick_jd_mult()
+    local x_mult = pick_jd_xmult()
+    local dollars = pick_jd_dollars()
+    local hand_name = JD_POKER_HANDS[math.random(#JD_POKER_HANDS)]
+    local suit_a = JD_SUITS[math.random(#JD_SUITS)]
+    local suit_c = JD_SUITS[math.random(#JD_SUITS)]
+    local rank_m = JD_RANKS[math.random(#JD_RANKS)]
+    local rank_i = JD_RANKS[math.random(#JD_RANKS)]
+    local suit_i = JD_SUITS[math.random(#JD_SUITS)]
+
+    local active_text_loc = safe_localize(active_bool and 'jdis_active' or 'jdis_inactive', nil, active_bool and "Active!" or "Inactive")
+    local active_str = active_text_loc
+    if c_key == 'j_invisible' then
+        local req = math.random(2, 3)
+        local cur = active_bool and req or math.random(0, req - 1)
+        active_str = active_bool and safe_localize('jdis_active', nil, "Active!") or string.format("%d/%d", cur, req)
+    end
+
+    local trading_dollars = active_bool and ("+$" .. tostring(math.random(1, 10))) or "-"
+    local rem = math.random(0, 5)
+    local loyalty_str = (rem == 0)
+        and safe_localize('jdis_active', nil, "Active!")
+        or safe_localize({type = 'variable', key = 'jdis_loyalty_remaining', vars = {rem}}, nil, tostring(rem) .. " remaining")
+    local num = ({1, 1, 1, 2, 4, 8})[math.random(6)]
+    local den = ({2, 3, 4, 5, 6, 8, 10, 15, 1000})[math.random(9)]
+    local odds_str = safe_localize({type = 'variable', key = 'jdis_odds', vars = {num, den}}, nil, string.format("%d in %d", num, den))
+    local idol_str = safe_localize({
+        type = 'variable',
+        key = 'jdis_rank_of_suit',
+        vars = {safe_localize(rank_i, 'ranks', rank_i), safe_localize(suit_i, 'suits_plural', suit_i)}
+    }, nil, rank_i .. " of " .. suit_i)
+
+    local inv_req = math.random(2, 3)
+    local inv_cur = active_bool and inv_req or math.random(0, inv_req - 1)
+    local perish_tally = math.random(1, (G.GAME and G.GAME.perishable_rounds) or 5)
+
+    return {
+        sell_cost = math.random(1, 99),
+        small = (math.random() < 0.20),
+        ability = {
+            mult = mult,
+            x_mult = x_mult,
+            extra = (math.random() < 0.5) and chips or mult,
+            driver_tally = math.random(0, 32),
+            caino_xmult = x_mult,
+            invis_rounds = inv_cur,
+            loyalty_remaining = rem,
+            perish_tally = perish_tally,
+            to_do_poker_hand = hand_name,
+            stone_tally = math.random(0, 20),
+            steel_tally = math.random(0, 20),
+            nine_tally = math.random(0, 20),
+            h_size = math.random(1, 5),
+            discards = math.random(0, 5)
+        },
+        ability_extra = {
+            chips = chips,
+            chip_mod = math.random(1, 30),
+            mult = mult,
+            Xmult = x_mult,
+            dollars = dollars,
+            h_size = math.random(1, 5),
+            discards = math.random(0, 23),
+            yorick_discards = math.random(0, 23)
+        },
+        jvals = {
+            chips = chips,
+            mult = mult,
+            x_mult = x_mult,
+            count = math.random(0, 6),
+            dollars = dollars,
+            trading_dollars = trading_dollars,
+            active = active_bool,
+            active_bool = active_bool,
+            active_str = active_str,
+            active_text = active_text_loc,
+            is_active = active_bool,
+            start_count = math.random(1, 8),
+            yorick_discards = math.random(0, 23),
+            ancient_card_suit = safe_localize(suit_a, 'suits_plural', suit_a),
+            castle_card_suit = safe_localize(suit_c, 'suits_plural', suit_c),
+            mail_card_rank = safe_localize(rank_m, 'ranks', rank_m),
+            to_do_poker_hand = safe_localize(hand_name, 'poker_hands', hand_name),
+            idol_card = idol_str,
+            loyalty_text = loyalty_str,
+            odds = odds_str
+        }
+    }
+end
+
 -- Populate the top Joker Bar (G.jokers) with 0 to 9 jokers
 function G.DATASET_MOD:populate_joker_bar()
     if not G.jokers then return end
 
     self.captured_boxes = self.captured_boxes or setmetatable({}, {__mode = "k"})
     clear_card_area(G.jokers)
+
+    local jd_present = is_joker_display_available()
+    local show_jd = false
+    if jd_present then
+        self:save_joker_display_config()
+        ensure_joker_display_hook()
+        -- 30% of training frames show randomized JokerDisplay tooltips; 70% completely hide them
+        show_jd = (math.random() < 0.30)
+        JokerDisplay.config.enabled = show_jd
+        JokerDisplay.config.hide_by_default = false
+        if show_jd then
+            randomize_jd_round_state()
+        end
+    end
 
     -- Distribution: 0 to 9 jokers, with 7, 8, 9 appearing less commonly
     -- 0-6: 12% each (84% total)
@@ -805,12 +1196,47 @@ function G.DATASET_MOD:populate_joker_bar()
                     card.debuff = true
                 end
             end
+            if jd_present then
+                if show_jd then
+                    card._jd_randomized_override = build_jd_override_for_card(card)
+                    card.joker_display_values = {
+                        disabled = false,
+                        small = card._jd_randomized_override.small
+                    }
+                    apply_jd_override_to_card(card)
+                else
+                    card._jd_randomized_override = nil
+                    card.joker_display_values = { disabled = true, small = false }
+                    card.joker_display_installed = true
+                end
+            end
             G.jokers:emplace(card)
         end
     end
 
     if G.jokers.align_cards then
         G.jokers:align_cards()
+    end
+
+    -- Synchronize JokerDisplay UIs after all jokers (including Blueprint/Brainstorm neighbors) are emplaced
+    if jd_present and G.jokers.cards then
+        for _, card in ipairs(G.jokers.cards) do
+            if show_jd then
+                if card.ability and card.ability.perishable and card._jd_randomized_override and card._jd_randomized_override.ability then
+                    card.ability.perish_tally = card._jd_randomized_override.ability.perish_tally
+                end
+                pcall(function() card:update_joker_display(true, true, "gdcv_setup") end)
+                if card.children then
+                    if card.children.joker_display and card.children.joker_display.recalculate then card.children.joker_display:recalculate(true) end
+                    if card.children.joker_display_small and card.children.joker_display_small.recalculate then card.children.joker_display_small:recalculate(true) end
+                    if card.children.joker_display_debuff and card.children.joker_display_debuff.recalculate then card.children.joker_display_debuff:recalculate(true) end
+                    if card.children.joker_display_perishable and card.children.joker_display_perishable.recalculate then card.children.joker_display_perishable:recalculate() end
+                    if card.children.joker_display_rental and card.children.joker_display_rental.recalculate then card.children.joker_display_rental:recalculate() end
+                end
+            elseif card.joker_display_remove then
+                pcall(function() card:joker_display_remove() end)
+            end
+        end
     end
 end
 
@@ -1083,7 +1509,10 @@ local function select_card_in_area(area, card)
     end
     area.highlighted = {card}
 
-    if card.set_cost then card:set_cost() end
+    if not card._gdcv_cost_randomized then
+        randomize_card_costs(card)
+    end
+    ensure_consumable_ready(card)
     card:highlight(true)
 
     if area.align_cards then
@@ -1170,11 +1599,19 @@ end
 function G.DATASET_MOD:setup_shop_screen()
     if not G.GAME then return end
 
+    if G.pack_cards then
+        clear_card_area(G.pack_cards)
+    end
     if G.booster_pack then
         G.booster_pack:remove()
         G.booster_pack = nil
         G.pack_cards = nil
         prune_engine_tables()
+    end
+
+    -- Randomize deck skin collabs so Magic Trick playing cards in shop cover all skins
+    if self.randomize_deck_appearance then
+        self:randomize_deck_appearance()
     end
 
     -- Cycle shop slots: 2 (no voucher) -> 3 (overstock tier 1) -> 4 (overstock tier 2)
@@ -1226,6 +1663,12 @@ function G.DATASET_MOD:setup_shop_screen()
         end
     end
     G.STATE = G.STATES.SHOP
+    G.STATE_COMPLETE = true
+    if G.SHOP_SIGN then
+        G.SHOP_SIGN.alignment.offset.y = 0
+        if G.SHOP_SIGN.align_to_major then G.SHOP_SIGN:align_to_major() end
+        snap_ui_node(G.SHOP_SIGN)
+    end
 
     if G.shop_jokers then
         clear_card_area(G.shop_jokers)
@@ -1492,11 +1935,24 @@ function G.DATASET_MOD:setup_pack_screen()
         G.shop.alignment.offset.y = G.ROOM.T.y + 11
         if G.shop.hard_set_VT then G.shop:hard_set_VT() end
     end
+    if G.SHOP_SIGN then
+        G.SHOP_SIGN.alignment.offset.y = -15
+        if G.SHOP_SIGN.align_to_major then G.SHOP_SIGN:align_to_major() end
+        if G.SHOP_SIGN.hard_set_VT then G.SHOP_SIGN:hard_set_VT() end
+    end
+    if G.pack_cards then
+        clear_card_area(G.pack_cards)
+    end
     if G.booster_pack then
         G.booster_pack:remove()
         G.booster_pack = nil
         G.pack_cards = nil
         prune_engine_tables()
+    end
+
+    -- Randomize deck skin collabs so Standard packs cover vanilla and crossover card skins
+    if self.randomize_deck_appearance then
+        self:randomize_deck_appearance()
     end
 
     -- 50% Buffoon pack, 15% Standard pack, 15% Arcana, 10% Celestial, 10% Spectral
@@ -1598,6 +2054,7 @@ function G.DATASET_MOD:setup_pack_screen()
         G.booster_pack.alignment.offset.y = -2.2
         if G.booster_pack.hard_set_VT then G.booster_pack:hard_set_VT() end
         G.STATE = pack_state
+        G.STATE_COMPLETE = true
     end
 
     if G.pack_cards then

@@ -62,30 +62,37 @@ end
 function UI.get_filtered_joker_entries(mod)
     local all_entries = UI.get_all_joker_entries()
     local r_filter = mod.test_joker_rarity_filter or "All"
-    if r_filter == "All" then
-        return all_entries
-    end
-    local target_r = 1
-    if r_filter == "Uncommon" then target_r = 2
+    local search_q = (mod.test_joker_search and tostring(mod.test_joker_search) or ""):lower():match("^%s*(.-)%s*$")
+
+    local target_r = nil
+    if r_filter == "Common" then target_r = 1
+    elseif r_filter == "Uncommon" then target_r = 2
     elseif r_filter == "Rare" then target_r = 3
     elseif r_filter == "Legendary" then target_r = 4
     end
 
+    if not target_r and search_q == "" then
+        return all_entries
+    end
+
     local filtered = {}
     for _, ent in ipairs(all_entries) do
-        if ent.rarity == target_r then
+        local rarity_ok = (not target_r) or (ent.rarity == target_r)
+        local search_ok = (search_q == "")
+            or (ent.name and ent.name:lower():find(search_q, 1, true) ~= nil)
+            or (ent.key and ent.key:lower():find(search_q, 1, true) ~= nil)
+        if rarity_ok and search_ok then
             table.insert(filtered, ent)
         end
     end
-    if #filtered == 0 then return all_entries end
     return filtered
 end
 
-function UI.spawn_test_joker(mod)
+function UI.spawn_test_joker(mod, entry_override)
     local entries = mod.test_joker_list or UI.get_filtered_joker_entries(mod)
     local idx = mod.test_joker_idx or 1
-    local selected = entries[idx]
-    if not selected then
+    local selected = entry_override or entries[idx]
+    if not selected or not selected.key then
         mod.capture_flash = 1.5
         mod.capture_flash_text = "NO JOKER SELECTED!"
         return
@@ -338,6 +345,9 @@ function UI.init_callbacks(mod)
         }
         mod.config.calibration_mode = state_map[args.to_val] or 'setup'
         mod.state = 'idle'
+        if mod.config.calibration_mode ~= 'generation' and mod.restore_joker_display_config then
+            mod:restore_joker_display_config()
+        end
     end
 
     G.FUNCS.gdcv_change_max_frames = function(args)
@@ -353,6 +363,12 @@ function UI.init_callbacks(mod)
     G.FUNCS.gdcv_change_card_selection_chance = function(args)
         mod.config.card_selection_chance = args.to_val or '50%'
         print("DATASET: Card selection chance set to " .. tostring(mod.config.card_selection_chance))
+    end
+
+    G.FUNCS.gdcv_change_frame_wait_time = function(args)
+        local secs = tonumber((tostring(args.to_val or '0.08s'):gsub('s$', ''))) or 0.08
+        mod.config.frame_wait_time = secs
+        print(string.format("DATASET: Frame wait time set to %.2fs", secs))
     end
 
     G.FUNCS.gdcv_save_config = function(e)
@@ -433,23 +449,67 @@ function UI.init_callbacks(mod)
     end
 
     -- ==========================================
-    -- JOKER TEST GENERATOR CALLBACKS
+    -- PAGE & JOKER SPAWNER CALLBACKS
     -- ==========================================
+    G.FUNCS.gdcv_switch_page = function(e)
+        local target_page = e and e.config and e.config.ref_table and e.config.ref_table.page
+        if not target_page then return end
+        if G.CONTROLLER and G.CONTROLLER.text_input_hook then
+            G.CONTROLLER.text_input_hook = nil
+        end
+        mod.config_page = target_page
+        UI.refresh_page_holder(mod, e.UIBox)
+    end
+
     G.FUNCS.gdcv_change_joker_rarity = function(args)
         local r_name = args.to_val or "All"
         mod.test_joker_rarity_filter = r_name
-        local entries = UI.get_filtered_joker_entries(mod)
-        mod.test_joker_list = entries
-        mod.test_joker_idx = 1
-        local sel = entries[1]
-        mod.test_joker_name_display = sel and sel.name or "None"
-        mod.test_joker_key_display = sel and ("[" .. sel.key .. "]") or "[-]"
+        mod.test_joker_page = 1
+        UI.refresh_joker_grid(mod)
+    end
+
+    G.FUNCS.gdcv_apply_joker_search = function(e)
+        if G.CONTROLLER and G.CONTROLLER.text_input_hook and G.FUNCS.text_input_key then
+            pcall(G.FUNCS.text_input_key, {key = 'return'})
+        else
+            mod.test_joker_page = 1
+            UI.refresh_joker_grid(mod, e and e.UIBox)
+        end
+    end
+
+    G.FUNCS.gdcv_clear_joker_search = function(e)
+        if G.CONTROLLER and G.CONTROLLER.text_input_hook then
+            G.CONTROLLER.text_input_hook = nil
+        end
+        mod.test_joker_search = ""
+        mod.test_joker_page = 1
+        UI.refresh_page_holder(mod, e and e.UIBox)
+    end
+
+    G.FUNCS.gdcv_joker_page_prev = function(e)
+        local total_pages = math.max(1, mod.test_joker_total_pages or 1)
+        local cur = mod.test_joker_page or 1
+        mod.test_joker_page = (cur > 1) and (cur - 1) or total_pages
+        UI.refresh_joker_grid(mod, e and e.UIBox)
+    end
+
+    G.FUNCS.gdcv_joker_page_next = function(e)
+        local total_pages = math.max(1, mod.test_joker_total_pages or 1)
+        local cur = mod.test_joker_page or 1
+        mod.test_joker_page = (cur < total_pages) and (cur + 1) or 1
+        UI.refresh_joker_grid(mod, e and e.UIBox)
+    end
+
+    G.FUNCS.gdcv_spawn_grid_joker = function(e)
+        local ent = e and e.config and e.config.ref_table
+        if ent and ent.key then
+            UI.spawn_test_joker(mod, ent)
+        end
     end
 
     G.FUNCS.gdcv_change_joker_selection = function(args)
         local idx = args.to_key
         if not idx then
-            -- Fallback by searching option value in list
             local entries = mod.test_joker_list or UI.get_filtered_joker_entries(mod)
             for i, ent in ipairs(entries) do
                 if ent.name == args.to_val then
@@ -487,361 +547,550 @@ function UI.init_callbacks(mod)
     end
 end
 
+UI.JOKER_GRID_COLS = 3
+UI.JOKER_GRID_ROWS = 4
+UI.JOKER_GRID_PER_PAGE = UI.JOKER_GRID_COLS * UI.JOKER_GRID_ROWS
+
+local function make_cycle_row(label, id, options, current_option, opt_callback, w, label_w)
+    return {
+        n = G.UIT.R,
+        config = {align = "cr", padding = 0.03},
+        nodes = {
+            {n = G.UIT.C, config = {align = "cl", minw = label_w or 3.1}, nodes = {
+                {n = G.UIT.T, config = {text = label, scale = 0.32, colour = G.C.UI.TEXT_LIGHT}}
+            }},
+            {n = G.UIT.C, config = {align = "cm"}, nodes = {
+                create_option_cycle({
+                    id = id,
+                    options = options,
+                    current_option = current_option,
+                    opt_callback = opt_callback,
+                    w = w or 2.8,
+                    h = 0.52,
+                    scale = 0.60
+                })
+            }}
+        }
+    }
+end
+
+local function find_option_index(options, value, default_idx)
+    local target = tostring(value)
+    for i, opt in ipairs(options) do
+        if tostring(opt) == target then return i end
+    end
+    return default_idx or 1
+end
+
+function UI.build_joker_grid_definition(mod)
+    local entries = UI.get_filtered_joker_entries(mod)
+    mod.test_joker_list = entries
+    local per_page = UI.JOKER_GRID_PER_PAGE
+    local total_matches = #entries
+    local total_pages = math.max(1, math.ceil(total_matches / per_page))
+    mod.test_joker_total_pages = total_pages
+    mod.test_joker_page = math.max(1, math.min(mod.test_joker_page or 1, total_pages))
+
+    local start_idx = (mod.test_joker_page - 1) * per_page + 1
+    local rarity_colours = {
+        [1] = G.C.BLUE,
+        [2] = G.C.GREEN,
+        [3] = G.C.RED,
+        [4] = G.C.PURPLE
+    }
+
+    local grid_rows = {}
+    if total_matches == 0 then
+        table.insert(grid_rows, {
+            n = G.UIT.R,
+            config = {align = "cm", padding = 0.06, minh = 2.0, minw = 6.9},
+            nodes = {
+                {n = G.UIT.T, config = {text = "No Jokers match filter.", scale = 0.34, colour = G.C.UI.TEXT_INACTIVE}}
+            }
+        })
+    else
+        for r = 1, UI.JOKER_GRID_ROWS do
+            local row_nodes = {}
+            for c = 1, UI.JOKER_GRID_COLS do
+                local idx = start_idx + (r - 1) * UI.JOKER_GRID_COLS + (c - 1)
+                local ent = entries[idx]
+                if ent then
+                    local tile_col = rarity_colours[ent.rarity] or G.C.BLUE
+                    table.insert(row_nodes, {
+                        n = G.UIT.C,
+                        config = {align = "cm", padding = 0.03},
+                        nodes = {
+                            UIBox_button({
+                                col = true,
+                                button = 'gdcv_spawn_grid_joker',
+                                ref_table = {key = ent.key, name = ent.name, index = idx},
+                                label = {ent.name or ent.key},
+                                minw = 2.18,
+                                maxw = 2.02,
+                                minh = 0.44,
+                                scale = 0.27,
+                                colour = tile_col
+                            })
+                        }
+                    })
+                else
+                    table.insert(row_nodes, {
+                        n = G.UIT.C,
+                        config = {align = "cm", padding = 0.03},
+                        nodes = {{n = G.UIT.B, config = {w = 2.18, h = 0.44}}}
+                    })
+                end
+            end
+            table.insert(grid_rows, {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.01},
+                nodes = row_nodes
+            })
+        end
+    end
+
+    -- Pagination Bar
+    table.insert(grid_rows, {
+        n = G.UIT.R,
+        config = {align = "cm", padding = 0.04},
+        nodes = {
+            UIBox_button({
+                col = true,
+                button = 'gdcv_joker_page_prev',
+                label = {'< Prev'},
+                minw = 1.35,
+                minh = 0.42,
+                scale = 0.28,
+                colour = G.C.L_BLACK
+            }),
+            {n = G.UIT.C, config = {align = "cm", minw = 3.4}, nodes = {
+                {n = G.UIT.T, config = {
+                    text = string.format("Page %d / %d  (%d jokers)", mod.test_joker_page, total_pages, total_matches),
+                    scale = 0.28,
+                    colour = G.C.UI.TEXT_LIGHT
+                }}
+            }},
+            UIBox_button({
+                col = true,
+                button = 'gdcv_joker_page_next',
+                label = {'Next >'},
+                minw = 1.35,
+                minh = 0.42,
+                scale = 0.28,
+                colour = G.C.L_BLACK
+            })
+        }
+    })
+
+    return {
+        n = G.UIT.ROOT,
+        config = {align = "cm", padding = 0.03, colour = G.C.CLEAR, minw = 7.0},
+        nodes = grid_rows
+    }
+end
+
+function UI.refresh_joker_grid(mod, root_uibox)
+    local uibox = root_uibox or G.OVERLAY_MENU
+    if not uibox or not uibox.get_UIE_by_ID then return end
+    local holder = uibox:get_UIE_by_ID('gdcv_joker_grid_holder')
+    if not holder then return end
+    if holder.config.object and holder.config.object.remove then
+        holder.config.object:remove()
+    end
+    holder.config.object = UIBox{
+        definition = UI.build_joker_grid_definition(mod),
+        config = {offset = {x = 0, y = 0}, parent = holder, type = 'cm'}
+    }
+    if holder.UIBox and holder.UIBox.recalculate then
+        holder.UIBox:recalculate()
+    end
+end
+
+function UI.refresh_page_holder(mod, root_uibox)
+    local uibox = root_uibox or G.OVERLAY_MENU
+    if not uibox or not uibox.get_UIE_by_ID then return end
+    local active_page = mod.config_page or 'dataset'
+    for _, pid in ipairs({'dataset', 'jokers', 'system'}) do
+        local tab_btn = uibox:get_UIE_by_ID('gdcv_tab_' .. pid)
+        if tab_btn and tab_btn.config then
+            tab_btn.config.colour = (pid == active_page) and G.C.ORANGE or G.C.L_BLACK
+        end
+    end
+    local holder = uibox:get_UIE_by_ID('gdcv_page_holder')
+    if not holder then return end
+    if holder.config.object and holder.config.object.remove then
+        holder.config.object:remove()
+    end
+    holder.config.object = UIBox{
+        definition = UI.build_page_definition(mod),
+        config = {offset = {x = 0, y = 0}, parent = holder, type = 'cm'}
+    }
+    if holder.UIBox and holder.UIBox.recalculate then
+        holder.UIBox:recalculate()
+    end
+end
+
+function UI.build_page_definition(mod)
+    local page = mod.config_page or 'dataset'
+
+    if page == 'jokers' then
+        mod.test_joker_rarity_filter = mod.test_joker_rarity_filter or "All"
+        mod.test_joker_edition = mod.test_joker_edition or "None"
+        mod.test_joker_sticker = mod.test_joker_sticker or "None"
+        mod.test_joker_search = mod.test_joker_search or ""
+
+        local rarity_options = {"All", "Common", "Uncommon", "Rare", "Legendary"}
+        local rarity_idx = find_option_index(rarity_options, mod.test_joker_rarity_filter, 1)
+
+        local edition_options = {"None", "Foil", "Holo", "Polychrome", "Negative"}
+        local edition_idx = find_option_index(edition_options, mod.test_joker_edition, 1)
+
+        local sticker_options = {"None", "Eternal", "Perishable", "Rental"}
+        local sticker_idx = find_option_index(sticker_options, mod.test_joker_sticker, 1)
+
+        return {
+            n = G.UIT.ROOT,
+            config = {align = "cm", padding = 0.05, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
+            nodes = {
+                -- Search + Rarity Row
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.03},
+                    nodes = {
+                        create_text_input({
+                            w = 2.4,
+                            h = 0.46,
+                            text_scale = 0.34,
+                            max_length = 24,
+                            extended_corpus = true,
+                            prompt_text = "Search joker...",
+                            ref_table = mod,
+                            ref_value = "test_joker_search",
+                            callback = function()
+                                mod.test_joker_page = 1
+                                UI.refresh_joker_grid(mod)
+                            end
+                        }),
+                        {n = G.UIT.B, config = {w = 0.08, h = 0.1}},
+                        UIBox_button({
+                            col = true,
+                            button = 'gdcv_apply_joker_search',
+                            label = {'Find'},
+                            minw = 0.85,
+                            minh = 0.46,
+                            scale = 0.28,
+                            colour = G.C.BLUE
+                        }),
+                        {n = G.UIT.B, config = {w = 0.06, h = 0.1}},
+                        UIBox_button({
+                            col = true,
+                            button = 'gdcv_clear_joker_search',
+                            label = {'X'},
+                            minw = 0.50,
+                            minh = 0.46,
+                            scale = 0.28,
+                            colour = G.C.RED
+                        }),
+                        {n = G.UIT.B, config = {w = 0.12, h = 0.1}},
+                        create_option_cycle({
+                            id = 'gdcv_joker_rarity_cycle',
+                            options = rarity_options,
+                            current_option = rarity_idx,
+                            opt_callback = 'gdcv_change_joker_rarity',
+                            w = 2.1,
+                            h = 0.46,
+                            scale = 0.55
+                        })
+                    }
+                },
+                -- Edition & Sticker Row
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.02},
+                    nodes = {
+                        {n = G.UIT.T, config = {text = "Ed:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
+                        {n = G.UIT.B, config = {w = 0.06, h = 0.1}},
+                        create_option_cycle({
+                            id = 'gdcv_joker_edition_cycle',
+                            options = edition_options,
+                            current_option = edition_idx,
+                            opt_callback = 'gdcv_change_joker_edition',
+                            w = 2.2,
+                            h = 0.44,
+                            scale = 0.54
+                        }),
+                        {n = G.UIT.B, config = {w = 0.22, h = 0.1}},
+                        {n = G.UIT.T, config = {text = "Stk:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
+                        {n = G.UIT.B, config = {w = 0.06, h = 0.1}},
+                        create_option_cycle({
+                            id = 'gdcv_joker_sticker_cycle',
+                            options = sticker_options,
+                            current_option = sticker_idx,
+                            opt_callback = 'gdcv_change_joker_sticker',
+                            w = 2.2,
+                            h = 0.44,
+                            scale = 0.54
+                        })
+                    }
+                },
+                -- Clickable 3x4 Paginated Joker Grid
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.02},
+                    nodes = {
+                        {
+                            n = G.UIT.O,
+                            config = {
+                                id = 'gdcv_joker_grid_holder',
+                                object = UIBox{
+                                    definition = UI.build_joker_grid_definition(mod),
+                                    config = {offset = {x = 0, y = 0}, align = 'cm'}
+                                }
+                            }
+                        }
+                    }
+                },
+                -- Board Controls Row
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.03},
+                    nodes = {
+                        UIBox_button({
+                            col = true,
+                            button = 'gdcv_clear_all_jokers',
+                            label = {'Clear Jokers'},
+                            minw = 2.4,
+                            minh = 0.46,
+                            scale = 0.29,
+                            colour = G.C.RED
+                        }),
+                        {n = G.UIT.B, config = {w = 0.2, h = 0.1}},
+                        UIBox_button({
+                            col = true,
+                            button = 'gdcv_setup_custom_test_suite',
+                            label = {'Setup Custom Test Suite'},
+                            minw = 3.8,
+                            minh = 0.46,
+                            scale = 0.29,
+                            colour = G.C.PURPLE
+                        })
+                    }
+                }
+            }
+        }
+    elseif page == 'system' then
+        return {
+            n = G.UIT.ROOT,
+            config = {align = "cm", padding = 0.08, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
+            nodes = {
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.05, r = 0.08, colour = G.C.BLACK, minw = 6.8},
+                    nodes = {
+                        {n = G.UIT.T, config = {
+                            text = "Engine Parity Tracker: AUTO-ACTIVE (run_telemetry.jsonl)",
+                            scale = 0.29,
+                            colour = G.C.GREEN
+                        }}
+                    }
+                },
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.05, r = 0.08, colour = G.C.BLACK, minw = 6.8},
+                    nodes = {
+                        {n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+                            {n = G.UIT.T, config = {text = "Hotkeys: [F1/F2] Toggle Mode  |  [Tab] Setup / Auto-Gen", scale = 0.26, colour = G.C.UI.TEXT_LIGHT}}
+                        }},
+                        {n = G.UIT.R, config = {align = "cm", padding = 0.02}, nodes = {
+                            {n = G.UIT.T, config = {text = "Setup: [1-9,0,V] Select ROI/Box  |  [WASD/Arrows] Move/Resize  |  [R] Regen  |  [P] Shop/Pack  |  [C] Capture", scale = 0.24, colour = G.C.UI.TEXT_INACTIVE}}
+                        }}
+                    }
+                },
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.04},
+                    nodes = {
+                        UIBox_button({col = true, button = 'gdcv_save_config', label = {'Save Config'}, minw = 2.1, minh = 0.52, scale = 0.30, colour = G.C.GREEN}),
+                        {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
+                        UIBox_button({col = true, button = 'gdcv_load_config', label = {'Load Config'}, minw = 2.1, minh = 0.52, scale = 0.30, colour = G.C.ORANGE}),
+                        {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
+                        UIBox_button({col = true, button = 'gdcv_reload_mod', label = {'Hot Reload'}, minw = 2.1, minh = 0.52, scale = 0.30, colour = G.C.BLUE})
+                    }
+                },
+                {
+                    n = G.UIT.R,
+                    config = {align = "cm", padding = 0.04},
+                    nodes = {
+                        {
+                            n = G.UIT.C,
+                            config = {
+                                align = "cm",
+                                padding = 0.05,
+                                r = 0.1,
+                                hover = true,
+                                colour = G.C.RED,
+                                button = 'gdcv_clear_dataset',
+                                minw = 3.2,
+                                minh = 0.52,
+                                shadow = true
+                            },
+                            nodes = {
+                                {n = G.UIT.R, config = {align = "cm", padding = 0}, nodes = {
+                                    {n = G.UIT.T, config = {
+                                        ref_table = mod,
+                                        ref_value = "clear_button_text",
+                                        text = mod.clear_button_text,
+                                        scale = 0.30,
+                                        colour = G.C.UI.TEXT_LIGHT,
+                                        shadow = true
+                                    }}
+                                }}
+                            }
+                        },
+                        {n = G.UIT.B, config = {w = 0.25, h = 0.1}},
+                        UIBox_button({col = true, button = 'gdcv_restart_game', label = {'Restart Game'}, minw = 3.2, minh = 0.52, scale = 0.30, colour = G.C.PURPLE})
+                    }
+                }
+            }
+        }
+    end
+
+    -- Default page: 'dataset'
+    local current_mode_idx = (mod.config.mode == 'card_classifier' and 2) or (mod.config.mode == 'shop_classifier' and 3) or 1
+
+    local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
+    local current_mf_idx = find_option_index(max_frames_options, mod.config.max_frames or 10000, 4)
+
+    local perkeo_max_options = {'4', '5', '6', '7', '8', '9', '10'}
+    local current_pm_idx = find_option_index(perkeo_max_options, mod.config.perkeo_max_consumables or 10, 7)
+
+    local selection_chance_options = {'0%', '50%', '100%'}
+    local current_sc_idx = find_option_index(selection_chance_options, mod.config.card_selection_chance or '50%', 2)
+
+    local frame_wait_options = {'0.02s', '0.05s', '0.08s', '0.15s', '0.25s'}
+    local current_fw_val = tonumber(mod.config.frame_wait_time) or 0.08
+    local current_fw_idx = 3
+    for idx, val in ipairs(frame_wait_options) do
+        local num = tonumber((val:gsub('s$', '')))
+        if num and math.abs(num - current_fw_val) < 0.005 then current_fw_idx = idx; break end
+    end
+
+    local jd_installed = (JokerDisplay ~= nil and type(JokerDisplay.Definitions) == 'table' and type(Card) == 'table' and type(Card.update_joker_display) == 'function')
+    local jd_status_text = jd_installed
+        and "JokerDisplay Mod: DETECTED (30% shown / randomized, 70% hidden)"
+        or "JokerDisplay Mod: NOT FOUND (safe fallback active)"
+
+    return {
+        n = G.UIT.ROOT,
+        config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
+        nodes = {
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier'}, current_mode_idx, 'gdcv_change_mode'),
+            make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
+            make_cycle_row("Perkeo Max Consumables", 'gdcv_pm_cycle', perkeo_max_options, current_pm_idx, 'gdcv_change_perkeo_max'),
+            make_cycle_row("Card Selection Chance", 'gdcv_sc_cycle', selection_chance_options, current_sc_idx, 'gdcv_change_card_selection_chance'),
+            make_cycle_row("Frame Wait Time", 'gdcv_fw_cycle', frame_wait_options, current_fw_idx, 'gdcv_change_frame_wait_time'),
+            {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.04},
+                nodes = {
+                    {n = G.UIT.T, config = {text = jd_status_text, scale = 0.25, colour = jd_installed and G.C.GREEN or G.C.UI.TEXT_INACTIVE}}
+                }
+            }
+        }
+    }
+end
+
 function UI.create_config_tab()
     local mod = G.DATASET_MOD
     mod.clear_confirm = false
     mod.clear_confirm_timer = 0
     mod.clear_button_text = "Clear Dataset"
+    mod.config_page = mod.config_page or 'dataset'
     mod.stats_text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
         mod.frame_counts and mod.frame_counts.card or 0,
         mod.frame_counts and mod.frame_counts.shop or 0,
         string.upper(mod.shop_phase or 'shop'))
 
-    local current_mode_idx = (mod.config.mode == 'card_classifier' and 2) or (mod.config.mode == 'shop_classifier' and 3) or 1
+    local active_page = mod.config_page
 
-    local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
-    local current_mf_str = tostring(mod.config.max_frames or 10000)
-    local current_mf_idx = 4
-    for idx, val in ipairs(max_frames_options) do
-        if val == current_mf_str then current_mf_idx = idx; break end
-    end
-
-    local perkeo_max_options = {'4', '5', '6', '7', '8', '9', '10'}
-    local current_pm_str = tostring(mod.config.perkeo_max_consumables or 10)
-    local current_pm_idx = 7
-    for idx, val in ipairs(perkeo_max_options) do
-        if val == current_pm_str then current_pm_idx = idx; break end
-    end
-
-    local selection_chance_options = {'0%', '50%', '100%'}
-    local current_sc_str = tostring(mod.config.card_selection_chance or '50%')
-    local current_sc_idx = 2
-    for idx, val in ipairs(selection_chance_options) do
-        if val == current_sc_str then current_sc_idx = idx; break end
-    end
-
-    -- Initialize Joker Generator State
-    mod.test_joker_rarity_filter = mod.test_joker_rarity_filter or "All"
-    mod.test_joker_edition = mod.test_joker_edition or "None"
-    mod.test_joker_sticker = mod.test_joker_sticker or "None"
-    local joker_entries = UI.get_filtered_joker_entries(mod)
-    mod.test_joker_list = joker_entries
-    mod.test_joker_idx = math.min(mod.test_joker_idx or 1, math.max(1, #joker_entries))
-
-    local joker_names = {}
-    for _, ent in ipairs(joker_entries) do
-        table.insert(joker_names, ent.name)
-    end
-    if #joker_names == 0 then
-        joker_names = {"No Jokers Found"}
-    end
-
-    local sel_entry = joker_entries[mod.test_joker_idx]
-    mod.test_joker_name_display = sel_entry and sel_entry.name or "None"
-    mod.test_joker_key_display = sel_entry and ("[" .. sel_entry.key .. "]") or "[-]"
-
-    local rarity_options = {"All", "Common", "Uncommon", "Rare", "Legendary"}
-    local rarity_idx = 1
-    for i, r in ipairs(rarity_options) do
-        if r == mod.test_joker_rarity_filter then rarity_idx = i; break end
-    end
-
-    local edition_options = {"None", "Foil", "Holo", "Polychrome", "Negative"}
-    local edition_idx = 1
-    for i, ed in ipairs(edition_options) do
-        if ed == mod.test_joker_edition then edition_idx = i; break end
-    end
-
-    local sticker_options = {"None", "Eternal", "Perishable", "Rental"}
-    local sticker_idx = 1
-    for i, st in ipairs(sticker_options) do
-        if st == mod.test_joker_sticker then sticker_idx = i; break end
-    end
-
-    local tab_def = {
+    return {
         n = G.UIT.ROOT,
         config = {
             r = 0.1,
-            minw = 6.8,
+            minw = 7.4,
             align = "cm",
             padding = 0.08,
             colour = G.C.BLACK
         },
         nodes = {
-            -- Title
+            -- Compact Title
+            {
+                n = G.UIT.R,
+                config = {align = "cm", padding = 0.03},
+                nodes = {
+                    {n = G.UIT.T, config = {text = "GameState Dataset CV - Settings", scale = 0.38, colour = G.C.GOLD}}
+                }
+            },
+            -- Top Page Navigation Tabs
             {
                 n = G.UIT.R,
                 config = {align = "cm", padding = 0.04},
                 nodes = {
-                    {n = G.UIT.T, config = {text = "GameState Dataset CV - Settings", scale = 0.42, colour = G.C.GOLD}}
+                    UIBox_button({
+                        col = true,
+                        id = 'gdcv_tab_dataset',
+                        button = 'gdcv_switch_page',
+                        ref_table = {page = 'dataset'},
+                        label = {'Dataset Gen'},
+                        minw = 2.25,
+                        minh = 0.46,
+                        scale = 0.29,
+                        colour = (active_page == 'dataset') and G.C.ORANGE or G.C.L_BLACK
+                    }),
+                    {n = G.UIT.B, config = {w = 0.12, h = 0.1}},
+                    UIBox_button({
+                        col = true,
+                        id = 'gdcv_tab_jokers',
+                        button = 'gdcv_switch_page',
+                        ref_table = {page = 'jokers'},
+                        label = {'Joker Spawner'},
+                        minw = 2.25,
+                        minh = 0.46,
+                        scale = 0.29,
+                        colour = (active_page == 'jokers') and G.C.ORANGE or G.C.L_BLACK
+                    }),
+                    {n = G.UIT.B, config = {w = 0.12, h = 0.1}},
+                    UIBox_button({
+                        col = true,
+                        id = 'gdcv_tab_system',
+                        button = 'gdcv_switch_page',
+                        ref_table = {page = 'system'},
+                        label = {'System & Tools'},
+                        minw = 2.25,
+                        minh = 0.46,
+                        scale = 0.29,
+                        colour = (active_page == 'system') and G.C.ORANGE or G.C.L_BLACK
+                    })
                 }
             },
-            -- Telemetry Engine Status
-            {
-                n = G.UIT.R,
-                config = {align = "cm", padding = 0.02},
-                nodes = {
-                    {
-                        n = G.UIT.C,
-                        config = {align = "cm", padding = 0.04, r = 0.1, colour = G.C.L_BLACK, minw = 6.4},
-                        nodes = {
-                            {
-                                n = G.UIT.T,
-                                config = {
-                                    text = "Engine Parity Tracker: AUTO-ACTIVE (Recording to run_telemetry.jsonl)",
-                                    scale = 0.28,
-                                    colour = G.C.GREEN
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            -- Mode Selector Cycle
-            {
-                n = G.UIT.R,
-                config = {align = "cr", padding = 0.02},
-                nodes = {
-                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
-                        {n = G.UIT.T, config = {text = "Classifier Mode", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
-                    }},
-                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                        create_option_cycle({
-                            id = 'gdcv_mode_cycle',
-                            options = {'Off', 'Card Classifier', 'Shop Classifier'},
-                            current_option = current_mode_idx,
-                            opt_callback = 'gdcv_change_mode',
-                            w = 2.8,
-                            h = 0.6,
-                            scale = 0.65
-                        })
-                    }}
-                }
-            },
-            -- Target Frames Cap Cycle
-            {
-                n = G.UIT.R,
-                config = {align = "cr", padding = 0.02},
-                nodes = {
-                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
-                        {n = G.UIT.T, config = {text = "Target Frame Cap", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
-                    }},
-                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                        create_option_cycle({
-                            id = 'gdcv_mf_cycle',
-                            options = max_frames_options,
-                            current_option = current_mf_idx,
-                            opt_callback = 'gdcv_change_max_frames',
-                            w = 2.8,
-                            h = 0.6,
-                            scale = 0.65
-                        })
-                    }}
-                }
-            },
-            -- Perkeo Max Consumables Cycle
-            {
-                n = G.UIT.R,
-                config = {align = "cr", padding = 0.02},
-                nodes = {
-                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
-                        {n = G.UIT.T, config = {text = "Perkeo Max Consumables", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
-                    }},
-                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                        create_option_cycle({
-                            id = 'gdcv_pm_cycle',
-                            options = perkeo_max_options,
-                            current_option = current_pm_idx,
-                            opt_callback = 'gdcv_change_perkeo_max',
-                            w = 2.8,
-                            h = 0.6,
-                            scale = 0.65
-                        })
-                    }}
-                }
-            },
-            -- Card Selection Chance Cycle
-            {
-                n = G.UIT.R,
-                config = {align = "cr", padding = 0.02},
-                nodes = {
-                    {n = G.UIT.C, config = {align = "cl", minw = 3.0}, nodes = {
-                        {n = G.UIT.T, config = {text = "Card Selection Chance", scale = 0.35, colour = G.C.UI.TEXT_LIGHT}}
-                    }},
-                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                        create_option_cycle({
-                            id = 'gdcv_sc_cycle',
-                            options = selection_chance_options,
-                            current_option = current_sc_idx,
-                            opt_callback = 'gdcv_change_card_selection_chance',
-                            w = 2.8,
-                            h = 0.6,
-                            scale = 0.65
-                        })
-                    }}
-                }
-            },
-            -- =========================================================
-            -- JOKER SPAWNER TEST BENCH (RNG & GameState Re-creation)
-            -- =========================================================
+            -- Dynamic Page Body
             {
                 n = G.UIT.R,
                 config = {align = "cm", padding = 0.03},
                 nodes = {
                     {
-                        n = G.UIT.C,
-                        config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 6.5},
-                        nodes = {
-                            -- Header
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0.02},
-                                nodes = {
-                                    {
-                                        n = G.UIT.T,
-                                        config = {
-                                            text = "JOKER TEST GENERATOR (GameState / RNG)",
-                                            scale = 0.34,
-                                            colour = G.C.ORANGE
-                                        }
-                                    }
-                                }
-                            },
-                            -- Rarity Filter Cycle
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cr", padding = 0.02},
-                                nodes = {
-                                    {n = G.UIT.C, config = {align = "cl", minw = 2.8}, nodes = {
-                                        {n = G.UIT.T, config = {text = "Rarity Filter", scale = 0.30, colour = G.C.UI.TEXT_LIGHT}}
-                                    }},
-                                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                                        create_option_cycle({
-                                            id = 'gdcv_joker_rarity_cycle',
-                                            options = rarity_options,
-                                            current_option = rarity_idx,
-                                            opt_callback = 'gdcv_change_joker_rarity',
-                                            w = 3.2,
-                                            h = 0.55,
-                                            scale = 0.60
-                                        })
-                                    }}
-                                }
-                            },
-                            -- Joker Selector Cycle
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cr", padding = 0.02},
-                                nodes = {
-                                    {n = G.UIT.C, config = {align = "cl", minw = 2.8}, nodes = {
-                                        {n = G.UIT.T, config = {text = "Select Joker", scale = 0.30, colour = G.C.UI.TEXT_LIGHT}}
-                                    }},
-                                    {n = G.UIT.C, config = {align = "cm"}, nodes = {
-                                        create_option_cycle({
-                                            id = 'gdcv_joker_choice_cycle',
-                                            options = joker_names,
-                                            current_option = math.min(mod.test_joker_idx, #joker_names),
-                                            opt_callback = 'gdcv_change_joker_selection',
-                                            w = 3.2,
-                                            h = 0.55,
-                                            scale = 0.55
-                                        })
-                                    }}
-                                }
-                            },
-                            -- Active Key Display
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0.01},
-                                nodes = {
-                                    {
-                                        n = G.UIT.T,
-                                        config = {
-                                            ref_table = mod,
-                                            ref_value = "test_joker_key_display",
-                                            text = mod.test_joker_key_display,
-                                            scale = 0.26,
-                                            colour = G.C.BLUE
-                                        }
-                                    }
-                                }
-                            },
-                            -- Modifiers: Edition & Sticker Cycle Row
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0.02},
-                                nodes = {
-                                    {n = G.UIT.C, config = {align = "cm", padding = 0.01}, nodes = {
-                                        {n = G.UIT.T, config = {text = "Edition:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
-                                        create_option_cycle({
-                                            id = 'gdcv_joker_edition_cycle',
-                                            options = edition_options,
-                                            current_option = edition_idx,
-                                            opt_callback = 'gdcv_change_joker_edition',
-                                            w = 2.2,
-                                            h = 0.5,
-                                            scale = 0.55
-                                        })
-                                    }},
-                                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
-                                    {n = G.UIT.C, config = {align = "cm", padding = 0.01}, nodes = {
-                                        {n = G.UIT.T, config = {text = "Sticker:", scale = 0.28, colour = G.C.UI.TEXT_LIGHT}},
-                                        create_option_cycle({
-                                            id = 'gdcv_joker_sticker_cycle',
-                                            options = sticker_options,
-                                            current_option = sticker_idx,
-                                            opt_callback = 'gdcv_change_joker_sticker',
-                                            w = 2.2,
-                                            h = 0.5,
-                                            scale = 0.55
-                                        })
-                                    }}
-                                }
-                            },
-                            -- Action Buttons: Spawn Joker & Clear All Jokers
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0.03},
-                                nodes = {
-                                    UIBox_button({
-                                        button = 'gdcv_spawn_selected_joker',
-                                        label = {'+ Spawn Joker'},
-                                        minw = 2.9,
-                                        minh = 0.55,
-                                        scale = 0.32,
-                                        colour = G.C.GOLD
-                                    }),
-                                    {n = G.UIT.B, config = {w = 0.2, h = 0.1}},
-                                    UIBox_button({
-                                        button = 'gdcv_clear_all_jokers',
-                                        label = {'Clear Jokers'},
-                                        minw = 2.9,
-                                        minh = 0.55,
-                                        scale = 0.32,
-                                        colour = G.C.RED
-                                    })
-                                }
-                            },
-                            -- Custom Test Suite Setup: Spawn All Custom Jokers & Consumables, Split Deck Lucky/Glass
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0.03},
-                                nodes = {
-                                    UIBox_button({
-                                        button = 'gdcv_setup_custom_test_suite',
-                                        label = {'Setup Custom Engine Test Suite'},
-                                        minw = 6.0,
-                                        minh = 0.55,
-                                        scale = 0.32,
-                                        colour = G.C.PURPLE
-                                    })
-                                }
+                        n = G.UIT.O,
+                        config = {
+                            id = 'gdcv_page_holder',
+                            object = UIBox{
+                                definition = UI.build_page_definition(mod),
+                                config = {offset = {x = 0, y = 0}, align = 'cm'}
                             }
                         }
                     }
                 }
             },
-            -- Stats & Info Row
+            -- Compact Live Stats Footer
             {
                 n = G.UIT.R,
                 config = {align = "cm", padding = 0.03},
@@ -852,97 +1101,14 @@ function UI.create_config_tab()
                             ref_table = mod,
                             ref_value = "stats_text",
                             text = mod.stats_text,
-                            scale = 0.30,
+                            scale = 0.28,
                             colour = G.C.UI.TEXT_INACTIVE
                         }
                     }
                 }
-            },
-            -- Buttons Row 1: Save, Load, Hot Reload
-            {
-                n = G.UIT.R,
-                config = {align = "cm", padding = 0.03},
-                nodes = {
-                    UIBox_button({
-                        button = 'gdcv_save_config',
-                        label = {'Save Config'},
-                        minw = 1.9,
-                        minh = 0.55,
-                        scale = 0.32,
-                        colour = G.C.GREEN
-                    }),
-                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
-                    UIBox_button({
-                        button = 'gdcv_load_config',
-                        label = {'Load Config'},
-                        minw = 1.9,
-                        minh = 0.55,
-                        scale = 0.32,
-                        colour = G.C.ORANGE
-                    }),
-                    {n = G.UIT.B, config = {w = 0.15, h = 0.1}},
-                    UIBox_button({
-                        button = 'gdcv_reload_mod',
-                        label = {'Hot Reload'},
-                        minw = 1.9,
-                        minh = 0.55,
-                        scale = 0.32,
-                        colour = G.C.BLUE
-                    })
-                }
-            },
-            -- Buttons Row 2: Clear Dataset (Confirmation) & Restart Game
-            {
-                n = G.UIT.R,
-                config = {align = "cm", padding = 0.03},
-                nodes = {
-                    {
-                        n = G.UIT.C,
-                        config = {
-                            align = "cm",
-                            padding = 0.05,
-                            r = 0.1,
-                            hover = true,
-                            colour = G.C.RED,
-                            button = 'gdcv_clear_dataset',
-                            minw = 2.9,
-                            minh = 0.55,
-                            shadow = true,
-                        },
-                        nodes = {
-                            {
-                                n = G.UIT.R,
-                                config = {align = "cm", padding = 0},
-                                nodes = {
-                                    {
-                                        n = G.UIT.T,
-                                        config = {
-                                            ref_table = mod,
-                                            ref_value = "clear_button_text",
-                                            text = mod.clear_button_text,
-                                            scale = 0.32,
-                                            colour = G.C.UI.TEXT_LIGHT,
-                                            shadow = true
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    {n = G.UIT.B, config = {w = 0.2, h = 0.1}},
-                    UIBox_button({
-                        button = 'gdcv_restart_game',
-                        label = {'Restart Game'},
-                        minw = 2.9,
-                        minh = 0.55,
-                        scale = 0.32,
-                        colour = G.C.PURPLE
-                    })
-                }
             }
         }
     }
-    return tab_def
 end
 
 -- ==========================================
@@ -1155,6 +1321,7 @@ function G.DATASET_MOD:on_keypressed(key)
         else
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
+            if self.restore_joker_display_config then self:restore_joker_display_config() end
             self.capture_flash = 2.0
             self.capture_flash_text = "CALIBRATION SETUP MODE ACTIVE."
             print("DATASET: Setup Mode Started")
@@ -1285,6 +1452,7 @@ function G.DATASET_MOD:update(dt)
         if cur_frame >= max_frames then
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
+            if self.restore_joker_display_config then self:restore_joker_display_config() end
             self.capture_flash = 3.0
             self.capture_flash_text = string.format("REACHED TARGET CAP (%d FRAMES)! GENERATION STOPPED.", max_frames)
             print(string.format("DATASET: Reached threshold cap of %d frames. Stopped generation.", max_frames))
@@ -1300,7 +1468,7 @@ function G.DATASET_MOD:update(dt)
             end
 
             self.state = 'waiting'
-            self.timer = 0.08 -- Reduced from 0.25 since animations are instantly snapped
+            self.timer = tonumber(self.config.frame_wait_time) or 0.08
         elseif self.state == 'waiting' then
             self.timer = self.timer - dt
             if self.timer <= 0 then

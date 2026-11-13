@@ -10,6 +10,7 @@ local DEFAULT_CONFIG = {
     perkeo_max_consumables = 10, -- Max consumables in perkeo mode (configurable)
     show_shop_prices = false, -- Synchronously render price labels below shop items (disabled for fast animation-free generation)
     card_selection_chance = '50%', -- '0%', '50%', '100%'
+    frame_wait_time = 0.08, -- Seconds to wait between generation and capture
     rois = {
         card_hand    = {x = 508.319934, y = 567.839093, w = 1071.056521, h = 322.734447},
         joker_bar    = {x = 320.0,      y = 10.0,       w = 1280.0,      h = 260.0},
@@ -38,6 +39,7 @@ function Config.init(mod)
         perkeo_max_consumables = DEFAULT_CONFIG.perkeo_max_consumables,
         show_shop_prices = DEFAULT_CONFIG.show_shop_prices,
         card_selection_chance = DEFAULT_CONFIG.card_selection_chance,
+        frame_wait_time = DEFAULT_CONFIG.frame_wait_time,
         rois = {},
         boxes = {}
     }
@@ -166,6 +168,7 @@ function G.DATASET_MOD:save_config()
     content = content .. string.format("  perkeo_max_consumables = %d,\n", self.config.perkeo_max_consumables or 10)
     content = content .. string.format("  show_shop_prices = %s,\n", self.config.show_shop_prices ~= false and "true" or "false")
     content = content .. string.format("  card_selection_chance = %q,\n", self.config.card_selection_chance or '50%')
+    content = content .. string.format("  frame_wait_time = %.3f,\n", tonumber(self.config.frame_wait_time) or 0.08)
     
     content = content .. "  rois = {\n"
     for k, v in pairs(self.config.rois) do
@@ -199,6 +202,7 @@ function G.DATASET_MOD:load_config()
                 if t.perkeo_max_consumables then self.config.perkeo_max_consumables = tonumber(t.perkeo_max_consumables) or 10 end
                 if t.show_shop_prices ~= nil then self.config.show_shop_prices = (t.show_shop_prices == true) end
                 if t.card_selection_chance then self.config.card_selection_chance = tostring(t.card_selection_chance) end
+                if t.frame_wait_time then self.config.frame_wait_time = tonumber(t.frame_wait_time) or 0.08 end
 
                 -- Backwards compatibility: single 'roi' table
                 if t.roi and type(t.roi) == "table" and not t.rois then
@@ -253,6 +257,9 @@ end
 
 function G.DATASET_MOD:set_mode(mode)
     if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'off' then
+        if mode ~= 'shop_classifier' and self.restore_joker_display_config then
+            self:restore_joker_display_config()
+        end
         self.config.mode = mode
         if mode == 'card_classifier' then
             self.selected_target = 'roi_card_hand'

@@ -68,21 +68,24 @@ def apply_video_compression_noise(img_tensor: torch.Tensor, p: float = 0.5) -> t
         return img_tensor.squeeze(0) if is_single else img_tensor
 
     out = img_tensor.clone()
-    selected = out[mask]
+    orig_dtype = out.dtype
+    selected = out[mask].float()
     orig_h, orig_w = selected.shape[-2:]
+
+    max_val = 255.0 if orig_dtype == torch.uint8 or selected.max() > 1.5 else 1.0
 
     scale = torch.empty(1, device=device).uniform_(0.35, 0.75).item()
     down_h = max(8, int(orig_h * scale))
     down_w = max(8, int(orig_w * scale))
 
     down = F.interpolate(selected, size=(down_h, down_w), mode="bilinear", align_corners=False)
-    down = torch.round(down * 32.0) / 32.0
+    step = max_val / 32.0
+    down = torch.round(down / step) * step
     up = F.interpolate(down, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
 
-    max_val = 255.0 if selected.max() > 1.5 else 1.0
     noise = (torch.rand_like(selected) - 0.5) * 0.04 * max_val
 
-    selected_augmented = torch.clamp(up + noise, 0.0, max_val)
+    selected_augmented = torch.clamp(up + noise, 0.0, max_val).to(orig_dtype)
     out[mask] = selected_augmented
 
     return out.squeeze(0) if is_single else out
@@ -113,6 +116,7 @@ def overlay_cursor_noise(img_tensor: torch.Tensor, cursor_rgba: np.ndarray = Non
         return img_tensor.squeeze(0) if is_single else img_tensor
 
     out = img_tensor.clone()
+    orig_dtype = out.dtype
     c_h, c_w = cursor_rgba.shape[:2]
 
     for idx in range(batch_size):
@@ -133,11 +137,12 @@ def overlay_cursor_noise(img_tensor: torch.Tensor, cursor_rgba: np.ndarray = Non
         c_rgb = torch.tensor(resized[..., :3], dtype=torch.float32, device=device).permute(2, 0, 1)
         c_alpha = torch.tensor(resized[..., 3:], dtype=torch.float32, device=device).permute(2, 0, 1)
 
-        if out[idx].max() <= 1.5:
+        if orig_dtype != torch.uint8 and out[idx].max() <= 1.5:
             c_rgb = c_rgb / 255.0
 
-        bg_patch = out[idx, :, y:y+target_h, x:x+target_w]
-        out[idx, :, y:y+target_h, x:x+target_w] = bg_patch * (1.0 - c_alpha) + c_rgb * c_alpha
+        bg_patch = out[idx, :, y:y+target_h, x:x+target_w].float()
+        blended = bg_patch * (1.0 - c_alpha) + c_rgb * c_alpha
+        out[idx, :, y:y+target_h, x:x+target_w] = blended.to(orig_dtype)
 
     return out.squeeze(0) if is_single else out
 

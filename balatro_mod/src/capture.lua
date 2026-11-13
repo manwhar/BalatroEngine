@@ -33,6 +33,25 @@ local function clamp_aabb_to_roi(roi, bx, by, bw, bh)
     return min_x, min_y, max_x - min_x, max_y - min_y
 end
 
+local function paste_clamped_region(img, rx, ry, rw, rh)
+    local out_w = math.max(1, math.floor(rw))
+    local out_h = math.max(1, math.floor(rh))
+    local cropped = love.image.newImageData(out_w, out_h)
+    if not img then return cropped end
+    local img_w, img_h = img:getWidth(), img:getHeight()
+    local floor_rx, floor_ry = math.floor(rx), math.floor(ry)
+    local src_x1 = math.max(0, floor_rx)
+    local src_y1 = math.max(0, floor_ry)
+    local src_x2 = math.min(img_w, floor_rx + out_w)
+    local src_y2 = math.min(img_h, floor_ry + out_h)
+    local copy_w = src_x2 - src_x1
+    local copy_h = src_y2 - src_y1
+    if copy_w > 0 and copy_h > 0 then
+        cropped:paste(img, src_x1 - floor_rx, src_y1 - floor_ry, src_x1, src_y1, copy_w, copy_h)
+    end
+    return cropped
+end
+
 local function to_yolo(roi, bx, by, bw, bh)
     local cx = bx + bw / 2
     local cy = by + bh / 2
@@ -130,8 +149,7 @@ function G.DATASET_MOD:capture_frame_card()
     local current_frame = self.frame_counts.card
 
     love.graphics.captureScreenshot(function(img)
-        local cropped = love.image.newImageData(rw, rh)
-        cropped:paste(img, 0, 0, rx, ry, rw, rh)
+        local cropped = paste_clamped_region(img, rx, ry, rw, rh)
         
         local filedata = cropped:encode("png")
         local filename = string.format("Mods/gamestate_dataset_cv/dataset/images/frame_%04d.png", current_frame)
@@ -262,8 +280,7 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
     local rx, ry = math.floor(roi.x), math.floor(roi.y)
 
     -- 1. Save Image Crop (write FileData directly to avoid multi-megabyte Lua string heap bloat)
-    local cropped = love.image.newImageData(rw, rh)
-    cropped:paste(img, 0, 0, rx, ry, rw, rh)
+    local cropped = paste_clamped_region(img, rx, ry, rw, rh)
     local filedata = cropped:encode("png")
     local img_path = string.format("Mods/gamestate_dataset_cv/dataset_shop/images/frame_%04d_%s.png", current_frame, file_suffix)
     love.filesystem.write(img_path, filedata)
@@ -297,19 +314,32 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
                 if clamped[1] then
                     local nx, ny, nw, nh = to_yolo(roi, clamped[1], clamped[2], clamped[3], clamped[4])
 
-                    local is_playing_card = (card.base ~= nil) or (card.ability and (card.ability.set == 'Default' or card.ability.set == 'Enhanced')) or (card.config and card.config.center and (card.config.center.set == 'Default' or card.config.center.set == 'Enhanced'))
-                    local card_type = is_playing_card and "PlayingCard" or ((card.ability and card.ability.set) or (card.config and card.config.center and card.config.center.set) or "Joker")
+                    local ability_set = card.ability and card.ability.set
+                    local center_set = card.config and card.config.center and card.config.center.set
+                    local has_card_base = card.base and type(card.base.suit) == 'string' and card.base.suit ~= '' and type(card.base.value) == 'string' and card.base.value ~= ''
+                    local is_playing_card = (center_set == 'Default' or center_set == 'Enhanced')
+                        or (ability_set == 'Default' or ability_set == 'Enhanced')
+                        or (not ability_set and not center_set and has_card_base)
+                    local card_type = is_playing_card and "PlayingCard" or (ability_set or center_set or "Joker")
                     local class_id = class_id_map[card_type] or 0
 
                     table.insert(yolo_labels, string.format("%d %.6f %.6f %.6f %.6f", class_id, nx, ny, nw, nh))
 
                     local name = (card.config and card.config.center and card.config.center.name) or "Unknown"
-                    if is_playing_card and card.base then
-                        name = tostring(card.base.value or "") .. " of " .. tostring(card.base.suit or "")
+                    if is_playing_card then
+                        if card.config and card.config.center and card.config.center.name == "Stone Card" then
+                            name = "Stone Card"
+                        elseif card.base then
+                            name = tostring(card.base.value or "") .. " of " .. tostring(card.base.suit or "")
+                        end
                     end
                     local key = (card.config and card.config.center and card.config.center.key) or "unknown"
-                    if is_playing_card and card.base then
-                        key = tostring(card.base.suit or "") .. "_" .. tostring(card.base.value or "")
+                    if is_playing_card then
+                        if card.config and card.config.center and card.config.center.name == "Stone Card" then
+                            key = "m_stone"
+                        elseif card.base then
+                            key = tostring(card.base.suit or "") .. "_" .. tostring(card.base.value or "")
+                        end
                     end
                     local rarity = get_rarity_str(card)
                     local edition = get_edition_str(card)
@@ -334,69 +364,70 @@ local function export_roi_dataset(mod, img, roi, card_list, area_name, current_f
                         local cy1 = math.max(0, math.floor(min_y))
                         local cx2 = math.min(img:getWidth(), math.ceil(min_x + bw))
                         local cy2 = math.min(img:getHeight(), math.ceil(min_y + bh))
-                        local cw = math.max(1, cx2 - cx1)
-                        local ch = math.max(1, cy2 - cy1)
+                        local cw = cx2 - cx1
+                        local ch = cy2 - cy1
 
-                        local card_crop = love.image.newImageData(cw, ch)
-                        card_crop:paste(img, 0, 0, cx1, cy1, cw, ch)
-                        local crop_data = card_crop:encode("png")
+                        if cw > 0 and ch > 0 then
+                            local card_crop = paste_clamped_region(img, cx1, cy1, cw, ch)
+                            local crop_data = card_crop:encode("png")
 
-                        local crop_filename = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/images/crop_%04d_%s_%d.png", current_frame, file_suffix, idx)
-                        love.filesystem.write(crop_filename, crop_data)
-                        if crop_data and crop_data.release then crop_data:release() end
-                        if card_crop and card_crop.release then card_crop:release() end
+                            local crop_filename = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/images/crop_%04d_%s_%d.png", current_frame, file_suffix, idx)
+                            love.filesystem.write(crop_filename, crop_data)
+                            if crop_data and crop_data.release then crop_data:release() end
+                            if card_crop and card_crop.release then card_crop:release() end
 
-                        local p_rank = "None"
-                        local p_suit = "None"
-                        local p_edition = "None"
-                        local p_enhancement = "None"
-                        local p_seal = "None"
-                        local p_debuffed = (card.debuff == true)
-                        local p_face_down = (card.facing == 'back' or card.sprite_facing == 'back')
+                            local p_rank = "None"
+                            local p_suit = "None"
+                            local p_edition = "None"
+                            local p_enhancement = "None"
+                            local p_seal = "None"
+                            local p_debuffed = (card.debuff == true)
+                            local p_face_down = (card.facing == 'back' or card.sprite_facing == 'back')
 
-                        if not p_face_down then
-                            if card.config.center and card.config.center.name == "Stone Card" then
-                                p_rank = "Stone"
-                                p_suit = "None"
-                            elseif card.base then
-                                p_rank = tostring(card.base.value or "None")
-                                p_suit = tostring(card.base.suit or "None")
-                            end
-
-                            if card.edition then
-                                if card.edition.foil then p_edition = "Foil"
-                                elseif card.edition.holo then p_edition = "Holo"
-                                elseif card.edition.polychrome then p_edition = "Polychrome"
-                                elseif card.edition.negative then p_edition = "Negative"
+                            if not p_face_down then
+                                if card.config.center and card.config.center.name == "Stone Card" then
+                                    p_rank = "Stone"
+                                    p_suit = "None"
+                                elseif card.base then
+                                    p_rank = tostring(card.base.value or "None")
+                                    p_suit = tostring(card.base.suit or "None")
                                 end
+
+                                if card.edition then
+                                    if card.edition.foil then p_edition = "Foil"
+                                    elseif card.edition.holo then p_edition = "Holo"
+                                    elseif card.edition.polychrome then p_edition = "Polychrome"
+                                    elseif card.edition.negative then p_edition = "Negative"
+                                    end
+                                end
+
+                                if card.config.center and card.config.center.name ~= "Default Base" and card.config.center.name ~= "Stone Card" then
+                                    p_enhancement = string.gsub(card.config.center.name, " Card", "")
+                                    p_enhancement = string.gsub(p_enhancement, " ", "")
+                                elseif card.config.center and card.config.center.name == "Stone Card" then
+                                    p_enhancement = "Stone"
+                                end
+
+                                p_seal = card.seal or "None"
                             end
 
-                            if card.config.center and card.config.center.name ~= "Default Base" and card.config.center.name ~= "Stone Card" then
-                                p_enhancement = string.gsub(card.config.center.name, " Card", "")
-                                p_enhancement = string.gsub(p_enhancement, " ", "")
-                            elseif card.config.center and card.config.center.name == "Stone Card" then
-                                p_enhancement = "Stone"
+                            local p_selected = card.highlighted and true or false
+                            local p_card_skin = "None"
+                            local p_is_suit_hc = false
+                            if p_suit ~= "None" and not p_face_down then
+                                p_card_skin = (G.SETTINGS.CUSTOM_DECK and G.SETTINGS.CUSTOM_DECK.Collabs and G.SETTINGS.CUSTOM_DECK.Collabs[p_suit]) or "default"
+                                p_is_suit_hc = (G.SETTINGS.colour_palettes and G.SETTINGS.colour_palettes[p_suit] == "hc") or false
                             end
 
-                            p_seal = card.seal or "None"
+                            local crop_json_content = string.format(
+                                '[\n  {"card_index": %d, "box_yolo": [0.5, 0.5, 1.0, 1.0], "box_pixel": [0, 0, %d, %d], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "debuffed": %s, "face_down": %s, "skin": "%s", "high_contrast": %s}\n]\n',
+                                idx, cw, ch,
+                                p_rank, p_suit, p_edition, p_enhancement, p_seal, p_selected and "true" or "false", p_debuffed and "true" or "false", p_face_down and "true" or "false",
+                                json_escape(p_card_skin), p_is_suit_hc and "true" or "false"
+                            )
+                            local crop_json_path = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/labels/crop_%04d_%s_%d.json", current_frame, file_suffix, idx)
+                            love.filesystem.write(crop_json_path, crop_json_content)
                         end
-
-                        local p_selected = card.highlighted and true or false
-                        local p_card_skin = "None"
-                        local p_is_suit_hc = false
-                        if p_suit ~= "None" and not p_face_down then
-                            p_card_skin = (G.SETTINGS.CUSTOM_DECK and G.SETTINGS.CUSTOM_DECK.Collabs and G.SETTINGS.CUSTOM_DECK.Collabs[p_suit]) or "default"
-                            p_is_suit_hc = (G.SETTINGS.colour_palettes and G.SETTINGS.colour_palettes[p_suit] == "hc") or false
-                        end
-
-                        local crop_json_content = string.format(
-                            '[\n  {"card_index": %d, "box_yolo": [0.5, 0.5, 1.0, 1.0], "box_pixel": [0, 0, %d, %d], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": %s, "debuffed": %s, "face_down": %s, "skin": "%s", "high_contrast": %s}\n]\n',
-                            idx, cw, ch,
-                            p_rank, p_suit, p_edition, p_enhancement, p_seal, p_selected and "true" or "false", p_debuffed and "true" or "false", p_face_down and "true" or "false",
-                            json_escape(p_card_skin), p_is_suit_hc and "true" or "false"
-                        )
-                        local crop_json_path = string.format("Mods/gamestate_dataset_cv/dataset_card_crops/labels/crop_%04d_%s_%d.json", current_frame, file_suffix, idx)
-                        love.filesystem.write(crop_json_path, crop_json_content)
                     end
                 end
             end

@@ -8,17 +8,20 @@ then automatically launches the end-to-end retraining pipeline:
 Supported Models:
     --model shop   (default: monitors dataset_shop/images, trains shop_classifier)
     --model card   (monitors dataset/images, trains card_classifier)
+    --model both   (monitors dataset_shop/images, trains shop_classifier AND card_classifier)
     --model auto   (detects active generation directory automatically)
 
 Usage:
     python auto_retrain.py
     python auto_retrain.py --model shop --target 10000 --interval 5
     python auto_retrain.py --model card --target 10000
+    python auto_retrain.py --model both --clean-shop --target 10000
 """
 
 import os
 import sys
 import time
+import shutil
 import argparse
 import subprocess
 from pathlib import Path
@@ -57,7 +60,7 @@ def resolve_images_directory(model_type: str = "shop") -> tuple[Path, str, Path]
 
         model_type = "shop" if shop_count >= card_count else "card"
 
-    if model_type == "shop":
+    if model_type in ("shop", "both"):
         folder_name = "dataset_shop"
         train_script = ROOT_DIR / "classifiers" / "shop_classifier" / "train.py"
     else:
@@ -162,15 +165,57 @@ def wait_for_images(images_dir: Path, model_type: str, target_count: int = 10000
         time.sleep(check_interval)
 
 
-def launch_training(train_script: Path, model_type: str, epochs_det: int = 15, epochs_cls: int = 25):
+def clean_shop_datasets():
+    """
+    Deletes old shop dataset and card-crop output directories (leaving in-hand
+    card classifier data untouched) so shop frames can be regenerated cleanly
+    with updated ROIs.
+    """
+    targets = [
+        APPDATA_MOD_DIR / "dataset_shop",
+        REPO_MOD_DIR / "dataset_shop",
+        APPDATA_MOD_DIR / "dataset_card_crops",
+        REPO_MOD_DIR / "dataset_card_crops",
+        ROOT_DIR / "classifiers" / "shop_classifier" / "dataset",
+        ROOT_DIR / "classifiers" / "card_classifier" / "dataset" / "shop_crops",
+    ]
     print("\n" + "=" * 70)
-    print(f"LAUNCHING {model_type.upper()} CLASSIFIER RETRAINING PIPELINE")
+    print("CLEANING OLD SHOP & CROP DATASETS (PRESERVING HAND CARD DATA)")
     print("=" * 70)
+    for target in targets:
+        if target.exists():
+            print(f"Removing: {target}")
+            shutil.rmtree(target)
+        else:
+            print(f"Already clean: {target}")
+    # Recreate expected output directories so an already-running Balatro instance can write immediately
+    for sub in [
+        APPDATA_MOD_DIR / "dataset_shop" / "images",
+        APPDATA_MOD_DIR / "dataset_shop" / "labels",
+        APPDATA_MOD_DIR / "dataset_card_crops" / "images",
+        APPDATA_MOD_DIR / "dataset_card_crops" / "labels",
+    ]:
+        sub.mkdir(parents=True, exist_ok=True)
+    print("=" * 70 + "\n")
+
+
+def launch_training(
+    train_script: Path,
+    model_type: str,
+    stage: str = "all",
+    epochs_det: int = 15,
+    epochs_cls: int = 25,
+    clean_sync: bool = False,
+):
+    print("\n" + "=" * 70)
+    print(f"LAUNCHING {model_type.upper()} CLASSIFIER RETRAINING PIPELINE (stage={stage})")
+    print("=" * 70)
+    sync_flag = "--clean-sync" if clean_sync else "--sync"
     cmd = [
         sys.executable,
         str(train_script),
-        "--sync",
-        "--stage", "all",
+        sync_flag,
+        "--stage", stage,
         "--epochs-detector", str(epochs_det),
         "--epochs-classifier", str(epochs_cls),
         "--batch-classifier", "256",
@@ -193,13 +238,51 @@ def launch_training(train_script: Path, model_type: str, epochs_det: int = 15, e
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wait for dataset generation and trigger retraining")
-    parser.add_argument("--model", type=str, default="shop", choices=["shop", "card", "auto"], help="Model to train (default: shop)")
+    parser.add_argument("--model", type=str, default="shop", choices=["shop", "card", "both", "auto"], help="Model(s) to train (default: shop)")
     parser.add_argument("--target", type=int, default=10000, help="Target image count (default: 10000)")
     parser.add_argument("--interval", type=int, default=5, help="Poll interval in seconds (default: 5)")
     parser.add_argument("--epochs-detector", type=int, default=15, help="Stage 1 detector epochs (default: 15)")
     parser.add_argument("--epochs-classifier", type=int, default=15, help="Stage 2 classifier epochs (default: 15)")
+    parser.add_argument("--clean-shop", action="store_true", help="Delete existing shop & shop_crops datasets before monitoring/syncing (preserves hand card dataset)")
+    parser.add_argument("--shop-stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Training stage for shop_classifier (default: all)")
+    parser.add_argument("--card-stage", type=str, default=None, choices=["all", "detector", "classifier"], help="Training stage for card_classifier (default: classifier when --model both, else all)")
     args = parser.parse_args()
+
+    if args.clean_shop:
+        clean_shop_datasets()
 
     images_dir, model_type, train_script = resolve_images_directory(args.model)
     wait_for_images(images_dir, model_type, target_count=args.target, check_interval=args.interval)
-    launch_training(train_script, model_type, epochs_det=args.epochs_detector, epochs_cls=args.epochs_classifier)
+
+    if model_type == "both":
+        shop_script = ROOT_DIR / "classifiers" / "shop_classifier" / "train.py"
+        card_script = ROOT_DIR / "classifiers" / "card_classifier" / "train.py"
+        card_stage = args.card_stage or "classifier"
+        launch_training(
+            shop_script,
+            "shop",
+            stage=args.shop_stage,
+            epochs_det=args.epochs_detector,
+            epochs_cls=args.epochs_classifier,
+            clean_sync=args.clean_shop,
+        )
+        # Never --clean-sync card_classifier here so existing hand card data is preserved
+        launch_training(
+            card_script,
+            "card",
+            stage=card_stage,
+            epochs_det=args.epochs_detector,
+            epochs_cls=args.epochs_classifier,
+            clean_sync=False,
+        )
+    else:
+        stage = args.shop_stage if model_type == "shop" else (args.card_stage or "all")
+        clean_sync = args.clean_shop if model_type == "shop" else False
+        launch_training(
+            train_script,
+            model_type,
+            stage=stage,
+            epochs_det=args.epochs_detector,
+            epochs_cls=args.epochs_classifier,
+            clean_sync=clean_sync,
+        )

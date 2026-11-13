@@ -15,7 +15,9 @@ function G.DATASET_MOD:get_random_card_center()
     local cards = {}
     if G.P_CARDS then
         for k, v in pairs(G.P_CARDS) do
-            table.insert(cards, v)
+            if k ~= 'empty' and type(v) == 'table' and v.suit and v.value then
+                table.insert(cards, v)
+            end
         end
     end
     if #cards > 0 then
@@ -164,11 +166,10 @@ function G.DATASET_MOD:randomize_deck_appearance()
         
         -- 2. Dynamically pick between available custom face card arts (crossover arts)
         local crossover_arts = self:get_available_crossover_arts(suit)
-        local chosen_skin = nil
-        if #crossover_arts > 0 then
+        local default_skin = (G.COLLABS and G.COLLABS.options and G.COLLABS.options[suit] and G.COLLABS.options[suit][1]) or ('default_' .. suit)
+        local chosen_skin = default_skin
+        if #crossover_arts > 0 and math.random() >= 0.35 then
             chosen_skin = crossover_arts[math.random(#crossover_arts)]
-        else
-            chosen_skin = (G.COLLABS and G.COLLABS.options and G.COLLABS.options[suit] and G.COLLABS.options[suit][1]) or ('default_' .. suit) or 'default'
         end
         G.SETTINGS.CUSTOM_DECK.Collabs[suit] = chosen_skin
         
@@ -267,9 +268,11 @@ function G.DATASET_MOD:generate_random_hand()
         local card = Card(G.play.T.x + G.play.T.w/2, G.play.T.y, G.CARD_W, G.CARD_H, base_card, center, {bypass_discovery_center = true, bypass_discovery_ui = true})
         
         -- Force re-application of base card to guarantee sprite atlas is loaded (vanilla blank art fix)
+        -- Pass initial=true so active blind doesn't auto-debuff cards (debuff is controlled below)
         if base_card and card.set_base then
-            card:set_base(base_card)
+            card:set_base(base_card, true)
         end
+        card.debuff = false
         
         local edition = self:get_random_edition()
         if edition then card:set_edition({[edition] = true}, true, true) end
