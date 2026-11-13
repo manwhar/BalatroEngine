@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import time
 
 import cv2
@@ -13,7 +14,17 @@ from config import Config, configure_logging, get_config
 from tools.debug_plotter import plot
 from eval_template import eval, format_timestamp
 from frame import iter_video_frames
+from screen_state import ScreenStateTracker
 from template import template_loader
+
+
+def build_output_json_path(
+    output_dir: str, input_video_path: str, timestamp: int | None = None
+) -> str:
+    """Builds the output JSON path from any Windows or POSIX video file path."""
+    ts = int(time.time()) if timestamp is None else timestamp
+    base_name = Path(input_video_path).stem
+    return str(Path(output_dir) / f"{base_name}_{ts}.json")
 
 
 def get_expected_frame_count(config: Config) -> int | None:
@@ -56,8 +67,12 @@ if __name__ == "__main__":
         config.resolution,
     )
     template_key = {template.name: i for i, template in enumerate(templates)}
+    # Starting mid-run is out of scope: screen gating begins in PRE_GAME.
+    screen_tracker = ScreenStateTracker()
 
-    def process_frame(video_frame) -> tuple[int, list, dict[str, float], dict | None]:
+    def process_frame(
+        video_frame, active_templates
+    ) -> tuple[int, list, dict[str, float], dict | None, str | None]:
         frame_idx = video_frame.index
         ts_str = format_timestamp(video_frame.timestamp_seconds, frame_idx)
 
@@ -69,7 +84,8 @@ if __name__ == "__main__":
 
         matches = []
         template_clicked = None
-        for template in templates:
+        clicked_name = None
+        for template in active_templates:
             result = eval(
                 template,
                 video_frame.image,
@@ -80,6 +96,7 @@ if __name__ == "__main__":
             if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
                 matches.append((template, result.plot_kwargs))
             if result.found and result.clicked:
+                clicked_name = result.template_name
                 template_clicked = {
                     "action": template_key[result.template_name],
                     "box": list(result.box) if result.box is not None else None,
@@ -91,7 +108,7 @@ if __name__ == "__main__":
             "grayscale_time": t1 - t0,
             "eval_time": t2 - t1,
         }
-        return frame_idx, matches, metrics, template_clicked
+        return frame_idx, matches, metrics, template_clicked, clicked_name
 
     def chunked_iterable(iterable, size):
         it = iter(iterable)
@@ -161,9 +178,13 @@ if __name__ == "__main__":
     if config.debug_plot or config.setup_mode:
         # Sequential processing to ensure safe UI/Plotting on the main thread
         for video_frame in frames:
-            frame_idx, matches, metrics, template_clicked = process_frame(video_frame)
-            if template_clicked is not None:
+            active_templates = screen_tracker.filter_templates(templates)
+            frame_idx, matches, metrics, template_clicked, clicked_name = process_frame(
+                video_frame, active_templates
+            )
+            if template_clicked is not None and clicked_name is not None:
                 action_frames[frame_idx] = template_clicked
+                screen_tracker.on_template_clicked(clicked_name)
             total_grayscale_time += metrics["grayscale_time"]
             total_eval_time += metrics["eval_time"]
             for template, plot_kwargs in matches:
@@ -204,15 +225,50 @@ if __name__ == "__main__":
                 total=total_frames, desc="Processing video", unit="frame"
             ) as pbar:
                 for chunk in chunked_iterable(frames, 64):
-                    for frame_idx, matches, metrics, template_clicked in executor.map(
-                        process_frame, chunk
-                    ):
-                        results.append(frame_idx)
-                        total_grayscale_time += metrics["grayscale_time"]
-                        total_eval_time += metrics["eval_time"]
-                        if template_clicked is not None:
-                            action_frames[frame_idx] = template_clicked
-                        pbar.update(1)
+                    pending = list(chunk)
+                    while pending:
+                        active_templates = screen_tracker.filter_templates(templates)
+                        chunk_outputs = list(
+                            executor.map(
+                                lambda vf, tmpls=active_templates: process_frame(
+                                    vf, tmpls
+                                ),
+                                pending,
+                            )
+                        )
+                        transitioned_at = None
+                        for idx_in_chunk, (
+                            frame_idx,
+                            matches,
+                            metrics,
+                            template_clicked,
+                            clicked_name,
+                        ) in enumerate(chunk_outputs):
+                            results.append(frame_idx)
+                            total_grayscale_time += metrics["grayscale_time"]
+                            total_eval_time += metrics["eval_time"]
+                            pbar.update(1)
+                            if template_clicked is not None and clicked_name is not None:
+                                action_frames[frame_idx] = template_clicked
+                                prev_state = (
+                                    screen_tracker.state,
+                                    screen_tracker.allow_play_game,
+                                    screen_tracker.pre_pack_location,
+                                )
+                                screen_tracker.on_template_clicked(clicked_name)
+                                cur_state = (
+                                    screen_tracker.state,
+                                    screen_tracker.allow_play_game,
+                                    screen_tracker.pre_pack_location,
+                                )
+                                if cur_state != prev_state:
+                                    transitioned_at = idx_in_chunk
+                                    break
+                        if transitioned_at is not None:
+                            # Re-run only the suffix after a state transition under the updated whitelist
+                            pending = pending[transitioned_at + 1 :]
+                        else:
+                            pending = []
 
     num_frames = len(results)
     if num_frames > 0:
@@ -237,8 +293,7 @@ if __name__ == "__main__":
             print(f"Other (Overhead):   {wall_other:.5f}s ({pct_other:4.1f}%)")
             print("-----------------------------------------------------------")
 
-        base_name = os.path.splitext(config.input_video_path.rsplit("/", 1)[-1])[0]
-        out_path = f"{config.output_dir}/{base_name}_{int(time.time())}.json"
+        out_path = build_output_json_path(config.output_dir, config.input_video_path)
 
         output_payload = {
             "key": template_key,

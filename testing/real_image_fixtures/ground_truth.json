@@ -1,0 +1,71 @@
+{
+  "_notes": [
+    "Add real 1920x1080 (or 16:9) Balatro screenshot entries under each list below.",
+    "Only list actual files you place in testing/real_image_fixtures/{hand,shop,pack,joker_bar}/.",
+    "Within each expected card dict, omitted fields are ignored so you can annotate as little or as much detail as you want."
+  ],
+  "schema_examples_reference_only": {
+    "hand": [
+      {
+        "image": "hand/blind_hand_01.png",
+        "cards": [
+          {
+            "rank": "Ace",
+            "suit": "Spades",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": true,
+            "debuffed": false,
+            "facing_back": false
+          }
+        ]
+      }
+    ],
+    "shop": [
+      {
+        "image": "shop/shop_01.png",
+        "shop_cards": [
+          {"type": "Joker", "name": "Blueprint", "edition": "none", "eternal": false, "perishable": false, "rental": false},
+          {"type": "Tarot", "name": "The Fool", "edition": "none"}
+        ],
+        "vouchers": [
+          {"name": "Overstock"}
+        ],
+        "packs": [
+          {"booster_type": "Arcana", "size": "Mega"}
+        ],
+        "joker_bar": [
+          {"name": "Hanging Chad", "edition": "Foil"}
+        ],
+        "consumables": [
+          {"type": "Planet", "name": "Mercury", "edition": "Negative"}
+        ]
+      }
+    ],
+    "pack": [
+      {
+        "image": "pack/arcana_pack_01.png",
+        "cards": [
+          {"type": "Tarot", "name": "The Hermit"},
+          {"type": "Tarot", "name": "Death"}
+        ]
+      }
+    ],
+    "joker_bar": [
+      {
+        "image": "joker_bar/select_blind_01.png",
+        "location": "select",
+        "round_won": false,
+        "jokers": [
+          {"name": "Baron", "edition": "Polychrome", "eternal": true},
+          {"name": "Mime", "edition": "none"}
+        ]
+      }
+    ]
+  },
+  "hand": [],
+  "shop": [],
+  "pack": [],
+  "joker_bar": []
+}

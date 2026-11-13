@@ -192,13 +192,26 @@ def recognize_hand_cards(
     )
 
 
+def _get_shelves_for_mode(mode: str) -> list[str]:
+    """Returns the ROI shelf keys evaluated for a given shop/panel recognition mode."""
+    if mode == "joker_only":
+        return ["joker_bar"]
+    if mode == "bars":
+        return ["joker_bar", "consumeables"]
+    if mode == "pack_only":
+        return ["pack"]
+    if mode == "pack":
+        return ["joker_bar", "consumeables", "pack"]
+    return ["joker_bar", "consumeables", "shop", "voucher", "booster"]
+
+
 def recognize_shop(
     video_frame: Any,
     mode: str = "shop",
     conf_threshold: float = 0.35,
     device: str | None = None
 ) -> ShopRecognitionOutput:
-    """Evaluates all relevant shelves on a shop or pack frame (boxes returned in full-frame pixels)."""
+    """Evaluates all relevant shelves on a shop, pack, or HUD frame (boxes returned in full-frame pixels)."""
     img_bgr, f_idx, ts = _extract_frame_image_and_meta(video_frame)
     pipeline = get_shop_pipeline(device=device)
 
@@ -208,36 +221,23 @@ def recognize_shop(
         mode=mode
     )
 
-    joker_pil, joker_roi = _crop_roi_to_pil(img_bgr, "joker_bar")
-    output.joker_bar = _translate_item_boxes(
-        pipeline.predict(joker_pil, conf_threshold=conf_threshold), joker_roi[0], joker_roi[1]
-    )
-
-    cons_pil, cons_roi = _crop_roi_to_pil(img_bgr, "consumeables")
-    output.consumeables = _translate_item_boxes(
-        pipeline.predict(cons_pil, conf_threshold=conf_threshold), cons_roi[0], cons_roi[1]
-    )
-
-    if mode == "pack":
-        pack_pil, pack_roi = _crop_roi_to_pil(img_bgr, "pack")
-        output.pack_items = _translate_item_boxes(
-            pipeline.predict(pack_pil, conf_threshold=conf_threshold), pack_roi[0], pack_roi[1]
+    shelves = _get_shelves_for_mode(mode)
+    shelf_attr_map = {
+        "joker_bar": "joker_bar",
+        "consumeables": "consumeables",
+        "pack": "pack_items",
+        "shop": "shop_items",
+        "voucher": "vouchers",
+        "booster": "boosters",
+    }
+    for shelf_key in shelves:
+        crop_pil, roi = _crop_roi_to_pil(img_bgr, shelf_key)
+        items = _translate_item_boxes(
+            pipeline.predict(crop_pil, conf_threshold=conf_threshold),
+            roi[0],
+            roi[1],
         )
-    else:
-        shop_pil, shop_roi = _crop_roi_to_pil(img_bgr, "shop")
-        output.shop_items = _translate_item_boxes(
-            pipeline.predict(shop_pil, conf_threshold=conf_threshold), shop_roi[0], shop_roi[1]
-        )
-
-        voucher_pil, voucher_roi = _crop_roi_to_pil(img_bgr, "voucher")
-        output.vouchers = _translate_item_boxes(
-            pipeline.predict(voucher_pil, conf_threshold=conf_threshold), voucher_roi[0], voucher_roi[1]
-        )
-
-        booster_pil, booster_roi = _crop_roi_to_pil(img_bgr, "booster")
-        output.boosters = _translate_item_boxes(
-            pipeline.predict(booster_pil, conf_threshold=conf_threshold), booster_roi[0], booster_roi[1]
-        )
+        setattr(output, shelf_attr_map[shelf_key], items)
 
     return output
 
@@ -375,11 +375,7 @@ def batch_recognize_shops(
         for _, f_idx, ts in unwrapped
     ]
 
-    shelves = ["joker_bar", "consumeables"]
-    if mode == "pack":
-        shelves.append("pack")
-    else:
-        shelves.extend(["shop", "voucher", "booster"])
+    shelves = _get_shelves_for_mode(mode)
 
     for shelf_key in shelves:
         # 1. Extract uniformly shaped crops for this specific shelf across all frames

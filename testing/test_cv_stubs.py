@@ -283,6 +283,119 @@ class TestCVStubsLocationChecks(unittest.TestCase):
         self.assertEqual(shop_res.packs[0].size, bm.BoosterSize.MEGA)
         self.assertEqual(shop_res.packs[0].choose, 2)
 
+    # -------------------------------------------------------------
+    # cv_detect_pack_cards Tests
+    # -------------------------------------------------------------
+
+    def test_pack_cards_in_blind_raises(self):
+        self.state.location = bm.Location.BLIND
+        with self.assertRaises(cv_stubs.InvalidLocationError):
+            cv_stubs.cv_detect_pack_cards(self.state, self.dummy_frame)
+
+    def test_pack_cards_in_select_raises(self):
+        self.state.location = bm.Location.SELECT
+        with self.assertRaises(cv_stubs.InvalidLocationError):
+            cv_stubs.cv_detect_pack_cards(self.state, self.dummy_frame)
+
+    def test_pack_cards_in_main_shop_without_pack_raises(self):
+        self.state.location = bm.Location.SHOP
+        self.state.active_pack = None
+        with self.assertRaises(cv_stubs.InvalidLocationError):
+            cv_stubs.cv_detect_pack_cards(self.state, self.dummy_frame)
+
+    def test_pack_cards_in_cash_out_raises(self):
+        self.state.location = bm.Location.PACK
+        self.state.round_won = True
+        with self.assertRaises(cv_stubs.InvalidLocationError):
+            cv_stubs.cv_detect_pack_cards(self.state, self.dummy_frame)
+
+    def test_pack_cards_none_frame_raises(self):
+        self.state.location = bm.Location.PACK
+        with self.assertRaises(ValueError):
+            cv_stubs.cv_detect_pack_cards(self.state, None)
+
+    def test_pack_cards_in_pack_valid(self):
+        self.state.location = bm.Location.PACK
+        self.state.active_pack = bm.BoosterPack(
+            booster_type=bm.BoosterType.STANDARD,
+            size=bm.BoosterSize.REGULAR,
+            cost=4,
+            choose=1,
+            extra=3,
+        )
+        tarot_item = MagicMock(
+            key="c_hermit", card_type="Tarot", edition="None",
+            eternal=False, perishable=False, rental=False, debuffed=False,
+        )
+        card_item = MagicMock(
+            key="", card_type="PlayingCard", edition="Foil",
+            eternal=False, perishable=False, rental=False, debuffed=False,
+            card_details=MagicMock(
+                rank="King", suit="Hearts", enhancement="Glass",
+                edition="Foil", seal="Gold", debuffed=False,
+            ),
+        )
+        mock_out = MagicMock(pack_items=[tarot_item, card_item])
+
+        with patch("classifiers.inference.recognize_shop", return_value=mock_out) as mock_rec:
+            # Verify (frame, state) argument order works too
+            pack_res = cv_stubs.cv_detect_pack_cards(self.dummy_frame, self.state)
+
+        mock_rec.assert_called_once()
+        self.assertEqual(mock_rec.call_args.kwargs.get("mode"), "pack_only")
+        self.assertEqual(len(pack_res), 2)
+        self.assertIsInstance(pack_res[0], bm.Tarot)
+        self.assertEqual(pack_res[0].name, bm.TarotName.HERMIT)
+        self.assertIsInstance(pack_res[1], bm.PlayingCard)
+        self.assertEqual(pack_res[1].rank, bm.Rank.KING)
+        self.assertEqual(pack_res[1].suit, bm.Suit.HEARTS)
+        self.assertEqual(pack_res[1].enhancement, bm.Enhancement.GLASS)
+        self.assertEqual(pack_res[1].seal, bm.Seal.GOLD)
+
+    # -------------------------------------------------------------
+    # cv_detect_joker_bar Tests
+    # -------------------------------------------------------------
+
+    def test_joker_bar_invalid_location_raises(self):
+        self.state.location = "menu"
+        with self.assertRaises(cv_stubs.InvalidLocationError):
+            cv_stubs.cv_detect_joker_bar(self.state, self.dummy_frame)
+
+    def test_joker_bar_none_frame_raises(self):
+        self.state.location = bm.Location.BLIND
+        with self.assertRaises(ValueError):
+            cv_stubs.cv_detect_joker_bar(self.state, None)
+
+    def test_joker_bar_valid_across_gameplay_screens(self):
+        joker_item = MagicMock(
+            key="j_brainstorm", card_type="Joker", edition="Polychrome",
+            eternal=False, perishable=True, rental=True, debuffed=False,
+        )
+        stray_item = MagicMock(
+            key="c_pluto", card_type="Planet", edition="None",
+            eternal=False, perishable=False, rental=False, debuffed=False,
+        )
+        mock_out = MagicMock(joker_bar=[joker_item, stray_item])
+
+        for loc, round_won in [
+            (bm.Location.SELECT, False),
+            (bm.Location.BLIND, False),
+            (bm.Location.BLIND, True),
+            (bm.Location.SHOP, False),
+            (bm.Location.PACK, False),
+        ]:
+            self.state.location = loc
+            self.state.round_won = round_won
+            with patch("classifiers.inference.recognize_shop", return_value=mock_out) as mock_rec:
+                jokers = cv_stubs.cv_detect_joker_bar(self.state, self.dummy_frame)
+            self.assertEqual(mock_rec.call_args.kwargs.get("mode"), "joker_only")
+            self.assertEqual(len(jokers), 1)
+            self.assertIsInstance(jokers[0], bm.Joker)
+            self.assertEqual(jokers[0].name, bm.JokerName.BRAINSTORM)
+            self.assertEqual(jokers[0].edition, bm.Edition.POLYCHROME)
+            self.assertTrue(jokers[0].perishable)
+            self.assertTrue(jokers[0].rental)
+
 
 class TestPRNGBossBlind(unittest.TestCase):
     """Verifies that cv_detect_boss_blind is removed and PRNG boss resolution works correctly."""

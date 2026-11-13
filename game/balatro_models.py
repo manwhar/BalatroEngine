@@ -203,6 +203,7 @@ class Deck(StrEnum):
     ANAGLYPH_DECK = "Anaglyph Deck"
     BLACK_DECK = "Black Deck"
     BLUE_DECK = "Blue Deck"
+    # Challenge Decks are out of scope for this engine.
     CHALLENGE_DECK = "Challenge Deck"
     CHECKERED_DECK = "Checkered Deck"
     ERRATIC_DECK = "Erratic Deck"

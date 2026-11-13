@@ -1128,7 +1128,11 @@ class TestEngine(unittest.TestCase):
         initial_money = sim_state.money
 
         sim_state, _ = gs.step_simulation(
-            sim_state, bm.Action(type=bm.ActionType.CASH_OUT)
+            sim_state,
+            bm.Action(
+                type=bm.ActionType.CASH_OUT,
+                metadata={"include_round_payout": False},
+            ),
         )
         self.assertEqual(sim_state.money, initial_money + 4)
 
@@ -2267,7 +2271,13 @@ class TestNewEngineFeatures(unittest.TestCase):
         s.location = bm.Location.BLIND
         s.current_blind = s.boss_blind or bm.BlindName.THE_HOOK
         s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.END_ROUND))
-        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.CASH_OUT))
+        s, _ = gs.step_simulation(
+            s,
+            bm.Action(
+                type=bm.ActionType.CASH_OUT,
+                metadata={"include_round_payout": False},
+            ),
+        )
         self.assertEqual(s.money, money_before + 50)
         self.assertNotIn(bm.SkipTag.INVESTMENT_TAG, s.active_tags)
 
@@ -2501,6 +2511,266 @@ class TestNewEngineFeatures(unittest.TestCase):
         vs, _ = gs.step_simulation(vs, bm.Action(type=bm.ActionType.BUY_CARD, target_idx=0))
         self.assertEqual(vs.money, money_pre_coupon)
         self.assertGreaterEqual(vs.inventory.jokers[-1].get_sell_value(), 1)
+
+    def test_auto_skip_tags_default_cash_out_and_prng_jokers(self):
+        """Verifies Skip Tags PRNG population, default CASH_OUT payout, and Madness/Invisible/Perkeo."""
+        from game.engine.rng_sim.api import BalatroRun
+
+        # 1. GameState(seed=...) automatically populates Ante 1 tags matching BalatroRun
+        s = gs.GameState(seed="AUTOTAG1")
+        pred_small, pred_big = BalatroRun("AUTOTAG1").predict_ante_tags(
+            ante=1, include_orbital_hands=True
+        )
+        self.assertEqual(s.small_blind_tag, pred_small.skip_tag)
+        self.assertEqual(s.big_blind_tag, pred_big.skip_tag)
+        if s.small_blind_tag == bm.SkipTag.ORBITAL_TAG:
+            self.assertEqual(s.small_blind_orbital_hand, pred_small.orbital_hand)
+
+        # Advancing from Ante 1 Boss to Ante 2 Small Blind rolls Ante 2 tags automatically
+        s.location = bm.Location.BLIND
+        s.current_blind = s.boss_blind or bm.BlindName.THE_HOOK
+        s.money = 10
+        s.hands_left = 2
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.END_ROUND))
+        # Default CASH_OUT (no metadata) pays blind reward ($5 boss) + remaining hands ($2) + interest ($2) = +$9
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(s.money, 19)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.NEXT_ROUND))
+        self.assertEqual(s.ante, 2)
+        pred2_small, pred2_big = BalatroRun("AUTOTAG1").predict_ante_tags(ante=2)
+        self.assertEqual(s.small_blind_tag, pred2_small.skip_tag)
+        self.assertEqual(s.big_blind_tag, pred2_big.skip_tag)
+
+        # 2. Madness increments x_mult and destroys another non-Eternal Joker on Small/Big Blind
+        mad = bm.Joker(name=bm.JokerName.MADNESS)
+        fodder = bm.Joker(name=bm.JokerName.JOKER)
+        eternal = bm.Joker(name=bm.JokerName.BLUEPRINT, eternal=True)
+        sm = gs.GameState(
+            seed="MAD1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.SMALL,
+            inventory=bm.Inventory(jokers=[mad, fodder, eternal]),
+        )
+        sm, _ = gs.step_simulation(sm, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertAlmostEqual(mad.state["x_mult"], 1.5)
+        self.assertNotIn(fodder, sm.inventory.jokers)
+        self.assertIn(eternal, sm.inventory.jokers)
+
+        # 3. Invisible Joker tracks rounds and clones another Joker on sell (stripping Negative)
+        invis = bm.Joker(name=bm.JokerName.INVISIBLE_JOKER)
+        neg_bp = bm.Joker(name=bm.JokerName.BLUEPRINT, edition=bm.Edition.NEGATIVE)
+        si = gs.GameState(
+            seed="INV1",
+            location=bm.Location.BLIND,
+            inventory=bm.Inventory(jokers=[invis, neg_bp]),
+        )
+        for _ in range(2):
+            si.location = bm.Location.BLIND
+            si.round_won = False
+            si, _ = gs.step_simulation(si, bm.Action(type=bm.ActionType.END_ROUND))
+            si, _ = gs.step_simulation(si, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(invis.state["rounds"], 2)
+        si, _ = gs.step_simulation(si, bm.Action(type=bm.ActionType.SELL_CARD, target_idx=0))
+        self.assertEqual(len(si.inventory.jokers), 2)
+        self.assertEqual(si.inventory.jokers[1].name, bm.JokerName.BLUEPRINT)
+        self.assertEqual(si.inventory.jokers[1].edition, bm.Edition.NONE)
+        self.assertNotEqual(si.inventory.jokers[0].id, si.inventory.jokers[1].id)
+
+        # 4. Perkeo copies a held consumable as Negative on NEXT_ROUND (leaving shop)
+        perkeo = bm.Joker(name=bm.JokerName.PERKEO)
+        fool = bm.Tarot(name=bm.TarotName.FOOL)
+        sp = gs.GameState(
+            seed="PERK1",
+            location=bm.Location.SHOP,
+            inventory=bm.Inventory(jokers=[perkeo], consumables=[fool]),
+        )
+        sp, _ = gs.step_simulation(sp, bm.Action(type=bm.ActionType.NEXT_ROUND))
+        self.assertEqual(len(sp.inventory.consumables), 2)
+        self.assertEqual(sp.inventory.consumables[1].name, bm.TarotName.FOOL)
+        self.assertEqual(sp.inventory.consumables[1].edition, bm.Edition.NEGATIVE)
+
+    def test_all_boss_blind_semantics(self):
+        """Validates gameplay/state semantics across Boss Blinds & Luchador/Chicot disable."""
+        # 1. The Water, The Needle, and Luchador restore
+        luch = bm.Joker(name=bm.JokerName.LUCHADOR)
+        s = gs.GameState(
+            seed="BOSS1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.THE_WATER,
+            boss_blind=bm.BlindName.THE_WATER,
+            inventory=bm.Inventory(jokers=[luch]),
+        )
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertEqual(s.discards_left, 0)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.SELL_CARD, target_idx=0))
+        self.assertTrue(s.boss_disabled)
+        self.assertEqual(s.discards_left, 4)  # Red Deck default = 4 discards
+
+        s.location = bm.Location.SELECT
+        s.current_blind = bm.BlindName.THE_NEEDLE
+        s.inventory.jokers = [bm.Joker(name=bm.JokerName.CHICOT)]
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertTrue(s.boss_disabled)
+        self.assertEqual(s.hands_left, 4)
+
+        # 2. The Manacle (-1 hand size restored at END_ROUND)
+        sm = gs.GameState(
+            seed="MAN1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.THE_MANACLE,
+        )
+        sm, _ = gs.step_simulation(sm, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertEqual(sm.hand.max_size, 7)
+        sm, _ = gs.step_simulation(sm, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertEqual(sm.hand.max_size, 8)
+
+        # 3. The Arm, The Ox, The Psychic, The Eye, The Mouth
+        sax = gs.GameState(
+            seed="ARMOX1",
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_ARM,
+            money=25,
+            hand_levels={bm.PokerHand.PAIR: 3, bm.PokerHand.HIGH_CARD: 1},
+            hand=bm.Hand(
+                cards=[
+                    bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.SPADES, id=1), selected=True),
+                    bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.HEARTS, id=2), selected=True),
+                ]
+            ),
+        )
+        sax, _ = gs.step_simulation(sax, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(sax.hand_levels[bm.PokerHand.PAIR], 2)
+
+        sax.current_blind = bm.BlindName.THE_OX
+        sax.ox_target_hand = bm.PokerHand.HIGH_CARD
+        sax.hand.cards = [
+            bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.CLUBS, id=3), selected=True)
+        ]
+        sax, _ = gs.step_simulation(sax, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(sax.money, 0)
+
+        # The Psychic: < 5 cards skips scoring triggers (Green Joker doesn't gain +1 mult)
+        gj = bm.Joker(name=bm.JokerName.GREEN_JOKER)
+        sp = gs.GameState(
+            seed="PSY1",
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_PSYCHIC,
+            inventory=bm.Inventory(jokers=[gj]),
+            hand=bm.Hand(
+                cards=[bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.SPADES, id=1), selected=True)]
+            ),
+        )
+        sp, _ = gs.step_simulation(sp, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(gj.state.get("mult", 0), 0)
+
+        # The Eye: repeating same hand type skips scoring triggers
+        se = gs.GameState(
+            seed="EYE1",
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_EYE,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.GREEN_JOKER)]),
+            hand=bm.Hand(
+                cards=[
+                    bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.SPADES, id=1), selected=True),
+                    bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.HEARTS, id=2), selected=False),
+                ]
+            ),
+        )
+        se, _ = gs.step_simulation(se, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(se.inventory.jokers[0].state["mult"], 1)
+        se.hand.cards[0].selected = True
+        se, _ = gs.step_simulation(se, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(se.inventory.jokers[0].state["mult"], 1)  # debuffed repeat
+
+        # 4. The Serpent (draws 3 cards after play/discard), The Fish/House/Mark/Wheel face-down
+        serp = gs.GameState(
+            seed="SERP1",
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_SERPENT,
+        )
+        serp.draw_cards(8)
+        serp.hand.cards[0].selected = True
+        serp, _ = gs.step_simulation(serp, bm.Action(type=bm.ActionType.PLAY_HAND))
+        drawn_serp = serp.draw_cards()
+        self.assertEqual(len(drawn_serp), 3)
+
+        # 5. The Pillar + Verdant Leaf debuffs & disable cleanup
+        vl = gs.GameState(
+            seed="VLEAF1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.VERDANT_LEAF,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.JOKER)]),
+        )
+        vl, _ = gs.step_simulation(vl, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        vl.draw_cards(5)
+        self.assertTrue(all(hc.card.debuffed for hc in vl.hand.cards))
+        vl, _ = gs.step_simulation(vl, bm.Action(type=bm.ActionType.SELL_CARD, target_idx=0))
+        self.assertTrue(vl.boss_disabled)
+        self.assertFalse(any(hc.card.debuffed for hc in vl.hand.cards))
+
+        # 6. Amber Acorn, Crimson Heart, Cerulean Bell
+        acorn = gs.GameState(
+            seed="ACORN1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.AMBER_ACORN,
+            inventory=bm.Inventory(
+                jokers=[
+                    bm.Joker(name=bm.JokerName.JOKER),
+                    bm.Joker(name=bm.JokerName.BLUEPRINT),
+                    bm.Joker(name=bm.JokerName.BRAINSTORM),
+                ]
+            ),
+        )
+        acorn, _ = gs.step_simulation(acorn, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertTrue(all(j.facing_back for j in acorn.inventory.jokers))
+        acorn, _ = gs.step_simulation(acorn, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertFalse(any(j.facing_back for j in acorn.inventory.jokers))
+
+        bell = gs.GameState(
+            seed="BELL1",
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.CERULEAN_BELL,
+        )
+        bell.draw_cards(5)
+        self.assertEqual(sum(1 for hc in bell.hand.cards if hc.forced_selection), 1)
+        self.assertEqual(sum(1 for hc in bell.hand.cards if hc.selected), 1)
+
+        heart = gs.GameState(
+            seed="HEART1",
+            location=bm.Location.SELECT,
+            current_blind=bm.BlindName.CRIMSON_HEART,
+            inventory=bm.Inventory(
+                jokers=[
+                    bm.Joker(name=bm.JokerName.JOKER),
+                    bm.Joker(name=bm.JokerName.MIME),
+                ]
+            ),
+        )
+        heart, _ = gs.step_simulation(heart, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertEqual(sum(1 for j in heart.inventory.jokers if j.debuffed), 1)
+
+        # 7. The House, The Mark, The Fish, The Pillar (ante clear)
+        house = gs.GameState(seed="HOUSE1", location=bm.Location.BLIND, current_blind=bm.BlindName.THE_HOUSE)
+        drawn_h = house.draw_cards(3)
+        self.assertTrue(all(hc.facing_back for hc in drawn_h))
+
+        fish = gs.GameState(seed="FISH1", location=bm.Location.SELECT, current_blind=bm.BlindName.THE_FISH)
+        fish, _ = gs.step_simulation(fish, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        first_draw = fish.draw_cards(2)
+        self.assertFalse(any(hc.facing_back for hc in first_draw))
+        fish.hand.cards[0].selected = True
+        fish, _ = gs.step_simulation(fish, bm.Action(type=bm.ActionType.PLAY_HAND))
+        second_draw = fish.draw_cards(1)
+        self.assertTrue(all(hc.facing_back for hc in second_draw))
+
+        pillar = gs.GameState(seed="PIL1", location=bm.Location.BLIND, current_blind=bm.BlindName.THE_PILLAR)
+        pillar.draw_cards(2)
+        played_c = pillar.hand.cards[0].card
+        pillar.hand.cards[0].selected = True
+        pillar, _ = gs.step_simulation(pillar, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertTrue(pillar.card_is_debuffed_by_boss(played_c))
+        pillar, _ = gs.step_simulation(pillar, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertEqual(pillar.played_cards_this_ante, [])
 
 
 def run_synthetic_test() -> None:

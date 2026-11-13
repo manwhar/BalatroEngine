@@ -273,7 +273,10 @@ def on_joker_added(state, joker: Joker) -> None:
             state.free_rerolls += 1
         case JokerName.CHICOT:
             if state.current_blind not in (BlindName.SMALL, BlindName.BIG):
-                state.boss_disabled = True
+                if hasattr(state, "disable_active_boss"):
+                    state.disable_active_boss()
+                else:
+                    state.boss_disabled = True
 
 
 def on_joker_removed(state, joker: Joker) -> None:
@@ -738,7 +741,13 @@ def handle_madness(joker: Joker, ctx: TriggerContext):
                 j for j in ctx.state.inventory.jokers if j is not joker and not j.eternal
             ]
             if destructible:
-                ctx.state.pending_cv_checks.add("jokers")
+                if ctx.state.rng:
+                    victim, _ = ctx.state.rng.choice("madness", destructible)
+                    if victim in ctx.state.inventory.jokers:
+                        on_joker_removed(ctx.state, victim)
+                        ctx.state.inventory.jokers.remove(victim)
+                else:
+                    ctx.state.pending_cv_checks.add("jokers")
 
 
 @joker_hook(JokerName.VAMPIRE)
@@ -907,8 +916,25 @@ def handle_invisible_joker(joker: Joker, ctx: TriggerContext):
     if _is_end_of_round_phase(ctx):
         joker.state["rounds"] = joker.state.get("rounds", 0) + 1
     elif ctx.event == TriggerEvent.CARD_SOLD:
-        if ctx.target_card == joker and joker.state.get("rounds", 0) >= 2:
-            ctx.state.pending_cv_checks.add("jokers")
+        if ctx.target_card is joker and joker.state.get("rounds", 0) >= 2:
+            others = [j for j in ctx.state.inventory.jokers if j is not joker]
+            if not others or not ctx.state.inventory.can_add_joker:
+                return
+            if ctx.state.rng:
+                chosen, _ = ctx.state.rng.choice("invisible", others)
+                clone = copy.deepcopy(chosen)
+                clone.id = 0
+                # Invisible Joker strips Negative edition when duplicating (card.lua:2384)
+                if clone.edition == Edition.NEGATIVE:
+                    clone.edition = Edition.NONE
+                if clone.name == JokerName.INVISIBLE_JOKER:
+                    clone.state["rounds"] = 0
+                if hasattr(ctx.state, "assign_joker_id"):
+                    ctx.state.assign_joker_id(clone, force_new=True)
+                ctx.state.inventory.jokers.append(clone)
+                on_joker_added(ctx.state, clone)
+            else:
+                ctx.state.pending_cv_checks.add("jokers")
 
 
 @joker_hook(JokerName.GROS_MICHEL)
@@ -1060,25 +1086,31 @@ def handle_chicot(joker: Joker, ctx: TriggerContext):
         return
     if ctx.event == TriggerEvent.SETTING_BLIND:
         if ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG):
-            ctx.state.boss_disabled = True
+            if hasattr(ctx.state, "disable_active_boss"):
+                ctx.state.disable_active_boss()
+            else:
+                ctx.state.boss_disabled = True
 
 
 @joker_hook(JokerName.LUCHADOR)
 def handle_luchador(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.CARD_SOLD:
-        if ctx.target_card == joker and ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG):
-            ctx.state.boss_disabled = True
-            for j in ctx.state.inventory.jokers:
-                if not (j.perishable and j.perish_tally <= 0):
-                    j.debuffed = False
-            for hc in ctx.state.hand.cards:
-                hc.card.debuffed = False
+        if ctx.target_card is joker and ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG):
+            if hasattr(ctx.state, "disable_active_boss"):
+                ctx.state.disable_active_boss()
+            else:
+                ctx.state.boss_disabled = True
+                for j in ctx.state.inventory.jokers:
+                    if not (j.perishable and j.perish_tally <= 0):
+                        j.debuffed = False
+                for hc in ctx.state.hand.cards:
+                    hc.card.debuffed = False
 
 
 @joker_hook(JokerName.DIET_COLA)
 def handle_diet_cola(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.CARD_SOLD:
-        if ctx.target_card == joker or ctx.is_blueprint:
+        if ctx.target_card is joker or ctx.is_blueprint:
             ctx.state.active_tags.append(SkipTag.DOUBLE_TAG)
 
 
@@ -1194,7 +1226,15 @@ def handle_chaos_the_clown(joker: Joker, ctx: TriggerContext):
 def handle_perkeo(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.LEAVE_SHOP:
         if ctx.state.inventory and ctx.state.inventory.consumables:
-            ctx.state.pending_cv_checks.add("consumables")
+            if ctx.state.rng:
+                chosen, _ = ctx.state.rng.choice(
+                    "perkeo", ctx.state.inventory.consumables
+                )
+                clone = copy.deepcopy(chosen)
+                clone.edition = Edition.NEGATIVE
+                ctx.state.inventory.consumables.append(clone)
+            else:
+                ctx.state.pending_cv_checks.add("consumables")
 
 
 @joker_hook(JokerName.DNA)
@@ -1348,6 +1388,8 @@ def handle_reserved_parking(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.MATADOR)
 def handle_matador(joker: Joker, ctx: TriggerContext):
+    # Matador's trigger depends on Balatro's internal `blind.triggered` debuff evaluation
+    # (complicated across edge cases); money updates are intentionally left to money OCR.
     if ctx.event in (TriggerEvent.BEFORE_PLAY, TriggerEvent.DISCARD):
         if (
             ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG)
@@ -1431,6 +1473,8 @@ def handle_hit_the_road(joker: Joker, ctx: TriggerContext):
 # =========================================================================
 # 8. PURE PASSIVE SCORING & STATIC JOKERS
 # =========================================================================
+# Chip and mult score calculation for static jokers is intentionally omitted
+# because round scores are captured directly via OCR.
 STATIC_SCORING_JOKERS = [
     JokerName.JOKER, JokerName.GREEDY_JOKER, JokerName.LUSTY_JOKER, JokerName.WRATHFUL_JOKER,
     JokerName.GLUTTONOUS_JOKER, JokerName.JOLLY_JOKER, JokerName.ZANY_JOKER, JokerName.MAD_JOKER,

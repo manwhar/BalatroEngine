@@ -2,9 +2,11 @@
 Common Utilities and Video Extraction Helpers for Balatro Classifiers
 """
 
+from pathlib import Path
+from typing import Iterable
+
 import cv2
 import numpy as np
-from pathlib import Path
 
 
 def parse_timestamp(ts_str: str) -> float:
@@ -51,6 +53,70 @@ def extract_video_frame(video_path: Path, timestamp_sec: float) -> tuple[np.ndar
         raise RuntimeError(f"Failed to read frame at timestamp {timestamp_sec:.2f}s from {video_path}")
 
     return frame, actual_sec, target_frame
+
+
+def extract_video_frames(
+    video_path: Path | str,
+    frame_indices: Iterable[int],
+    sequential_grab_threshold: int = 32,
+) -> dict[int, np.ndarray]:
+    """Extracts specific BGR frames in one pass over a video file.
+
+    Opens `cv2.VideoCapture` once, processes unique indices in ascending order,
+    uses fast `cap.grab()` for small forward steps (avoiding keyframe re-seeks),
+    and returns `{requested_frame_idx: bgr_ndarray}`.
+    """
+    requested = sorted({int(idx) for idx in frame_indices})
+    if not requested:
+        return {}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video file: {video_path}")
+
+    frames: dict[int, np.ndarray] = {}
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cur_pos: int | None = None
+        last_clamped: int | None = None
+        last_frame: np.ndarray | None = None
+
+        for orig_idx in requested:
+            target = max(0, orig_idx)
+            if total_frames > 0:
+                target = min(total_frames - 1, target)
+
+            if last_clamped == target and last_frame is not None:
+                frames[orig_idx] = last_frame
+                continue
+
+            if (
+                cur_pos is None
+                or target < cur_pos
+                or (target - cur_pos) > sequential_grab_threshold
+            ):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                cur_pos = target
+            else:
+                while cur_pos < target:
+                    if not cap.grab():
+                        break
+                    cur_pos += 1
+
+            ret, frame = cap.read()
+            cur_pos += 1
+            if not ret or frame is None:
+                raise RuntimeError(
+                    f"Failed to read frame {target} (requested {orig_idx}) from {video_path}"
+                )
+
+            frames[orig_idx] = frame
+            last_clamped = target
+            last_frame = frame
+    finally:
+        cap.release()
+
+    return frames
 
 
 def compute_iou(box_a: list[float], box_b: list[float]) -> float:

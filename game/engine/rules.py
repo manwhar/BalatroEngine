@@ -2,6 +2,7 @@ import copy
 
 from .context import TriggerContext, TriggerEvent
 from .jokers import (
+    JOKER_EFFECTS,
     dispatch_jokers,
     get_card_repetitions,
     get_oops_multiplier,
@@ -261,17 +262,46 @@ def trigger_end_of_round_effects(state, action: Action | None = None) -> None:
     ):
         _grant_skip_tag(state, SkipTag.DOUBLE_TAG, action=action)
 
+    # Restore Boss Blind round modifiers & clear per-ante state on Boss defeat
+    if hasattr(state, "clear_boss_round_modifiers"):
+        state.clear_boss_round_modifiers()
+    if state.current_blind not in (BlindName.SMALL, BlindName.BIG):
+        state.played_cards_this_ante.clear()
+        if hasattr(state, "update_ox_target_hand"):
+            state.update_ox_target_hand()
+
     state.discard_pile.clear()
 
 
 def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
-    """Runs the scoring pipeline for a played hand and triggers end_round() if the blind is beaten."""
+    """Runs the scoring pipeline for a played hand and triggers end_round() if the blind is beaten.
+
+    Note: Chip and mult score calculation (including The Flint's 0.5x base Chips/Mult) is
+    intentionally omitted here because round scores are obtained via OCR.
+    """
     if state.current_blind == BlindName.THE_TOOTH and not state.boss_disabled:
         state.money -= len(played_cards)
 
     jokers = state.inventory.jokers if state.inventory else None
     scoring_cards = get_scoring_cards(played_cards, jokers)
     poker_hand = evaluate_poker_hand(played_cards, jokers)
+
+    is_repeat_eye = (
+        state.current_blind == BlindName.THE_EYE
+        and poker_hand in state.hands_played_this_round_by_type
+    )
+    is_wrong_mouth = (
+        state.current_blind == BlindName.THE_MOUTH
+        and state.locked_hand_type is not None
+        and poker_hand != state.locked_hand_type
+    )
+    is_small_psychic = (
+        state.current_blind == BlindName.THE_PSYCHIC
+        and len(played_cards) < 5
+    )
+    hand_debuffed = (not state.boss_disabled) and (
+        is_repeat_eye or is_wrong_mouth or is_small_psychic
+    )
 
     state.last_hand_played = poker_hand
     state.hand_play_counts[poker_hand] = state.hand_play_counts.get(poker_hand, 0) + 1
@@ -283,99 +313,110 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
     ):
         state.locked_hand_type = poker_hand
 
-    # 1. Before play
-    ctx = TriggerContext(
-        event=TriggerEvent.BEFORE_PLAY,
-        state=state,
-        action=action,
-        scoring_cards=scoring_cards,
-        full_hand=played_cards,
-        poker_hand=poker_hand,
-    )
-    dispatch_jokers(ctx)
+    if not hand_debuffed:
+        if not state.boss_disabled:
+            if state.current_blind == BlindName.THE_ARM:
+                cur_lvl = state.hand_levels.get(poker_hand, 1)
+                if cur_lvl > 1:
+                    state.hand_levels[poker_hand] = cur_lvl - 1
+            elif state.current_blind == BlindName.THE_OX:
+                ox_target = getattr(state, "ox_target_hand", None) or PokerHand.HIGH_CARD
+                if poker_hand == ox_target:
+                    state.money = 0
 
-    # 2. Individual card scored (for each active, non-debuffed scoring card + retriggers)
-    for idx, card in enumerate(scoring_cards):
-        if getattr(card, "debuffed", False):
-            continue
-        reps = get_card_repetitions(card, idx, state)
-        for _ in range(reps):
-            if getattr(card, "destroyed", False):
-                break
-            if card.seal == Seal.GOLD:
-                state.money += 3
-            extra = {}
-            if card.enhancement == Enhancement.LUCKY and state.rng:
-                hit = evaluate_lucky_hit(
-                    state.rng, probability_modifier=get_oops_multiplier(state)
+        # 1. Before play
+        ctx = TriggerContext(
+            event=TriggerEvent.BEFORE_PLAY,
+            state=state,
+            action=action,
+            scoring_cards=scoring_cards,
+            full_hand=played_cards,
+            poker_hand=poker_hand,
+        )
+        dispatch_jokers(ctx)
+
+        # 2. Individual card scored (for each active, non-debuffed scoring card + retriggers)
+        for idx, card in enumerate(scoring_cards):
+            if getattr(card, "debuffed", False):
+                continue
+            reps = get_card_repetitions(card, idx, state)
+            for _ in range(reps):
+                if getattr(card, "destroyed", False):
+                    break
+                if card.seal == Seal.GOLD:
+                    state.money += 3
+                extra = {}
+                if card.enhancement == Enhancement.LUCKY and state.rng:
+                    hit = evaluate_lucky_hit(
+                        state.rng, probability_modifier=get_oops_multiplier(state)
+                    )
+                    if hit.mult:
+                        card.bonus_mult = getattr(card, "bonus_mult", 0) + 20
+                    if hit.money:
+                        state.money += 20
+                    extra["lucky_triggered"] = hit.any_hit
+
+                ctx_ind = TriggerContext(
+                    event=TriggerEvent.INDIVIDUAL_CARD_SCORED,
+                    state=state,
+                    action=action,
+                    target_card=card,
+                    scoring_cards=scoring_cards,
+                    full_hand=played_cards,
+                    poker_hand=poker_hand,
+                    extra=extra,
                 )
-                if hit.mult:
-                    card.bonus_mult = getattr(card, "bonus_mult", 0) + 20
-                if hit.money:
-                    state.money += 20
-                extra["lucky_triggered"] = hit.any_hit
+                dispatch_jokers(ctx_ind)
 
-            ctx_ind = TriggerContext(
-                event=TriggerEvent.INDIVIDUAL_CARD_SCORED,
-                state=state,
-                action=action,
-                target_card=card,
-                scoring_cards=scoring_cards,
-                full_hand=played_cards,
-                poker_hand=poker_hand,
-                extra=extra,
-            )
-            dispatch_jokers(ctx_ind)
-
-    # 3. Held-in-hand individual card effects (Reserved Parking, Baron, Shoot the Moon retriggers)
-    active_jokers = state.inventory.jokers if state.inventory else []
-    mime_count = 0
-    for j in active_jokers:
-        if j.debuffed:
-            continue
-        if j.name == JokerName.MIME:
-            mime_count += 1
-        elif j.name in (JokerName.BLUEPRINT, JokerName.BRAINSTORM):
-            target = resolve_copy_target(j, active_jokers)
-            if target and not target.debuffed and target.name == JokerName.MIME:
+        # 3. Held-in-hand individual card effects (Reserved Parking, Baron, Shoot the Moon retriggers)
+        active_jokers = state.inventory.jokers if state.inventory else []
+        mime_count = 0
+        for j in active_jokers:
+            if j.debuffed:
+                continue
+            if j.name == JokerName.MIME:
                 mime_count += 1
+            elif j.name in (JokerName.BLUEPRINT, JokerName.BRAINSTORM):
+                target = resolve_copy_target(j, active_jokers)
+                if target and not target.debuffed and target.name == JokerName.MIME:
+                    mime_count += 1
 
-    held_cards = [hc.card for hc in state.hand.cards if not hc.selected]
-    for card in held_cards:
-        if getattr(card, "debuffed", False):
-            continue
-        reps = 1 + (1 if card.seal == Seal.RED else 0) + mime_count
-        for _ in range(reps):
-            ctx_held = TriggerContext(
-                event=TriggerEvent.HELD_CARD_SCORED,
-                state=state,
-                action=action,
-                target_card=card,
-                scoring_cards=scoring_cards,
-                full_hand=played_cards,
-                poker_hand=poker_hand,
-            )
-            dispatch_jokers(ctx_held)
+        held_cards = [hc.card for hc in state.hand.cards if not hc.selected]
+        for card in held_cards:
+            if getattr(card, "debuffed", False):
+                continue
+            reps = 1 + (1 if card.seal == Seal.RED else 0) + mime_count
+            for _ in range(reps):
+                ctx_held = TriggerContext(
+                    event=TriggerEvent.HELD_CARD_SCORED,
+                    state=state,
+                    action=action,
+                    target_card=card,
+                    scoring_cards=scoring_cards,
+                    full_hand=played_cards,
+                    poker_hand=poker_hand,
+                )
+                dispatch_jokers(ctx_held)
 
-    # 4. Glass cards shatter check (evaluated once per scoring card after repetitions)
-    for card in scoring_cards:
-        if getattr(card, "debuffed", False) or getattr(card, "destroyed", False):
-            continue
-        if card.enhancement == Enhancement.GLASS and state.rng:
-            if state.rng.poll_odds("glass", 1, 4, get_oops_multiplier(state)):
-                card.destroyed = True
-                state.remove_card_from_deck(card, shattered=True)
+        # 4. Glass cards shatter check (evaluated once per scoring card after repetitions)
+        for card in scoring_cards:
+            if getattr(card, "debuffed", False) or getattr(card, "destroyed", False):
+                continue
+            if card.enhancement == Enhancement.GLASS and state.rng:
+                if state.rng.poll_odds("glass", 1, 4, get_oops_multiplier(state)):
+                    card.destroyed = True
+                    state.remove_card_from_deck(card, shattered=True)
 
-    # 5. After play
-    ctx_after = TriggerContext(
-        event=TriggerEvent.AFTER_PLAY,
-        state=state,
-        action=action,
-        scoring_cards=scoring_cards,
-        full_hand=played_cards,
-        poker_hand=poker_hand,
-    )
-    dispatch_jokers(ctx_after)
+        # 5. After play
+        ctx_after = TriggerContext(
+            event=TriggerEvent.AFTER_PLAY,
+            state=state,
+            action=action,
+            scoring_cards=scoring_cards,
+            full_hand=played_cards,
+            poker_hand=poker_hand,
+        )
+        dispatch_jokers(ctx_after)
 
     state.hand.cards = [c for c in state.hand.cards if not c.selected]
     for card in played_cards:
@@ -537,6 +578,8 @@ def _advance_blind_and_ante_if_pending(state, force: bool = False) -> None:
         if state.seed or getattr(state, "rng", None):
             if hasattr(state, "roll_boss_blind"):
                 state.roll_boss_blind(is_reroll=False)
+            if hasattr(state, "roll_blind_tags"):
+                state.roll_blind_tags()
 
     if hasattr(state, "compute_target_chips"):
         state.target_chips = state.compute_target_chips()
@@ -1147,8 +1190,19 @@ def on_action(state, action: Action):
             state.hands_played_this_round += 1
 
             for c in state.hand.cards:
+                c.forced_selection = False
                 if c.selected and c.facing_back and c._real_card:
                     c.resolve_face_down(c._real_card, lift_facing_back=True)
+
+            if state.current_blind == BlindName.THE_FISH and not state.boss_disabled:
+                state.fish_prepped = True
+            if (
+                state.current_blind == BlindName.CRIMSON_HEART
+                and not state.boss_disabled
+                and state.inventory
+                and state.inventory.jokers
+            ):
+                state.crimson_heart_prepped = True
 
             played_cards = [c.card for c in state.hand.cards if c.selected]
             state.hand.cards = [c for c in state.hand.cards if not c.selected]
@@ -1174,6 +1228,8 @@ def on_action(state, action: Action):
                 _advance_blind_and_ante_if_pending(state)
                 state.discards_left = max(0, state.discards_left - 1)
                 state.discards_used_this_round += 1
+                for c in state.hand.cards:
+                    c.forced_selection = False
 
             for c in state.hand.cards:
                 if c.selected and c.facing_back and c._real_card:
@@ -1374,16 +1430,27 @@ def on_action(state, action: Action):
                 if sold_card.type == CardType.JOKER:
                     on_joker_removed(state, sold_card)
                     if state.current_blind == BlindName.VERDANT_LEAF:
-                        state.boss_disabled = True
-                        for j in state.inventory.jokers:
-                            if not (j.perishable and j.perish_tally <= 0):
-                                j.debuffed = False
+                        if hasattr(state, "disable_active_boss"):
+                            state.disable_active_boss()
+                        else:
+                            state.boss_disabled = True
+                            for j in state.inventory.jokers:
+                                if not (j.perishable and j.perish_tally <= 0):
+                                    j.debuffed = False
                 ctx = TriggerContext(
                     event=TriggerEvent.CARD_SOLD,
                     state=state,
                     action=action,
                     target_card=sold_card,
                 )
+                # Trigger the sold Joker's own selling_self effect (Invisible Joker, Luchador, Diet Cola)
+                # before dispatching to remaining inventory Jokers (e.g. Campfire).
+                if (
+                    sold_card.type == CardType.JOKER
+                    and not sold_card.debuffed
+                    and sold_card.name in JOKER_EFFECTS
+                ):
+                    JOKER_EFFECTS[sold_card.name](sold_card, ctx)
                 dispatch_jokers(ctx)
 
         case ActionType.CASH_OUT:
@@ -1405,7 +1472,12 @@ def on_action(state, action: Action):
             if action.metadata and action.metadata.get("round_dollars") is not None:
                 state.money += action.metadata["round_dollars"]
             else:
-                if action.metadata and action.metadata.get("include_round_payout"):
+                include_payout = (
+                    action.metadata.get("include_round_payout", True)
+                    if action.metadata is not None
+                    else True
+                )
+                if include_payout:
                     state.money += calculate_base_round_payout(state)
                 if investment_count:
                     state.money += 25 * investment_count
@@ -1499,6 +1571,18 @@ def on_action(state, action: Action):
             state.hands_played_this_round_by_type.clear()
             state.locked_hand_type = None
             state.boss_disabled = False
+            state.fish_prepped = False
+            state.crimson_heart_prepped = False
+            state._manacle_active = False
+            state._water_discards_sub = 0
+            state._needle_hands_sub = 0
+
+            if state.current_blind == BlindName.THE_WATER:
+                state._water_discards_sub = state.discards_left
+                state.discards_left = 0
+            elif state.current_blind == BlindName.THE_NEEDLE:
+                state._needle_hands_sub = max(0, state.hands_left - 1)
+                state.hands_left = 1
 
             ctx = TriggerContext(
                 event=TriggerEvent.SETTING_BLIND,
@@ -1507,6 +1591,38 @@ def on_action(state, action: Action):
                 extra={"initial_jokers": list(state.inventory.jokers)},
             )
             dispatch_jokers(ctx)
+
+            if not state.boss_disabled and state.current_blind not in (
+                BlindName.SMALL,
+                BlindName.BIG,
+            ):
+                if state.current_blind == BlindName.THE_MANACLE:
+                    state.hand.max_size = max(0, state.hand.max_size - 1)
+                    state._manacle_active = True
+                elif (
+                    state.current_blind == BlindName.AMBER_ACORN
+                    and state.inventory
+                    and state.inventory.jokers
+                ):
+                    for j in state.inventory.jokers:
+                        j.facing_back = True
+                    if len(state.inventory.jokers) > 1 and getattr(state, "rng", None):
+                        for _ in range(3):
+                            state.rng.shuffle("aajk", state.inventory.jokers)
+                elif state.current_blind == BlindName.CRIMSON_HEART and hasattr(
+                    state, "apply_crimson_heart"
+                ):
+                    state.apply_crimson_heart()
+
+            if hasattr(state, "refresh_debuffs"):
+                state.refresh_debuffs()
+            if (
+                state.current_blind == BlindName.CERULEAN_BELL
+                and not state.boss_disabled
+                and state.hand.cards
+                and hasattr(state, "apply_cerulean_bell")
+            ):
+                state.apply_cerulean_bell()
 
         case ActionType.SKIP_BLIND:
             _advance_blind_and_ante_if_pending(state)

@@ -277,7 +277,14 @@ def get_suit_sort_nominal(card: PlayingCard) -> float:
 
 @dataclass(kw_only=True)
 class GameState:
-    """Full snapshot of the game state at a specific frame/decision boundary."""
+    """Full snapshot of the game state at a specific frame/decision boundary.
+
+    Scope notes:
+    - Starting mid-run is out of scope; simulations always start from Ante 1 / run start.
+    - Challenge Decks (`Deck.CHALLENGE_DECK`) are out of scope.
+    - Exact chip/mult score calculation is intentionally omitted (`current_chips` / round
+      scores are captured externally via OCR).
+    """
     step_idx: int = 0
     frame_idx: int = 0
     timestamp: float = 0.0
@@ -371,6 +378,11 @@ class GameState:
     hands_played_this_round_by_type: set[PokerHand] = field(default_factory=set)
     locked_hand_type: PokerHand | None = None
     ox_target_hand: PokerHand | None = None
+    fish_prepped: bool = False
+    crimson_heart_prepped: bool = False
+    _manacle_active: bool = False
+    _water_discards_sub: int = 0
+    _needle_hands_sub: int = 0
 
     # Deck & Pile Tracking
     deck_cards_count: int | None = None
@@ -403,7 +415,10 @@ class GameState:
             self.target_chips = self.compute_target_chips()
 
     def _init_stake_and_deck_rules(self) -> None:
-        """Applies Stake (White..Gold) and Deck modifiers onto initial run state."""
+        """Applies Stake (White..Gold) and Deck modifiers onto initial run state.
+
+        Note: Starting mid-run and Challenge Decks (`Deck.CHALLENGE_DECK`) are out of scope.
+        """
         stake_level = get_stake_level(self.stake)
         if stake_level >= 4:
             self.enable_eternals_in_shop = True
@@ -652,6 +667,233 @@ class GameState:
         self.boss_blind = pred.blind_name
         return self.boss_blind
 
+    def roll_blind_tags(self) -> tuple[SkipTag | None, SkipTag | None]:
+        """Deterministically populates Small & Big Blind Skip Tags + Orbital choices via PRNG."""
+        if not self.seed and self.rng is None:
+            return self.small_blind_tag, self.big_blind_tag
+        if self.rng is None and self.seed:
+            self.set_seed(self.seed)
+        try:
+            from game.engine.rng_sim.events import (
+                get_next_tag,
+                get_orbital_tag_hands_for_ante,
+            )
+        except ImportError:
+            from engine.rng_sim.events import (
+                get_next_tag,
+                get_orbital_tag_hands_for_ante,
+            )
+
+        small_pred = get_next_tag(
+            self.rng,
+            ante=self.ante,
+            blind_type="Small",
+            state=None,
+            roll_orbital_choice=False,
+        )
+        big_pred = get_next_tag(
+            self.rng,
+            ante=self.ante,
+            blind_type="Big",
+            state=None,
+            roll_orbital_choice=False,
+        )
+        self.small_blind_tag = small_pred.skip_tag
+        self.big_blind_tag = big_pred.skip_tag
+
+        visible_hands = [
+            h
+            for h in PokerHand
+            if h
+            not in (
+                PokerHand.FIVE_OF_A_KIND,
+                PokerHand.FLUSH_HOUSE,
+                PokerHand.FLUSH_FIVE,
+            )
+            or self.hand_play_counts.get(h, 0) > 0
+        ]
+        orb = get_orbital_tag_hands_for_ante(self.rng, visible_hands=visible_hands)
+        self.small_blind_orbital_hand = orb["Small"]
+        self.big_blind_orbital_hand = orb["Big"]
+        return self.small_blind_tag, self.big_blind_tag
+
+    def _is_card_face_for_blind(self, card: PlayingCard) -> bool:
+        """Checks face status ignoring debuff state (matching Balatro `card:is_face(true)`)."""
+        if self.has_joker(JokerName.PAREIDOLIA):
+            return True
+        if card.enhancement == Enhancement.STONE or card.rank == Rank.NONE:
+            return False
+        return card.is_face
+
+    def _card_matches_suit_for_blind(self, card: PlayingCard, target_suit: Suit) -> bool:
+        """Checks suit match ignoring debuff state (matching Balatro `card:is_suit(suit, true)`)."""
+        if card.enhancement == Enhancement.STONE or card.rank == Rank.NONE:
+            return False
+        if card.enhancement == Enhancement.WILD:
+            return True
+        if self.has_joker(JokerName.SMEARED_JOKER):
+            if target_suit in (Suit.HEARTS, Suit.DIAMONDS):
+                return card.suit in (Suit.HEARTS, Suit.DIAMONDS)
+            if target_suit in (Suit.SPADES, Suit.CLUBS):
+                return card.suit in (Suit.SPADES, Suit.CLUBS)
+        return card.suit == target_suit
+
+    def _was_played_this_ante(self, card: PlayingCard) -> bool:
+        for prev in self.played_cards_this_ante:
+            if card.id and prev.id:
+                if card.id == prev.id:
+                    return True
+            elif _cards_match(card, prev):
+                return True
+        return False
+
+    def card_is_debuffed_by_boss(self, card: PlayingCard) -> bool:
+        """Evaluates whether `card` should be debuffed by the active Boss Blind."""
+        if (
+            self.boss_disabled
+            or self.location != Location.BLIND
+            or self.current_blind in (BlindName.SMALL, BlindName.BIG)
+        ):
+            return False
+        suit_bosses = {
+            BlindName.THE_CLUB: Suit.CLUBS,
+            BlindName.THE_GOAD: Suit.SPADES,
+            BlindName.THE_HEAD: Suit.HEARTS,
+            BlindName.THE_WINDOW: Suit.DIAMONDS,
+        }
+        target_suit = suit_bosses.get(self.current_blind)
+        if target_suit is not None:
+            return self._card_matches_suit_for_blind(card, target_suit)
+        if self.current_blind == BlindName.THE_PLANT:
+            return self._is_card_face_for_blind(card)
+        if self.current_blind == BlindName.THE_PILLAR:
+            return self._was_played_this_ante(card)
+        if self.current_blind == BlindName.VERDANT_LEAF:
+            return True
+        return False
+
+    def refresh_debuffs(self) -> None:
+        """Recomputes debuff status on all playing cards in hand and full_deck."""
+        for hc in self.hand.cards:
+            hc.card.debuffed = self.card_is_debuffed_by_boss(hc.card)
+        if self.full_deck:
+            for c in self.full_deck:
+                c.debuffed = self.card_is_debuffed_by_boss(c)
+
+    def update_ox_target_hand(self) -> None:
+        """Sets `ox_target_hand` to the most played poker hand (tie-broken by highest hand rank)."""
+        # Matches state_events.lua:130-137 (highest hand order: Flush Five..High Card)
+        hand_order = (
+            PokerHand.FLUSH_FIVE,
+            PokerHand.FLUSH_HOUSE,
+            PokerHand.FIVE_OF_A_KIND,
+            PokerHand.STRAIGHT_FLUSH,
+            PokerHand.FOUR_OF_A_KIND,
+            PokerHand.FULL_HOUSE,
+            PokerHand.FLUSH,
+            PokerHand.STRAIGHT,
+            PokerHand.THREE_OF_A_KIND,
+            PokerHand.TWO_PAIR,
+            PokerHand.PAIR,
+            PokerHand.HIGH_CARD,
+        )
+        best_hand = PokerHand.HIGH_CARD
+        best_count = -1
+        for h in hand_order:
+            count = self.hand_play_counts.get(h, 0)
+            if count > best_count:
+                best_count = count
+                best_hand = h
+        self.ox_target_hand = best_hand
+
+    def apply_crimson_heart(self) -> None:
+        """Disables 1 random Joker for the current hand under Crimson Heart."""
+        self.crimson_heart_prepped = False
+        if (
+            self.boss_disabled
+            or self.current_blind != BlindName.CRIMSON_HEART
+            or not self.inventory
+            or not self.inventory.jokers
+        ):
+            return
+        jokers = self.inventory.jokers
+        candidates = [
+            j
+            for j in jokers
+            if (not j.debuffed or len(jokers) < 2)
+            and not (j.perishable and j.perish_tally <= 0)
+        ]
+        for j in jokers:
+            if not (j.perishable and j.perish_tally <= 0):
+                j.debuffed = False
+        if not candidates:
+            return
+        if self.rng is not None:
+            chosen, _ = self.rng.choice("crimson_heart", candidates)
+            chosen.debuffed = True
+        else:
+            self.pending_cv_checks.add("jokers")
+
+    def apply_cerulean_bell(self) -> None:
+        """Forces 1 card in hand to stay selected under Cerulean Bell."""
+        if (
+            self.boss_disabled
+            or self.current_blind != BlindName.CERULEAN_BELL
+            or not self.hand.cards
+        ):
+            return
+        if any(hc.forced_selection for hc in self.hand.cards):
+            return
+        for hc in self.hand.cards:
+            hc.selected = False
+            hc.forced_selection = False
+        if self.rng is not None:
+            chosen, _ = self.rng.choice("cerulean_bell", self.hand.cards)
+            chosen.forced_selection = True
+            chosen.selected = True
+
+    def clear_boss_round_modifiers(self) -> None:
+        """Restores round-scoped Boss Blind mutations at end of round or defeat."""
+        if self._manacle_active:
+            self.hand.max_size += 1
+            self._manacle_active = False
+        self.fish_prepped = False
+        self.crimson_heart_prepped = False
+        if self.inventory:
+            for j in self.inventory.jokers:
+                j.facing_back = False
+                if not (j.perishable and j.perish_tally <= 0):
+                    j.debuffed = False
+        for hc in self.hand.cards:
+            hc.forced_selection = False
+            hc.card.debuffed = False
+            if hc.facing_back and hc._real_card:
+                hc.resolve_face_down(hc._real_card, lift_facing_back=True)
+            else:
+                hc.facing_back = False
+        if self.full_deck:
+            for c in self.full_deck:
+                c.debuffed = False
+
+    def disable_active_boss(self) -> None:
+        """Disables the currently active Boss Blind (`Blind:disable`, Chicot / Luchador / Verdant Leaf)."""
+        if self.current_blind in (BlindName.SMALL, BlindName.BIG):
+            return
+        self.boss_disabled = True
+        if self._water_discards_sub:
+            if self.discards_left is not None:
+                self.discards_left += self._water_discards_sub
+            self._water_discards_sub = 0
+        if self._needle_hands_sub:
+            if self.hands_left is not None:
+                self.hands_left += self._needle_hands_sub
+            self._needle_hands_sub = 0
+        if self.current_blind in (BlindName.THE_WALL, BlindName.VIOLET_VESSEL):
+            base = get_blind_amount(self.ante, self.stake)
+            deck_scaling = 2 if self.deck == Deck.PLASMA_DECK else 1
+            self.target_chips = int(base * 2.0 * deck_scaling)
+        self.clear_boss_round_modifiers()
+
     def set_seed(self, seed: str) -> None:
         """Initializes or resets the deterministic BalatroRNG and EventResolver on this GameState."""
         self.seed = str(seed).strip().upper()
@@ -665,6 +907,8 @@ class GameState:
         self.resolver = EventResolver(self.rng)
         if self.boss_blind is None and self.seed:
             self.roll_boss_blind(is_reroll=False)
+        if self.small_blind_tag is None and self.big_blind_tag is None and self.seed:
+            self.roll_blind_tags()
 
     @property
     def discount_percent(self) -> int:
@@ -921,7 +1165,7 @@ class GameState:
 
         # 1. Deterministic sort if simulation or cards have true values
         can_simulate_sort = all(
-            (c._real_card is not None or c.card.rank != Rank.NONE or c.enhancement == Enhancement.STONE)
+            (c._real_card is not None or c.card.rank != Rank.NONE or c.card.enhancement == Enhancement.STONE)
             for c in self.hand.cards
         )
         if can_simulate_sort:
@@ -1110,6 +1354,13 @@ class GameState:
         """Draws cards from remaining deck into hand, appending them strictly to the right."""
         self.ensure_slot_uids()
         needed = (self.hand.max_size - len(self.hand.cards)) if count is None else count
+        if (
+            count is None
+            and self.current_blind == BlindName.THE_SERPENT
+            and not self.boss_disabled
+            and (self.hands_played_this_round > 0 or self.discards_used_this_round > 0)
+        ):
+            needed = 3
         if needed <= 0:
             return []
 
@@ -1117,9 +1368,35 @@ class GameState:
         drawn_playing_cards = rem[:needed]
         new_hand_cards: list[HandCard] = []
 
+        oops_mod = 1.0
+        if self.inventory:
+            oops_count = sum(
+                1
+                for j in self.inventory.jokers
+                if j.name == JokerName.OOPS_ALL_6S and not j.debuffed
+            )
+            oops_mod = float(2**oops_count)
+
         for c in drawn_playing_cards:
+            c.debuffed = self.card_is_debuffed_by_boss(c)
+            is_flipped = face_down
+            if not is_flipped and not self.boss_disabled and self.location == Location.BLIND:
+                if (
+                    self.current_blind == BlindName.THE_HOUSE
+                    and self.hands_played_this_round == 0
+                    and self.discards_used_this_round == 0
+                ):
+                    is_flipped = True
+                elif self.current_blind == BlindName.THE_MARK and self._is_card_face_for_blind(c):
+                    is_flipped = True
+                elif self.current_blind == BlindName.THE_FISH and self.fish_prepped:
+                    is_flipped = True
+                elif self.current_blind == BlindName.THE_WHEEL and self.rng is not None:
+                    if self.rng.poll_odds("wheel", 1, 7, oops_mod):
+                        is_flipped = True
+
             uid = self._get_next_slot_uid()
-            if face_down:
+            if is_flipped:
                 hc = HandCard(card=c, facing_back=True, slot_uid=uid)
                 hc.bounds = CardBounds(is_face_down=True)
                 hc.bounds.set_candidates(self.remaining_deck)
@@ -1129,6 +1406,10 @@ class GameState:
             new_hand_cards.append(hc)
 
         self.reconcile_face_down_adjacencies()
+        if self.crimson_heart_prepped:
+            self.apply_crimson_heart()
+        if self.current_blind == BlindName.CERULEAN_BELL and not self.boss_disabled:
+            self.apply_cerulean_bell()
         return new_hand_cards
 
     def copy(self) -> "GameState":
@@ -1213,6 +1494,11 @@ _TRACKED_STATE_FIELDS: tuple[str, ...] = (
     "temp_hand_size_bonus",
     "round_advanced",
     "pending_blind_advance",
+    "fish_prepped",
+    "crimson_heart_prepped",
+    "_manacle_active",
+    "_water_discards_sub",
+    "_needle_hands_sub",
     "seed",
 )
 

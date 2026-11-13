@@ -318,6 +318,12 @@ class BalatroRNG:
         threshold = (numerator * modifier) / float(denominator)
         return val < threshold
 
+    def shuffle(self, key: str, items: list[Any]) -> None:
+        """In-place Fisher-Yates shuffle matching Balatro's `pseudoshuffle(items, pseudoseed(key))`."""
+        pseed = self.step_seed(key)
+        tw = Tw223(pseed)
+        tw.shuffle(items)
+
     def advance(self, key: str, steps: int = 1) -> float:
         """Advance stream channel `key` by `steps` LCG calls without instantiating Tw223."""
         if steps <= 0:

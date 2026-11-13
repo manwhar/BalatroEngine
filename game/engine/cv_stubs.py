@@ -8,6 +8,10 @@ Enforces strict GameState location checks:
   (e.g. in shop outside of a pack, in celestial/buffoon/standard packs, selecting a blind, cash out screen).
 - cv_detect_shop_cards: Raises InvalidLocationError if called when not in the main shop
   (e.g. selecting a blind, in a blind, inside a booster pack, cash out screen).
+- cv_detect_pack_cards: Raises InvalidLocationError if not inside an open booster pack
+  (or if currently on the cash out screen).
+- cv_detect_joker_bar: Raises InvalidLocationError if not in an active gameplay screen
+  (select, blind/cash-out, shop, or pack).
 
 Deterministic non-visible state, RNG rolls, and Boss Blinds are resolved via PRNG (`game.engine.rng_sim`).
 `cv_detect_boss_blind` has been removed in favor of `get_boss_blind_from_seed` and `state.roll_boss_blind()`.
@@ -397,6 +401,64 @@ def validate_shop_cards_location(state: Any) -> None:
     )
 
 
+def validate_pack_cards_location(state: Any) -> None:
+    """Validates that the current GameState allows observing open booster pack cards.
+
+    Raises:
+        InvalidLocationError: If not currently inside an open booster pack (e.g. cash out screen,
+                              selecting a blind, active blind play, or main shop with no active pack).
+    """
+    if state is None:
+        raise ValueError("GameState must be provided to validate location.")
+
+    loc = getattr(state, "location", None)
+    round_won = getattr(state, "round_won", False)
+    active_pack = getattr(state, "active_pack", None)
+
+    if round_won or loc in (Location.CASH_OUT, "cash out", "cash_out"):
+        raise InvalidLocationError(
+            f"Cannot detect pack cards: currently in the cash out screen (location='{loc}')."
+        )
+
+    if loc in (Location.PACK, "pack") or active_pack is not None:
+        return
+
+    raise InvalidLocationError(
+        f"Cannot detect pack cards: not inside a booster pack (location='{loc}')."
+    )
+
+
+def validate_joker_bar_location(state: Any) -> None:
+    """Validates that the current GameState corresponds to an in-run screen showing the top Joker bar.
+
+    Raises:
+        InvalidLocationError: If GameState has no valid in-run screen location.
+    """
+    if state is None:
+        raise ValueError("GameState must be provided to validate location.")
+
+    loc = getattr(state, "location", None)
+    valid_locations = (
+        Location.SELECT,
+        "select",
+        Location.BLIND,
+        "blind",
+        Location.SHOP,
+        "shop",
+        Location.PACK,
+        "pack",
+        Location.CASH_OUT,
+        "cash out",
+        "cash_out",
+    )
+    if loc in valid_locations:
+        return
+
+    raise InvalidLocationError(
+        f"Cannot detect joker bar: unrecognized or invalid game location '{loc}'."
+    )
+
+
 # =========================================================================
 # ITEM DESERIALIZERS
 # =========================================================================
@@ -562,6 +624,35 @@ def _convert_shop_item_result(item: Any) -> Any:
 # =========================================================================
 
 
+def _import_classifier_fn(name: str) -> Any:
+    """Imports a recognition entrypoint from `classifiers.inference`, adding repo root if needed."""
+    try:
+        from classifiers import inference as cls_inf
+    except ImportError:
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from classifiers import inference as cls_inf
+
+    return getattr(cls_inf, name)
+
+
+def _convert_items_of_type(
+    items: Sequence[Any] | None,
+    expected_types: type | tuple[type, ...] | None = None,
+) -> list[Any]:
+    """Converts ShopItemResult objects once and optionally filters to expected domain classes."""
+    converted: list[Any] = []
+    for item in items or []:
+        obj = _convert_shop_item_result(item)
+        if expected_types is None or isinstance(obj, expected_types):
+            converted.append(obj)
+    return converted
+
+
 def cv_detect_hand_cards(
     state_or_frame: Any,
     frame_or_state: Any = None,
@@ -592,17 +683,7 @@ def cv_detect_hand_cards(
             "A valid video frame must be provided for cv_detect_hand_cards."
         )
 
-    try:
-        from classifiers.inference import recognize_hand_cards
-    except ImportError:
-        import sys
-        from pathlib import Path
-
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        if str(repo_root) not in sys.path:
-            sys.path.insert(0, str(repo_root))
-        from classifiers.inference import recognize_hand_cards
-
+    recognize_hand_cards = _import_classifier_fn("recognize_hand_cards")
     rec_output = recognize_hand_cards(
         frame, conf_threshold=conf_threshold, device=device
     )
@@ -640,46 +721,19 @@ def cv_detect_shop_cards(
             "A valid video frame must be provided for cv_detect_shop_cards."
         )
 
-    try:
-        from classifiers.inference import recognize_shop
-    except ImportError:
-        import sys
-        from pathlib import Path
-
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        if str(repo_root) not in sys.path:
-            sys.path.insert(0, str(repo_root))
-        from classifiers.inference import recognize_shop
-
+    recognize_shop = _import_classifier_fn("recognize_shop")
     rec_output = recognize_shop(
         frame, mode="shop", conf_threshold=conf_threshold, device=device
     )
 
-    shop_cards = [_convert_shop_item_result(item) for item in rec_output.shop_items]
-    vouchers = [
-        _convert_shop_item_result(item)
-        for item in rec_output.vouchers
-        if isinstance(_convert_shop_item_result(item), Voucher)
-    ]
-    packs = [
-        _convert_shop_item_result(item)
-        for item in rec_output.boosters
-        if isinstance(_convert_shop_item_result(item), BoosterPack)
-    ]
-    jokers = [
-        _convert_shop_item_result(item)
-        for item in rec_output.joker_bar
-        if isinstance(_convert_shop_item_result(item), Joker)
-    ]
-    consumables = [
-        _convert_shop_item_result(item)
-        for item in rec_output.consumeables
-        if isinstance(_convert_shop_item_result(item), (Tarot, Planet, Spectral))
-    ]
-    pack_items = [
-        _convert_shop_item_result(item)
-        for item in rec_output.pack_items
-    ] if hasattr(rec_output, "pack_items") and rec_output.pack_items else []
+    shop_cards = _convert_items_of_type(getattr(rec_output, "shop_items", None))
+    vouchers = _convert_items_of_type(getattr(rec_output, "vouchers", None), Voucher)
+    packs = _convert_items_of_type(getattr(rec_output, "boosters", None), BoosterPack)
+    jokers = _convert_items_of_type(getattr(rec_output, "joker_bar", None), Joker)
+    consumables = _convert_items_of_type(
+        getattr(rec_output, "consumeables", None), (Tarot, Planet, Spectral)
+    )
+    pack_items = _convert_items_of_type(getattr(rec_output, "pack_items", None))
 
     return ShopCardsResult(
         cards=shop_cards,
@@ -690,6 +744,83 @@ def cv_detect_shop_cards(
         pack_cards=pack_items,
         raw_output=rec_output,
     )
+
+
+def cv_detect_pack_cards(
+    state_or_frame: Any,
+    frame_or_state: Any = None,
+    conf_threshold: float = 0.35,
+    device: str | None = None,
+) -> list[Any]:
+    """Evaluates the open booster pack ROI for pack offerings from the video frame.
+
+    Args:
+        state_or_frame: Current GameState (or video frame if called as cv_detect_pack_cards(frame, state)).
+        frame_or_state: Video frame (numpy ndarray, PIL image, or VideoFrame) or GameState.
+        conf_threshold: Detection confidence threshold.
+        device: Torch device.
+
+    Returns:
+        List of converted pack item objects (Joker, Tarot, Planet, Spectral, or PlayingCard)
+        sorted left-to-right.
+
+    Raises:
+        InvalidLocationError: If GameState is not inside an open booster pack.
+        ValueError: If frame is None or invalid.
+    """
+    state, frame = _resolve_state_and_frame(state_or_frame, frame_or_state)
+    validate_pack_cards_location(state)
+
+    if frame is None:
+        raise ValueError(
+            "A valid video frame must be provided for cv_detect_pack_cards."
+        )
+
+    recognize_shop = _import_classifier_fn("recognize_shop")
+    rec_output = recognize_shop(
+        frame, mode="pack_only", conf_threshold=conf_threshold, device=device
+    )
+    return _convert_items_of_type(
+        getattr(rec_output, "pack_items", None),
+        (Joker, Tarot, Planet, Spectral, PlayingCard),
+    )
+
+
+def cv_detect_joker_bar(
+    state_or_frame: Any,
+    frame_or_state: Any = None,
+    conf_threshold: float = 0.35,
+    device: str | None = None,
+) -> list[Joker]:
+    """Evaluates the top Joker bar ROI from the video frame on any active gameplay screen.
+
+    Args:
+        state_or_frame: Current GameState (or video frame if called as cv_detect_joker_bar(frame, state)).
+        frame_or_state: Video frame (numpy ndarray, PIL image, or VideoFrame) or GameState.
+        conf_threshold: Detection confidence threshold.
+        device: Torch device.
+
+    Returns:
+        List of Joker objects sorted left-to-right (with `id=0`; call `match_cv_joker_order`
+        or `reconcile_cv_jokers` to preserve persistent Joker IDs).
+
+    Raises:
+        InvalidLocationError: If GameState does not correspond to a valid gameplay screen.
+        ValueError: If frame is None or invalid.
+    """
+    state, frame = _resolve_state_and_frame(state_or_frame, frame_or_state)
+    validate_joker_bar_location(state)
+
+    if frame is None:
+        raise ValueError(
+            "A valid video frame must be provided for cv_detect_joker_bar."
+        )
+
+    recognize_shop = _import_classifier_fn("recognize_shop")
+    rec_output = recognize_shop(
+        frame, mode="joker_only", conf_threshold=conf_threshold, device=device
+    )
+    return _convert_items_of_type(getattr(rec_output, "joker_bar", None), Joker)
 
 
 def match_cv_joker_order(state: Any, observed_jokers: Sequence[Joker]) -> list[int]:
