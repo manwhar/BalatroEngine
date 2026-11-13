@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
+from game.balatro_models import Planet, PlanetName
 from game.engine.rng_sim.rng import BalatroRNG, Tw223
 from game.engine.rng_sim.state import (
     DEFAULT_VISIBLE_POKER_HANDS,
@@ -44,10 +46,58 @@ from game.engine.rng_sim.state import (
 # ---------------------------------------------------------------------------
 
 P_CARDS_KEYS: list[str] = [
-    "C_2", "C_3", "C_4", "C_5", "C_6", "C_7", "C_8", "C_9", "C_A", "C_J", "C_K", "C_Q", "C_T",
-    "D_2", "D_3", "D_4", "D_5", "D_6", "D_7", "D_8", "D_9", "D_A", "D_J", "D_K", "D_Q", "D_T",
-    "H_2", "H_3", "H_4", "H_5", "H_6", "H_7", "H_8", "H_9", "H_A", "H_J", "H_K", "H_Q", "H_T",
-    "S_2", "S_3", "S_4", "S_5", "S_6", "S_7", "S_8", "S_9", "S_A", "S_J", "S_K", "S_Q", "S_T",
+    "C_2",
+    "C_3",
+    "C_4",
+    "C_5",
+    "C_6",
+    "C_7",
+    "C_8",
+    "C_9",
+    "C_A",
+    "C_J",
+    "C_K",
+    "C_Q",
+    "C_T",
+    "D_2",
+    "D_3",
+    "D_4",
+    "D_5",
+    "D_6",
+    "D_7",
+    "D_8",
+    "D_9",
+    "D_A",
+    "D_J",
+    "D_K",
+    "D_Q",
+    "D_T",
+    "H_2",
+    "H_3",
+    "H_4",
+    "H_5",
+    "H_6",
+    "H_7",
+    "H_8",
+    "H_9",
+    "H_A",
+    "H_J",
+    "H_K",
+    "H_Q",
+    "H_T",
+    "S_2",
+    "S_3",
+    "S_4",
+    "S_5",
+    "S_6",
+    "S_7",
+    "S_8",
+    "S_9",
+    "S_A",
+    "S_J",
+    "S_K",
+    "S_Q",
+    "S_T",
 ]
 
 _SUIT_LOOKUP: dict[str, Suit] = {
@@ -168,7 +218,9 @@ class VoucherProto:
 
 P_VOUCHERS: list[VoucherProto] = [
     VoucherProto("v_overstock_norm", VoucherName.OVERSTOCK, 1),
-    VoucherProto("v_overstock_plus", VoucherName.OVERSTOCK_PLUS, 2, ("v_overstock_norm",)),
+    VoucherProto(
+        "v_overstock_plus", VoucherName.OVERSTOCK_PLUS, 2, ("v_overstock_norm",)
+    ),
     VoucherProto("v_clearance_sale", VoucherName.CLEARANCE_SALE, 3),
     VoucherProto("v_liquidation", VoucherName.LIQUIDATION, 4, ("v_clearance_sale",)),
     VoucherProto("v_hone", VoucherName.HONE, 5),
@@ -186,7 +238,9 @@ P_VOUCHERS: list[VoucherProto] = [
     VoucherProto("v_tarot_merchant", VoucherName.TAROT_MERCHANT, 17),
     VoucherProto("v_tarot_tycoon", VoucherName.TAROT_TYCOON, 18, ("v_tarot_merchant",)),
     VoucherProto("v_planet_merchant", VoucherName.PLANET_MERCHANT, 19),
-    VoucherProto("v_planet_tycoon", VoucherName.PLANET_TYCOON, 20, ("v_planet_merchant",)),
+    VoucherProto(
+        "v_planet_tycoon", VoucherName.PLANET_TYCOON, 20, ("v_planet_merchant",)
+    ),
     VoucherProto("v_seed_money", VoucherName.SEED_MONEY, 21),
     VoucherProto("v_money_tree", VoucherName.MONEY_TREE, 22, ("v_seed_money",)),
     VoucherProto("v_blank", VoucherName.BLANK, 23),
@@ -378,7 +432,7 @@ def get_castle_suit(
     stream_key: str | None = None,
 ) -> Suit:
     """Determine the suit Castle selects for the round (`reset_castle_card`, common_events.lua:2312-2324).
-    
+
     Mid-Ante Deck Mutation Note:
     - If `round_num` (1=Small, 2=Big, 3=Boss) is passed, `rng.ensure_call_count('cas{ante}', round_num - 1)`
       automatically advances the `'cas{ante}'` LCG stream to `round_num - 1` (if not already there)
@@ -451,7 +505,7 @@ def get_idol_card(
     stream_key: str | None = None,
 ) -> IdolTarget:
     """Determine the card (`rank` + `suit`) The Idol selects for the round (`reset_idol_card`, common_events.lua:2271-2286).
-    
+
     Mid-Ante Deck Mutation Note:
     - If `round_num` (1=Small, 2=Big, 3=Boss) is passed, `rng.ensure_call_count('idol{ante}', round_num - 1)`
       automatically advances `'idol{ante}'` to `round_num - 1` (if not already there) and evaluates
@@ -939,7 +993,9 @@ def get_next_tag(
 
     orbital_hand: PokerHand | None = None
     if roll_orbital_choice:
-        hands = state.visible_hands if state is not None else DEFAULT_VISIBLE_POKER_HANDS
+        hands = (
+            state.visible_hands if state is not None else DEFAULT_VISIBLE_POKER_HANDS
+        )
         orbital_hand, _ = rng.choice("orbital", hands)
 
     proto = TAG_BY_KEY[center]
@@ -1192,7 +1248,7 @@ def evaluate_lucky_hit(
     modifier = (
         probability_modifier
         if probability_modifier is not None
-        else float(2 ** oops_count)
+        else float(2**oops_count)
     )
 
     roll_mult = rng.random("lucky_mult")
@@ -1240,7 +1296,9 @@ class EventResolver:
     ) -> bool:
         return self.check_odds(stream_key, 1, 4, oops_multiplier)
 
-    def bloodstone(self, oops_multiplier: float = 1.0, base_denominator: int = 2) -> bool:
+    def bloodstone(
+        self, oops_multiplier: float = 1.0, base_denominator: int = 2
+    ) -> bool:
         return self.check_odds("bloodstone", 1, base_denominator, oops_multiplier)
 
     def glass_card_shatter(self, oops_multiplier: float = 1.0) -> bool:
@@ -1421,7 +1479,9 @@ def predict_seance_spectral(rng: BalatroRNG, ante: int = 1) -> Spectral:
 
 
 def predict_superposition_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
-    return poll_tarot_pool(rng, ante=ante, key_append="sup", source_label="Superposition")
+    return poll_tarot_pool(
+        rng, ante=ante, key_append="sup", source_label="Superposition"
+    )
 
 
 def predict_purple_seal_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
@@ -1450,7 +1510,7 @@ _ENHANCED_CENTERS: list[Enhancement] = [
 
 def predict_random_destroy(rng: BalatroRNG, hand_cards: list[Any]) -> Any | None:
     """Predicts which card in hand is destroyed by Familiar, Grim, or Incantation.
-    
+
     Replicates:
     `destroyed_cards[#destroyed_cards+1] = pseudorandom_element(G.hand.cards, pseudoseed('random_destroy'))`
     (card.lua:1293)
@@ -1467,7 +1527,7 @@ def predict_immolate_destructions(
     rng: BalatroRNG, hand_cards: list[Any], count: int = 5
 ) -> list[Any]:
     """Predicts which cards in hand are destroyed by Immolate.
-    
+
     Replicates:
     `table.sort(temp_hand, function (a, b) return not a.playing_card or not b.playing_card or a.playing_card < b.playing_card end)`
     `pseudoshuffle(temp_hand, pseudoseed('immolate'))`
@@ -1527,3 +1587,327 @@ def predict_incantation_spawns(rng: BalatroRNG, count: int = 4) -> list[PlayingC
         cards.append(PlayingCard(rank=r, suit=s, enhancement=enh))
     return cards
 
+
+P_UNCOMMON_JOKERS: list[tuple[str, JokerName]] = [
+    ("j_stencil", JokerName.JOKER_STENCIL),
+    ("j_four_fingers", JokerName.FOUR_FINGERS),
+    ("j_mime", JokerName.MIME),
+    ("j_ceremonial", JokerName.CEREMONIAL_DAGGER),
+    ("j_marble", JokerName.MARBLE_JOKER),
+    ("j_loyalty_card", JokerName.LOYALTY_CARD),
+    ("j_dusk", JokerName.DUSK),
+    ("j_fibonacci", JokerName.FIBONACCI),
+    ("j_steel_joker", JokerName.STEEL_JOKER),
+    ("j_hack", JokerName.HACK),
+    ("j_pareidolia", JokerName.PAREIDOLIA),
+    ("j_space", JokerName.SPACE_JOKER),
+    ("j_burglar", JokerName.BURGLAR),
+    ("j_blackboard", JokerName.BLACKBOARD),
+    ("j_sixth_sense", JokerName.SIXTH_SENSE),
+    ("j_constellation", JokerName.CONSTELLATION),
+    ("j_hiker", JokerName.HIKER),
+    ("j_card_sharp", JokerName.CARD_SHARP),
+    ("j_madness", JokerName.MADNESS),
+    ("j_seance", JokerName.SEANCE),
+    ("j_vampire", JokerName.VAMPIRE),
+    ("j_shortcut", JokerName.SHORTCUT),
+    ("j_hologram", JokerName.HOLOGRAM),
+    ("j_cloud_9", JokerName.CLOUD_9),
+    ("j_rocket", JokerName.ROCKET),
+    ("j_midas_mask", JokerName.MIDAS_MASK),
+    ("j_luchador", JokerName.LUCHADOR),
+    ("j_gift", JokerName.GIFT_CARD),
+    ("j_turtle_bean", JokerName.TURTLE_BEAN),
+    ("j_erosion", JokerName.EROSION),
+    ("j_to_the_moon", JokerName.TO_THE_MOON),
+    ("j_stone", JokerName.STONE_JOKER),
+    ("j_lucky_cat", JokerName.LUCKY_CAT),
+    ("j_bull", JokerName.BULL),
+    ("j_diet_cola", JokerName.DIET_COLA),
+    ("j_trading", JokerName.TRADING_CARD),
+    ("j_flash", JokerName.FLASH_CARD),
+    ("j_trousers", JokerName.SPARE_TROUSERS),
+    ("j_ramen", JokerName.RAMEN),
+    ("j_selzer", JokerName.SELTZER),
+    ("j_castle", JokerName.CASTLE),
+    ("j_mr_bones", JokerName.MR_BONES),
+    ("j_acrobat", JokerName.ACROBAT),
+    ("j_sock_and_buskin", JokerName.SOCK_AND_BUSKIN),
+    ("j_troubadour", JokerName.TROUBADOUR),
+    ("j_certificate", JokerName.CERTIFICATE),
+    ("j_smeared", JokerName.SMEARED_JOKER),
+    ("j_throwback", JokerName.THROWBACK),
+    ("j_rough_gem", JokerName.ROUGH_GEM),
+    ("j_bloodstone", JokerName.BLOODSTONE),
+    ("j_arrowhead", JokerName.ARROWHEAD),
+    ("j_onyx_agate", JokerName.ONYX_AGATE),
+    ("j_glass", JokerName.GLASS_JOKER),
+    ("j_ring_master", JokerName.SHOWMAN),
+    ("j_flower_pot", JokerName.FLOWER_POT),
+    ("j_merry_andy", JokerName.MERRY_ANDY),
+    ("j_oops", JokerName.OOPS_ALL_6S),
+    ("j_idol", JokerName.THE_IDOL),
+    ("j_seeing_double", JokerName.SEEING_DOUBLE),
+    ("j_matador", JokerName.MATADOR),
+    ("j_satellite", JokerName.SATELLITE),
+    ("j_cartomancer", JokerName.CARTOMANCER),
+    ("j_astronomer", JokerName.ASTRONOMER),
+    ("j_bootstraps", JokerName.BOOTSTRAPS),
+]
+
+P_RARE_JOKERS: list[tuple[str, JokerName]] = [
+    ("j_dna", JokerName.DNA),
+    ("j_vagabond", JokerName.VAGABOND),
+    ("j_baron", JokerName.BARON),
+    ("j_obelisk", JokerName.OBELISK),
+    ("j_baseball", JokerName.BASEBALL_CARD),
+    ("j_ancient", JokerName.ANCIENT_JOKER),
+    ("j_campfire", JokerName.CAMPFIRE),
+    ("j_blueprint", JokerName.BLUEPRINT),
+    ("j_wee", JokerName.WEE_JOKER),
+    ("j_hit_the_road", JokerName.HIT_THE_ROAD),
+    ("j_duo", JokerName.THE_DUO),
+    ("j_trio", JokerName.THE_TRIO),
+    ("j_family", JokerName.THE_FAMILY),
+    ("j_order", JokerName.THE_ORDER),
+    ("j_tribe", JokerName.THE_TRIBE),
+    ("j_stuntman", JokerName.STUNTMAN),
+    ("j_invisible", JokerName.INVISIBLE_JOKER),
+    ("j_brainstorm", JokerName.BRAINSTORM),
+    ("j_drivers_license", JokerName.DRIVER),
+    ("j_burnt", JokerName.BURNT_JOKER),
+]
+
+P_LEGENDARY_JOKERS: list[tuple[str, JokerName]] = [
+    ("j_caino", JokerName.CANIO),
+    ("j_triboulet", JokerName.TRIBOULET),
+    ("j_yorick", JokerName.YORICK),
+    ("j_chicot", JokerName.CHICOT),
+    ("j_perkeo", JokerName.PERKEO),
+]
+
+# (key, PlanetName, hand_type_required_if_softlocked)
+P_PLANETS: list[tuple[str, PlanetName, PokerHand | None]] = [
+    ("c_mercury", PlanetName.MERCURY, None),
+    ("c_venus", PlanetName.VENUS, None),
+    ("c_earth", PlanetName.EARTH, None),
+    ("c_mars", PlanetName.MARS, None),
+    ("c_jupiter", PlanetName.JUPITER, None),
+    ("c_saturn", PlanetName.SATURN, None),
+    ("c_uranus", PlanetName.URANUS, None),
+    ("c_neptune", PlanetName.NEPTUNE, None),
+    ("c_pluto", PlanetName.PLUTO, None),
+    ("c_planet_x", PlanetName.PLANET_X, PokerHand.FIVE_OF_A_KIND),
+    ("c_ceres", PlanetName.CERES, PokerHand.FLUSH_HOUSE),
+    ("c_eris", PlanetName.ERIS, PokerHand.FLUSH_FIVE),
+]
+
+_ALL_JOKER_BY_KEY: dict[str, JokerName] = dict(
+    P_COMMON_JOKERS + P_UNCOMMON_JOKERS + P_RARE_JOKERS + P_LEGENDARY_JOKERS
+)
+_PLANET_BY_KEY: dict[str, PlanetName] = {k: name for k, name, _ in P_PLANETS}
+
+
+def poll_planet_pool(
+    rng: BalatroRNG,
+    ante: int = 1,
+    key_append: str = "",
+    hand_play_counts: dict[PokerHand, int] | None = None,
+    active_planets: set[PlanetName] | None = None,
+    banned_keys: set[str] | None = None,
+    has_showman: bool = False,
+) -> Planet:
+    """Polls `G.P_CENTER_POOLS['Planet']` matching `get_current_pool('Planet', ...)`."""
+    eff_ante = max(1, ante)
+    pool_key = f"Planet{key_append}{eff_ante}"
+    counts = hand_play_counts or {}
+    used = active_planets or set()
+    banned = banned_keys or set()
+
+    pool: list[str] = []
+    pool_size = 0
+    for key, p_name, req_hand in P_PLANETS:
+        is_avail = True
+        if key in banned:
+            is_avail = False
+        elif not has_showman and p_name in used:
+            is_avail = False
+        elif req_hand is not None and counts.get(req_hand, 0) <= 0:
+            is_avail = False
+
+        if is_avail:
+            pool.append(key)
+            pool_size += 1
+        else:
+            pool.append("UNAVAILABLE")
+
+    if pool_size == 0:
+        pool = ["c_pluto"]
+
+    chosen, _ = rng.choice(pool_key, pool)
+    it = 1
+    while chosen == "UNAVAILABLE":
+        it += 1
+        chosen, _ = rng.choice(f"{pool_key}_resample{it}", pool)
+
+    return Planet(name=_PLANET_BY_KEY.get(chosen, PlanetName.PLUTO))
+
+
+def poll_joker_pool(
+    rng: BalatroRNG,
+    ante: int = 1,
+    rarity_tier: int | None = None,
+    rarity_roll: float | None = None,
+    legendary: bool = False,
+    key_append: str = "",
+    owned_jokers: set[JokerName] | None = None,
+    gros_michel_extinct: bool = False,
+    banned_keys: set[str] | None = None,
+    has_showman: bool = False,
+    include_edition: bool = True,
+    edition_mod: float = 1.0,
+) -> Joker:
+    """Polls `G.P_JOKER_RARITY_POOLS` matching `create_card('Joker', ..., legendary, rarity, ..., append)`."""
+    eff_ante = max(1, ante)
+    if legendary:
+        tier = 4
+        # common_events.lua:1971 omits _append when _legendary is true
+        pool_key = f"Joker4{eff_ante}"
+        raw_pool = P_LEGENDARY_JOKERS
+    else:
+        if rarity_tier is not None:
+            tier = max(1, min(3, rarity_tier))
+        else:
+            roll = (
+                float(rarity_roll)
+                if rarity_roll is not None
+                else rng.random(f"rarity{eff_ante}{key_append}")
+            )
+            tier = 3 if roll > 0.95 else (2 if roll > 0.7 else 1)
+        pool_key = f"Joker{tier}{key_append}{eff_ante}"
+        raw_pool = (
+            P_RARE_JOKERS
+            if tier == 3
+            else (P_UNCOMMON_JOKERS if tier == 2 else P_COMMON_JOKERS)
+        )
+
+    owned = owned_jokers or set()
+    banned = banned_keys or set()
+    pool: list[str] = []
+    pool_size = 0
+    for key, j_name in raw_pool:
+        is_avail = True
+        if key in banned:
+            is_avail = False
+        elif not has_showman and j_name in owned:
+            is_avail = False
+        elif j_name == JokerName.GROS_MICHEL and gros_michel_extinct:
+            is_avail = False
+        elif j_name == JokerName.CAVENDISH and not gros_michel_extinct:
+            is_avail = False
+
+        if is_avail:
+            pool.append(key)
+            pool_size += 1
+        else:
+            pool.append("UNAVAILABLE")
+
+    if pool_size == 0:
+        pool = ["j_joker"]
+
+    chosen, _ = rng.choice(pool_key, pool)
+    it = 1
+    while chosen == "UNAVAILABLE":
+        it += 1
+        chosen, _ = rng.choice(f"{pool_key}_resample{it}", pool)
+
+    j_name = _ALL_JOKER_BY_KEY.get(chosen, JokerName.JOKER)
+    ed = (
+        poll_edition(rng, f"edi{key_append}{eff_ante}", mod=edition_mod)
+        if include_edition
+        else Edition.NONE
+    )
+    return Joker(name=j_name, edition=ed)
+
+
+def predict_ouija_rank(rng: BalatroRNG) -> Rank:
+    """Predicts target rank chosen by Ouija Spectral (`card.lua:1247`)."""
+    ranks = [
+        Rank.TWO,
+        Rank.THREE,
+        Rank.FOUR,
+        Rank.FIVE,
+        Rank.SIX,
+        Rank.SEVEN,
+        Rank.EIGHT,
+        Rank.NINE,
+        Rank.TEN,
+        Rank.JACK,
+        Rank.QUEEN,
+        Rank.KING,
+        Rank.ACE,
+    ]
+    chosen, _ = rng.choice("ouija", ranks)
+    return chosen
+
+
+def predict_ankh_choice(rng: BalatroRNG, jokers: Sequence[Joker]) -> Joker | None:
+    """Predicts surviving Joker chosen by Ankh (`card.lua:1434`)."""
+    if not jokers:
+        return None
+    indexed = list(enumerate(jokers))
+    if all(getattr(j, "sort_id", 0) or getattr(j, "id", 0) for _, j in indexed):
+        indexed.sort(
+            key=lambda pair: getattr(pair[1], "sort_id", 0) or getattr(pair[1], "id", 0)
+        )
+    chosen_pair, _ = rng.choice("ankh_choice", indexed)
+    return chosen_pair[1]
+
+
+def predict_hook_discards(
+    rng: BalatroRNG | None,
+    hand_cards: Sequence[Any],
+    count: int = 2,
+) -> list[Any]:
+    """Selects up to `count` remaining hand cards discarded by The Hook (`blind.lua:464-487`)."""
+    remaining = list(hand_cards)
+    if not remaining:
+        return []
+    to_pick = min(count, len(remaining))
+    if rng is None:
+        return remaining[:to_pick]
+
+    picked: list[Any] = []
+    # Match pseudorandom_element(sort_id) ordering when card ids are populated
+    indexed = list(enumerate(remaining))
+    if all(getattr(getattr(item, "card", item), "id", 0) for _, item in indexed):
+        indexed.sort(
+            key=lambda pair: getattr(getattr(pair[1], "card", pair[1]), "id", 0)
+        )
+
+    pool = list(indexed)
+    for _ in range(to_pick):
+        if not pool:
+            break
+        chosen_pair, _ = rng.choice("hook", pool)
+        pool.remove(chosen_pair)
+        picked.append(chosen_pair[1])
+    return picked
+
+
+def generate_erratic_deck(rng: BalatroRNG | None = None) -> list[PlayingCard]:
+    """Generates a 52-card Erratic Deck matching `game.lua:2342, 2367-2373`."""
+    chosen_keys: list[str] = []
+    for i in range(len(P_CARDS_KEYS)):
+        if rng is not None:
+            k, _ = rng.choice("erratic", P_CARDS_KEYS)
+        else:
+            k = P_CARDS_KEYS[i]
+        chosen_keys.append(k)
+    # table.sort on (suit_char .. rank_char)
+    chosen_keys.sort(key=lambda k: k.replace("_", ""))
+    cards: list[PlayingCard] = []
+    for idx, key in enumerate(chosen_keys, start=1):
+        suit, rank = parse_card_key(key)
+        cards.append(PlayingCard(rank=rank, suit=suit, id=idx))
+    return cards

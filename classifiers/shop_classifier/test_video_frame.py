@@ -47,36 +47,36 @@ from classifiers.shop_classifier.pipeline import ShopRecognitionPipeline
 BASE_WIDTH = 1920.0
 BASE_HEIGHT = 1080.0
 
-# Shop ROIs in 1920x1080 Balatro space (from balatro_mod/src/config.lua)
+# Shop ROIs in 1920x1080 Balatro space (from balatro_mod/dataset/boxes.lua)
 SHOP_ROIS = {
     "joker_bar": {
         "label": "Joker Bar",
-        "roi": {"x": 320.0, "y": 10.0, "w": 1280.0, "h": 260.0},
+        "roi": {"x": 512.701385, "y": 20.409878, "w": 868.473724, "h": 259.967609},
         "color": (59, 130, 246)  # Blue
     },
     "consumeables": {
         "label": "Consumables",
-        "roi": {"x": 1250.0, "y": 10.0, "w": 420.0, "h": 260.0},
+        "roi": {"x": 1369.783812, "y": 30.836806, "w": 425.206356, "h": 270.406328},
         "color": (168, 85, 247)  # Purple
     },
     "shop": {
         "label": "Shop Items",
-        "roi": {"x": 360.0, "y": 140.0, "w": 1200.0, "h": 380.0},
+        "roi": {"x": 818.386186, "y": 369.181989, "w": 720.772049, "h": 280.979925},
         "color": (34, 197, 94)   # Green
     },
     "voucher": {
         "label": "Voucher Shelf",
-        "roi": {"x": 880.0, "y": 355.0, "w": 340.0, "h": 300.0},
+        "roi": {"x": 656.059547, "y": 714.459732, "w": 360.743773, "h": 284.420985},
         "color": (234, 179, 8)   # Yellow
     },
     "booster": {
         "label": "Booster Shelf",
-        "roi": {"x": 1540.0, "y": 355.0, "w": 360.0, "h": 300.0},
+        "roi": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
         "color": (249, 115, 22)  # Orange
     },
     "pack": {
         "label": "Booster Pack Open",
-        "roi": {"x": 300.0, "y": 260.0, "w": 1320.0, "h": 500.0},
+        "roi": {"x": 565.612571, "y": 588.005101, "w": 960.654887, "h": 307.239491},
         "color": (236, 72, 153)  # Pink
     }
 }

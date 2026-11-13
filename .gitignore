@@ -10,5 +10,6 @@ dataset
 dataset_shop
 runs
 weights
+classifiers/old_models
 balatro_source
 JokerDisplay-2.0.8

@@ -17,9 +17,9 @@ import torch.nn as nn
 import torchvision.models as models
 
 try:
-    from .config import HEAD_CONFIG, IDX_TO_KEY, IDX_TO_EDITION
+    from .config import HEAD_CONFIG, IDX_TO_KEY, IDX_TO_EDITION, KEY_TO_IDX, INVALID_SHOP_KEYS
 except ImportError:
-    from config import HEAD_CONFIG, IDX_TO_KEY, IDX_TO_EDITION
+    from config import HEAD_CONFIG, IDX_TO_KEY, IDX_TO_EDITION, KEY_TO_IDX, INVALID_SHOP_KEYS
 
 
 class MultiHeadItemClassifier(nn.Module):
@@ -72,6 +72,13 @@ class MultiHeadItemClassifier(nn.Module):
         self.head_rental = nn.Linear(feat_dim, HEAD_CONFIG["rental"])
         self.head_debuffed = nn.Linear(feat_dim, HEAD_CONFIG["debuffed"])
 
+        invalid_key_mask = torch.zeros(HEAD_CONFIG["key"], dtype=torch.bool)
+        for key_name in INVALID_SHOP_KEYS:
+            idx = KEY_TO_IDX.get(key_name)
+            if idx is not None and 0 <= idx < HEAD_CONFIG["key"]:
+                invalid_key_mask[idx] = True
+        self.register_buffer("_invalid_key_mask", invalid_key_mask, persistent=False)
+
     def forward(self, x):
         """
         Forward pass for a batch of cropped item images.
@@ -102,8 +109,9 @@ class MultiHeadItemClassifier(nn.Module):
         with torch.no_grad():
             logits = self.forward(x)
 
-            # Softmax heads
-            key_probs = torch.softmax(logits["key"], dim=-1)
+            # Softmax heads (mask zero-sample non-item / placeholder keys to -inf)
+            key_logits = logits["key"].masked_fill(self._invalid_key_mask, float("-inf"))
+            key_probs = torch.softmax(key_logits, dim=-1)
             key_confs, key_preds = torch.max(key_probs, dim=-1)
 
             ed_probs = torch.softmax(logits["edition"], dim=-1)

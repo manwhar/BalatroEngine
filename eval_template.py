@@ -28,6 +28,7 @@ class EvaluationResult:
     clicked: bool | None
     template_filename: str | None = None
     plot_kwargs: dict | None = None
+    box: tuple[int, int, int, int] | None = None
 
 
 def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
@@ -182,6 +183,7 @@ def eval(
                 match=match,
                 clicked=clicked,
                 template_filename=None,  # not implemented rn, maybe will later
+                box=(top_left[0], top_left[1], top_left[0] + w_inp, top_left[1] + h_inp),
             )
 
     return EvaluationResult(

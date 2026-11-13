@@ -23,6 +23,41 @@ else:
 KEY_TO_IDX = {k: i for i, k in enumerate(ITEM_KEYS)}
 IDX_TO_KEY = {i: k for i, k in enumerate(ITEM_KEYS)}
 
+# Non-item / placeholder keys present in all_keys.json that have zero Stage 2 shop-item
+# training samples (e.g., Balatro UI/run stat keys prefixed with c_, placeholders j_locked /
+# j_undiscovered, and playing_card which Stage 1 routes to card_classifier). Masked to
+# -inf before softmax during inference so Stage 2 never predicts non-existent items.
+INVALID_SHOP_KEYS = frozenset({
+    "c_blind_states",
+    "c_cards_discarded",
+    "c_cards_played",
+    "c_cards_sold",
+    "c_control",
+    "c_dollars_earned",
+    "c_face_cards_played",
+    "c_hands_played",
+    "c_jokers_sold",
+    "c_locked",
+    "c_losses",
+    "c_planetarium_used",
+    "c_planets_bought",
+    "c_playing_cards_bought",
+    "c_round_interest_cap_streak",
+    "c_rounds",
+    "c_shop_dollars_spent",
+    "c_shop_rerolls",
+    "c_single_hand_round_streak",
+    "c_summit",
+    "c_tarot_reading_used",
+    "c_tarots_bought",
+    "c_trick",
+    "c_vouchers_bought",
+    "c_wins",
+    "j_locked",
+    "j_undiscovered",
+    "playing_card",
+})
+
 # 2. Editions (5 classes: None, Foil, Holo, Polychrome, Negative)
 EDITIONS = ["None", "Foil", "Holo", "Polychrome", "Negative"]
 EDITION_TO_IDX = {e: i for i, e in enumerate(EDITIONS)}

@@ -362,6 +362,35 @@ class TestRealImageCVInference(unittest.TestCase):
         for item in res:
             self.assertIsInstance(item, (bm.Card, bm.Joker, bm.Tarot, bm.Planet, bm.Spectral, bm.PlayingCard))
 
+    def test_shop_classifier_masks_invalid_keys_before_softmax(self):
+        """Verifies predict_attributes masks zero-sample INVALID_SHOP_KEYS logits to -inf before softmax."""
+        import torch
+        from classifiers.shop_classifier.stage2_classifier.config import INVALID_SHOP_KEYS, KEY_TO_IDX
+        from classifiers.shop_classifier.stage2_classifier.model import MultiHeadItemClassifier
+
+        model = MultiHeadItemClassifier(backbone_name="mobilenet_v3_small", pretrained=False)
+        num_keys = model.head_key.out_features
+        fake_logits = {
+            "key": torch.full((1, num_keys), -50.0),
+            "edition": torch.zeros((1, 5)),
+            "eternal": torch.zeros((1,)),
+            "perishable": torch.zeros((1,)),
+            "rental": torch.zeros((1,)),
+            "debuffed": torch.zeros((1,)),
+        }
+        # Force every masked invalid class to have a massive raw logit vs a modest valid key logit
+        for invalid_k in INVALID_SHOP_KEYS:
+            fake_logits["key"][0, KEY_TO_IDX[invalid_k]] = 100.0
+        fake_logits["key"][0, KEY_TO_IDX["j_blueprint"]] = 1.0
+
+        dummy_input = torch.zeros((1, 3, 192, 128))
+        with patch.object(model, "forward", return_value=fake_logits):
+            preds = model.predict_attributes(dummy_input)
+
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0]["key"], "j_blueprint")
+        self.assertNotIn(preds[0]["key"], INVALID_SHOP_KEYS)
+
 
 if __name__ == "__main__":
     unittest.main()

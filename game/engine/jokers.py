@@ -246,7 +246,9 @@ def init_joker_default_state(state, joker: Joker) -> None:
 
 
 def on_joker_added(state, joker: Joker) -> None:
-    """Applies Card:add_to_deck passive effects when a Joker is acquired."""
+    """Applies Card:add_to_deck passive effects and ensures a persistent Joker ID."""
+    if state is not None and hasattr(state, "assign_joker_id"):
+        state.assign_joker_id(joker)
     init_joker_default_state(state, joker)
     if joker.debuffed:
         return
@@ -1086,7 +1088,7 @@ def handle_diet_cola(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.TRADING_CARD)
 def handle_trading_card(joker: Joker, ctx: TriggerContext):
-    if ctx.is_blueprint:
+    if ctx.is_blueprint or ctx.hook:
         return
     if ctx.event == TriggerEvent.DISCARD:
         discarded = ctx.full_hand or (ctx.state.hand.selected_cards if ctx.state and ctx.state.hand else [])
@@ -1108,6 +1110,8 @@ def handle_faceless_joker(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.BURNT_JOKER)
 def handle_burnt_joker(joker: Joker, ctx: TriggerContext):
+    if ctx.hook:
+        return
     if ctx.event == TriggerEvent.DISCARD:
         if ctx.state.discards_used_this_round == 1:
             discarded = ctx.full_hand or (ctx.state.hand.selected_cards if ctx.state and ctx.state.hand else [])

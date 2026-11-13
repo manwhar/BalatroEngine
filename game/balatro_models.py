@@ -14,6 +14,8 @@ class Location(StrEnum):
     SHOP = "shop"
     SELECT = "select"
     PACK = "pack"
+    # Internal to post_processing.py only; GameState models the cash-out screen as
+    # Location.BLIND with round_won=True (do not pass Location.CASH_OUT into GameState).
     CASH_OUT = "cash out"
 
 
@@ -355,13 +357,20 @@ class Card:
     type: CardType
     edition: Edition = Edition.NONE
     extra_value: int = 0  # Dynamic additions (Gift Card, Egg, etc.)
+    couponed: bool = False
+    rental: bool = False
 
     @property
     def base_cost(self) -> int:
         return 0
 
-    def get_cost(self, discount_percent: int = 0, inflation: int = 0) -> int:
-        """Computes buy cost matching Balatro's Card:set_cost()."""
+    def _get_pre_coupon_cost(
+        self,
+        discount_percent: int = 0,
+        inflation: int = 0,
+        astronomer: bool = False,
+    ) -> int:
+        """Computes Card buy cost before Coupon Tag zeroing (matching Card:set_cost)."""
         edition_extra = {
             Edition.NONE: 0,
             Edition.FOIL: 2,
@@ -372,11 +381,40 @@ class Card:
 
         extra_cost = inflation + edition_extra
         raw = (self.base_cost + extra_cost + 0.5) * (100 - discount_percent) / 100.0
-        return max(1, math.floor(raw))
+        cost = max(1, math.floor(raw))
+        if astronomer and self.type == CardType.PLANET:
+            cost = 0
+        if getattr(self, "rental", False):
+            cost = 1
+        return cost
 
-    def get_sell_value(self, discount_percent: int = 0, inflation: int = 0) -> int:
-        """Sell value is half the buy cost plus any accrued extra_value (Gift Card)."""
-        cost = self.get_cost(discount_percent, inflation)
+    def get_cost(
+        self,
+        discount_percent: int = 0,
+        inflation: int = 0,
+        astronomer: bool = False,
+    ) -> int:
+        """Computes buy cost matching Balatro's Card:set_cost()."""
+        if getattr(self, "couponed", False):
+            return 0
+        return self._get_pre_coupon_cost(
+            discount_percent=discount_percent,
+            inflation=inflation,
+            astronomer=astronomer,
+        )
+
+    def get_sell_value(
+        self,
+        discount_percent: int = 0,
+        inflation: int = 0,
+        astronomer: bool = False,
+    ) -> int:
+        """Sell value is half the pre-coupon cost plus any accrued extra_value (Gift Card)."""
+        cost = self._get_pre_coupon_cost(
+            discount_percent=discount_percent,
+            inflation=inflation,
+            astronomer=astronomer,
+        )
         return max(1, math.floor(cost / 2)) + self.extra_value
 
     @property
@@ -915,6 +953,11 @@ class Voucher:
     name: VoucherName
     price: int = 10
 
+    def get_cost(self, discount_percent: int = 0, inflation: int = 0) -> int:
+        """Computes voucher buy cost matching Balatro's Card:set_cost()."""
+        raw = (self.price + inflation + 0.5) * (100 - discount_percent) / 100.0
+        return max(1, math.floor(raw))
+
 
 @dataclass(kw_only=True)
 class BoosterPack:
@@ -923,6 +966,21 @@ class BoosterPack:
     cost: int
     choose: int
     extra: int  # total options shown (e.g. choose 1 of 3 -> extra=3)
+    couponed: bool = False
+
+    def get_cost(
+        self,
+        discount_percent: int = 0,
+        inflation: int = 0,
+        astronomer: bool = False,
+    ) -> int:
+        """Computes booster pack buy cost matching Balatro's Card:set_cost()."""
+        if self.couponed:
+            return 0
+        if astronomer and self.booster_type == BoosterType.CELESTIAL:
+            return 0
+        raw = (self.cost + inflation + 0.5) * (100 - discount_percent) / 100.0
+        return max(1, math.floor(raw))
 
 
 @dataclass(kw_only=True)

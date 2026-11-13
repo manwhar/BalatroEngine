@@ -82,8 +82,30 @@ class ShopRecognitionPipeline:
             self.device = torch.device(device)
 
         self.card_pipeline = card_pipeline
-        detector_path = Path(detector_path) if detector_path else WEIGHTS_DIR / "detector_best.pt"
-        classifier_path = Path(classifier_path) if classifier_path else WEIGHTS_DIR / "classifier_best.pt"
+        prod_weights_dir = CURRENT_DIR.parent / "prod_weights"
+        if detector_path is not None:
+            detector_path = Path(detector_path)
+        else:
+            detector_path = WEIGHTS_DIR / "detector_best.pt"
+            if not detector_path.exists() and (prod_weights_dir / "shop_detector.pt").exists():
+                detector_path = prod_weights_dir / "shop_detector.pt"
+            elif not detector_path.exists():
+                candidates = list(CURRENT_DIR.glob("stage1_detector/runs/*/weights/best.pt"))
+                if candidates:
+                    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    detector_path = candidates[0]
+
+        if classifier_path is not None:
+            classifier_path = Path(classifier_path)
+        else:
+            classifier_path = WEIGHTS_DIR / "classifier_best.pt"
+            if not classifier_path.exists() and (prod_weights_dir / "shop_classifier.pt").exists():
+                classifier_path = prod_weights_dir / "shop_classifier.pt"
+            elif not classifier_path.exists():
+                candidates = list(CURRENT_DIR.glob("stage2_classifier/runs/*/best.pt"))
+                if candidates:
+                    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    classifier_path = candidates[0]
 
         print(f"[Pipeline] Loading Stage 1 detector: {detector_path}")
         self.detector = YOLO(str(detector_path))

@@ -101,6 +101,39 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
         return [y < abs_threshold for y in y1s]
 
 
+def decode_card_prediction(
+    preds: dict,
+    pred_idx: int,
+    index: int,
+    box: list[int],
+    selected: bool = False,
+) -> CardResult:
+    """Decodes one row from MultiHeadCardClassifier.predict_attributes into a CardResult."""
+    confs = {
+        "rank": float(preds["rank_conf"][pred_idx].item()),
+        "suit": float(preds["suit_conf"][pred_idx].item()),
+        "edition": float(preds["edition_conf"][pred_idx].item()),
+        "enhancement": float(preds["enhancement_conf"][pred_idx].item()),
+        "seal": float(preds["seal_conf"][pred_idx].item()),
+        "selected": 1.0,
+        "debuffed": float(preds["debuffed_conf"][pred_idx].item()) if "debuffed_conf" in preds else 1.0,
+        "face_down": float(preds["face_down_conf"][pred_idx].item()) if "face_down_conf" in preds else 1.0,
+    }
+    return CardResult(
+        index=index,
+        rank=IDX_TO_RANK.get(preds["rank_idx"][pred_idx].item(), "Unknown"),
+        suit=IDX_TO_SUIT.get(preds["suit_idx"][pred_idx].item(), "Unknown"),
+        edition=IDX_TO_EDITION.get(preds["edition_idx"][pred_idx].item(), "None"),
+        enhancement=IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][pred_idx].item(), "None"),
+        seal=IDX_TO_SEAL.get(preds["seal_idx"][pred_idx].item(), "None"),
+        selected=selected,
+        debuffed=bool(preds["debuffed"][pred_idx].item()) if "debuffed" in preds else False,
+        face_down=bool(preds["face_down"][pred_idx].item()) if "face_down" in preds else False,
+        box=box,
+        confidences=confs,
+    )
+
+
 class CardRecognitionPipeline:
     def __init__(self, detector_path=None, classifier_path=None, backbone="mobilenet_v3_small", device=None):
         if device is None:
@@ -120,7 +153,10 @@ class CardRecognitionPipeline:
         # 2. Resolve Stage 2 Classifier Weights
         if classifier_path is None:
             classifier_path = WEIGHTS_DIR / "classifier_best.pt"
-            if not classifier_path.exists():
+            prod_cls = CURRENT_DIR.parent / "prod_weights" / "card_classifier.pt"
+            if not classifier_path.exists() and prod_cls.exists():
+                classifier_path = prod_cls
+            elif not classifier_path.exists():
                 candidates = list(CURRENT_DIR.glob("stage2_classifier/runs/*/weights/best.pt"))
                 if candidates:
                     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -234,41 +270,10 @@ class CardRecognitionPipeline:
         selected_flags = determine_card_selection(valid_boxes, ih)
 
         # 5. Assemble CardResult objects
-        results = []
-        for i in range(len(valid_boxes)):
-            rank = IDX_TO_RANK.get(preds["rank_idx"][i].item(), "Unknown")
-            suit = IDX_TO_SUIT.get(preds["suit_idx"][i].item(), "Unknown")
-            edition = IDX_TO_EDITION.get(preds["edition_idx"][i].item(), "None")
-            enhancement = IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][i].item(), "None")
-            seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
-            selected = selected_flags[i]
-            debuffed = bool(preds["debuffed"][i].item()) if "debuffed" in preds else False
-            face_down = bool(preds["face_down"][i].item()) if "face_down" in preds else False
-
-            confs = {
-                "rank": float(preds["rank_conf"][i].item()),
-                "suit": float(preds["suit_conf"][i].item()),
-                "edition": float(preds["edition_conf"][i].item()),
-                "enhancement": float(preds["enhancement_conf"][i].item()),
-                "seal": float(preds["seal_conf"][i].item()),
-                "selected": 1.0,
-                "debuffed": float(preds["debuffed_conf"][i].item()) if "debuffed_conf" in preds else 1.0,
-                "face_down": float(preds["face_down_conf"][i].item()) if "face_down_conf" in preds else 1.0,
-            }
-
-            results.append(CardResult(
-                index=i + 1,
-                rank=rank,
-                suit=suit,
-                edition=edition,
-                enhancement=enhancement,
-                seal=seal,
-                selected=selected,
-                debuffed=debuffed,
-                face_down=face_down,
-                box=valid_boxes[i],
-                confidences=confs
-            ))
+        results = [
+            decode_card_prediction(preds, i, index=i + 1, box=valid_boxes[i], selected=selected_flags[i])
+            for i in range(len(valid_boxes))
+        ]
 
         t4 = time.perf_counter()
         total_ms = (t4 - t0) * 1000.0
@@ -298,40 +303,15 @@ class CardRecognitionPipeline:
         with torch.no_grad():
             preds = self.classifier.predict_attributes(batched_crops)
 
-        results = []
-        for i in range(len(pil_crops)):
-            rank = IDX_TO_RANK.get(preds["rank_idx"][i].item(), "Unknown")
-            suit = IDX_TO_SUIT.get(preds["suit_idx"][i].item(), "Unknown")
-            edition = IDX_TO_EDITION.get(preds["edition_idx"][i].item(), "None")
-            enhancement = IDX_TO_ENHANCEMENT.get(preds["enhancement_idx"][i].item(), "None")
-            seal = IDX_TO_SEAL.get(preds["seal_idx"][i].item(), "None")
-            debuffed = bool(preds["debuffed"][i].item()) if "debuffed" in preds else False
-            face_down = bool(preds["face_down"][i].item()) if "face_down" in preds else False
-
-            confs = {
-                "rank": float(preds["rank_conf"][i].item()),
-                "suit": float(preds["suit_conf"][i].item()),
-                "edition": float(preds["edition_conf"][i].item()),
-                "enhancement": float(preds["enhancement_conf"][i].item()),
-                "seal": float(preds["seal_conf"][i].item()),
-                "selected": 1.0,
-                "debuffed": float(preds["debuffed_conf"][i].item()) if "debuffed_conf" in preds else 1.0,
-                "face_down": float(preds["face_down_conf"][i].item()) if "face_down_conf" in preds else 1.0
-            }
-
-            b = boxes[i] if boxes and i < len(boxes) else [0, 0, pil_crops[i].width, pil_crops[i].height]
-            results.append(CardResult(
+        results = [
+            decode_card_prediction(
+                preds,
+                i,
                 index=i + 1,
-                rank=rank,
-                suit=suit,
-                edition=edition,
-                enhancement=enhancement,
-                seal=seal,
+                box=boxes[i] if boxes and i < len(boxes) else [0, 0, pil_crops[i].width, pil_crops[i].height],
                 selected=False,
-                debuffed=debuffed,
-                face_down=face_down,
-                box=b,
-                confidences=confs
-            ))
+            )
+            for i in range(len(pil_crops))
+        ]
 
         return results

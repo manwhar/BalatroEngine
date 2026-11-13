@@ -1,6 +1,7 @@
 import copy
+import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Sequence
 
 try:
     from game.balatro_models import (
@@ -26,8 +27,11 @@ try:
         Rank,
         Seal,
         SkipTag,
+        Spectral,
+        SpectralName,
         Stake,
         Suit,
+        Tarot,
         TarotName,
         Voucher,
         VoucherName,
@@ -57,8 +61,11 @@ except ImportError:
         Rank,
         Seal,
         SkipTag,
+        Spectral,
+        SpectralName,
         Stake,
         Suit,
+        Tarot,
         TarotName,
         Voucher,
         VoucherName,
@@ -91,6 +98,88 @@ def create_standard_deck() -> list[PlayingCard]:
             deck.append(PlayingCard(rank=r, suit=s, id=card_id))
             card_id += 1
     return deck
+
+
+# Base blind score thresholds for Antes 1..8 by Stake scaling tier (misc_functions.lua:919-954)
+ANTE_CHIPS_TABLE: dict[int, tuple[int, ...]] = {
+    1: (300, 800, 2000, 5000, 11000, 20000, 35000, 50000),      # White, Red Stakes
+    2: (300, 900, 2600, 8000, 20000, 36000, 60000, 100000),    # Green, Black, Blue Stakes
+    3: (300, 1000, 3200, 9000, 25000, 60000, 110000, 200000),  # Purple, Orange, Gold Stakes
+}
+
+STAKE_SCALING_TIER: dict[Stake, int] = {
+    Stake.WHITE: 1,
+    Stake.RED: 1,
+    Stake.GREEN: 2,
+    Stake.BLACK: 2,
+    Stake.BLUE: 2,
+    Stake.PURPLE: 3,
+    Stake.ORANGE: 3,
+    Stake.GOLD: 3,
+}
+
+STAKE_ORDER: tuple[Stake, ...] = (
+    Stake.WHITE,
+    Stake.RED,
+    Stake.GREEN,
+    Stake.BLACK,
+    Stake.BLUE,
+    Stake.PURPLE,
+    Stake.ORANGE,
+    Stake.GOLD,
+)
+
+BLIND_SCORE_MULTIPLIERS: dict[BlindName, float] = {
+    BlindName.SMALL: 1.0,
+    BlindName.BIG: 1.5,
+    BlindName.THE_WALL: 4.0,
+    BlindName.VIOLET_VESSEL: 6.0,
+    BlindName.THE_NEEDLE: 1.0,
+}
+
+
+def get_stake_level(stake: Stake) -> int:
+    """Returns 1..8 stake index matching Balatro's G.GAME.stake."""
+    try:
+        return STAKE_ORDER.index(stake) + 1
+    except ValueError:
+        return 1
+
+
+def get_blind_amount(ante: int, stake: Stake = Stake.WHITE) -> int:
+    """Returns base chip requirement for `ante` and `stake` (misc_functions.lua:919-954)."""
+    if ante < 1:
+        return 100
+    scaling = STAKE_SCALING_TIER.get(stake, 1)
+    amounts = ANTE_CHIPS_TABLE[scaling]
+    if ante <= 8:
+        return amounts[ante - 1]
+    k = 0.75
+    a = amounts[-1]
+    b = 1.6
+    c = ante - 8
+    d = 1.0 + 0.2 * c
+    amount = math.floor(a * (b + (k * c) ** d) ** c)
+    scale = 10 ** math.floor(math.log10(amount) - 1)
+    return int(amount - (amount % scale))
+
+
+def calculate_target_chips(
+    ante: int = 1,
+    round: int = 1,
+    stake: Stake = Stake.WHITE,
+    blind: BlindName | None = None,
+    deck: Deck = Deck.RED_DECK,
+) -> int:
+    """Computes blind target_chips from ante, round (or explicit blind), stake, and deck."""
+    base = get_blind_amount(ante, stake)
+    if blind is not None:
+        mult = BLIND_SCORE_MULTIPLIERS.get(blind, 2.0)
+    else:
+        round_slot = (max(1, round) - 1) % 3
+        mult = (1.0, 1.5, 2.0)[round_slot]
+    deck_scaling = 2 if deck == Deck.PLASMA_DECK else 1
+    return int(base * mult * deck_scaling)
 
 
 def _cards_match(a: PlayingCard, b: PlayingCard) -> bool:
@@ -198,19 +287,36 @@ class GameState:
     ante: int = 1
     round: int = 1
     current_blind: BlindName = BlindName.SMALL
-    target_chips: int = 300
+    target_chips: int | None = None
     current_chips: int = 0
 
     # Economy & Round Counters (formerly RunStats)
-    money: int = 4
-    hands_left: int = 4
-    discards_left: int = 3
+    money: int | None = None
+    hands_left: int | None = None
+    discards_left: int | None = None
     hands_played_this_round: int = 0
     discards_used_this_round: int = 0
-    reroll_cost: int = 5
+    reroll_cost: int | None = None
     free_rerolls: int = 0
     inflation: int = 0
     bankrupt_at: int = 0
+    base_hands: int = 4
+    base_discards: int = 3
+    base_reroll_cost: int = 5
+
+    # Shop Rates, Limits, and Stake Flags (G.GAME / G.GAME.modifiers)
+    shop_size: int = 2
+    tarot_rate: float = 4.0
+    planet_rate: float = 4.0
+    playing_card_rate: float = 0.0
+    spectral_rate: float = 0.0
+    edition_rate: float = 1.0
+    no_interest: bool = False
+    ante_scaling: float = 1.0
+    enable_eternals_in_shop: bool = False
+    enable_perishables_in_shop: bool = False
+    enable_rentals_in_shop: bool = False
+    coupon_shop_active: bool = False
 
     # Inventory & Hand
     inventory: Inventory = field(default_factory=Inventory)
@@ -225,12 +331,19 @@ class GameState:
     active_pack: BoosterPack | None = None
     pack_cards: list[Card] = field(default_factory=list)
     pack_choices_remaining: int = 0
+    pre_pack_location: Location | None = None
+    pending_packs: list[BoosterPack] = field(default_factory=list)
 
     # Skip Tags & Skip History
     small_blind_tag: SkipTag | None = None
     big_blind_tag: SkipTag | None = None
+    small_blind_orbital_hand: PokerHand | None = None
+    big_blind_orbital_hand: PokerHand | None = None
     active_tags: list[SkipTag] = field(default_factory=list)
     blinds_skipped: int = 0
+    temp_hand_size_bonus: int = 0
+    round_advanced: bool = False
+    pending_blind_advance: bool = False
 
     # Vouchers, Consumable Memory & Scaling Modifiers
     vouchers_redeemed: list[VoucherName] = field(default_factory=list)
@@ -260,9 +373,9 @@ class GameState:
     ox_target_hand: PokerHand | None = None
 
     # Deck & Pile Tracking
-    deck_cards_count: int = 52
-    starting_deck_size: int = 52
-    full_deck: list[PlayingCard] = field(default_factory=create_standard_deck)
+    deck_cards_count: int | None = None
+    starting_deck_size: int | None = None
+    full_deck: list[PlayingCard] | None = None
     discard_pile: list[PlayingCard] = field(default_factory=list)
     played_cards_this_round: list[PlayingCard] = field(default_factory=list)
     played_cards_this_ante: list[PlayingCard] = field(default_factory=list)
@@ -272,13 +385,251 @@ class GameState:
     rng: Any = None
     resolver: Any = None
     bosses_used: dict[str, int] = field(default_factory=dict)
+    apply_deck_stake_on_init: bool = field(default=True, repr=False, compare=False)
     _next_slot_uid: int = field(default=1, repr=False, compare=False)
+    _next_joker_id: int = field(default=1, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.seed and self.rng is None:
             self.set_seed(self.seed)
-        elif self.seed and self.boss_blind is None:
+
+        self._init_stake_and_deck_rules()
+        self.ensure_joker_ids()
+
+        if self.seed and self.boss_blind is None:
             self.roll_boss_blind(is_reroll=False)
+
+        if self.target_chips is None:
+            self.target_chips = self.compute_target_chips()
+
+    def _init_stake_and_deck_rules(self) -> None:
+        """Applies Stake (White..Gold) and Deck modifiers onto initial run state."""
+        stake_level = get_stake_level(self.stake)
+        if stake_level >= 4:
+            self.enable_eternals_in_shop = True
+        if stake_level >= 7:
+            self.enable_perishables_in_shop = True
+        if stake_level >= 8:
+            self.enable_rentals_in_shop = True
+
+        self.base_discards = 3 - (1 if stake_level >= 5 else 0)
+        self.base_hands = 4
+        bonus_dollars = 0
+
+        match self.deck:
+            case Deck.RED_DECK:
+                self.base_discards += 1
+            case Deck.BLUE_DECK:
+                self.base_hands += 1
+            case Deck.YELLOW_DECK:
+                bonus_dollars += 10
+            case Deck.GREEN_DECK:
+                self.no_interest = True
+            case Deck.BLACK_DECK:
+                self.base_hands = max(1, self.base_hands - 1)
+                if self.apply_deck_stake_on_init:
+                    self.inventory.joker_slots += 1
+            case Deck.MAGIC_DECK:
+                if self.apply_deck_stake_on_init:
+                    self.apply_voucher(
+                        VoucherName.CRYSTAL_BALL, adjust_round_counters=False
+                    )
+                    if not self.inventory.consumables:
+                        self.inventory.consumables.extend(
+                            [Tarot(name=TarotName.FOOL), Tarot(name=TarotName.FOOL)]
+                        )
+            case Deck.NEBULA_DECK:
+                if self.apply_deck_stake_on_init:
+                    self.apply_voucher(
+                        VoucherName.TELESCOPE, adjust_round_counters=False
+                    )
+                    self.inventory.consumable_slots = max(
+                        0, self.inventory.consumable_slots - 1
+                    )
+            case Deck.GHOST_DECK:
+                self.spectral_rate = 2.0
+                if self.apply_deck_stake_on_init and not self.inventory.consumables:
+                    self.inventory.consumables.append(
+                        Spectral(name=SpectralName.HEX)
+                    )
+            case Deck.ZODIAC_DECK:
+                if self.apply_deck_stake_on_init:
+                    self.apply_voucher(
+                        VoucherName.TAROT_MERCHANT, adjust_round_counters=False
+                    )
+                    self.apply_voucher(
+                        VoucherName.PLANET_MERCHANT, adjust_round_counters=False
+                    )
+                    self.apply_voucher(
+                        VoucherName.OVERSTOCK, adjust_round_counters=False
+                    )
+            case Deck.PAINTED_DECK:
+                if self.apply_deck_stake_on_init:
+                    self.hand.max_size += 2
+                    self.inventory.joker_slots = max(
+                        0, self.inventory.joker_slots - 1
+                    )
+            case Deck.PLASMA_DECK:
+                self.ante_scaling = 2.0
+            case _:
+                pass
+
+        if self.full_deck is None:
+            self.full_deck = self._build_initial_deck()
+        if self.deck_cards_count is None:
+            self.deck_cards_count = len(self.full_deck)
+        if self.starting_deck_size is None:
+            self.starting_deck_size = len(self.full_deck)
+
+        if self.apply_deck_stake_on_init:
+            if self.money is None:
+                self.money = 4 + bonus_dollars
+            if self.hands_left is None:
+                self.hands_left = self.base_hands
+            if self.discards_left is None:
+                self.discards_left = max(0, self.base_discards)
+            if self.reroll_cost is None:
+                self.reroll_cost = self.base_reroll_cost
+        else:
+            if self.money is None:
+                self.money = 4
+            if self.hands_left is None:
+                self.hands_left = 4
+            if self.discards_left is None:
+                self.discards_left = 3
+            if self.reroll_cost is None:
+                self.reroll_cost = self.base_reroll_cost
+
+    def _build_initial_deck(self) -> list[PlayingCard]:
+        """Builds the initial deck corresponding to self.deck."""
+        if self.deck == Deck.ABANDONED_DECK:
+            cards = [
+                c
+                for c in create_standard_deck()
+                if c.rank not in (Rank.JACK, Rank.QUEEN, Rank.KING)
+            ]
+            for idx, c in enumerate(cards, start=1):
+                c.id = idx
+            return cards
+        if self.deck == Deck.CHECKERED_DECK:
+            cards = create_standard_deck()
+            for c in cards:
+                if c.suit == Suit.CLUBS:
+                    c.suit = Suit.SPADES
+                elif c.suit == Suit.DIAMONDS:
+                    c.suit = Suit.HEARTS
+            return cards
+        if self.deck == Deck.ERRATIC_DECK:
+            try:
+                from game.engine.rng_sim.events import generate_erratic_deck
+            except ImportError:
+                from engine.rng_sim.events import generate_erratic_deck
+            return generate_erratic_deck(self.rng)
+        return create_standard_deck()
+
+    def compute_target_chips(self, blind: BlindName | None = None) -> int:
+        """Computes blind score requirement for the current/given blind."""
+        target_blind = blind if blind is not None else self.current_blind
+        return calculate_target_chips(
+            ante=self.ante,
+            round=self.round,
+            stake=self.stake,
+            blind=target_blind,
+            deck=self.deck,
+        )
+
+    def has_joker(self, joker_name: JokerName) -> bool:
+        """Returns True if an undebuffed Joker of the given name is in inventory."""
+        if not self.inventory:
+            return False
+        return any(
+            j.name == joker_name and not j.debuffed for j in self.inventory.jokers
+        )
+
+    def apply_voucher(
+        self, voucher_name: VoucherName, adjust_round_counters: bool = True
+    ) -> bool:
+        """Applies a Voucher effect onto GameState idempotently; returns False if already redeemed."""
+        if voucher_name in self.vouchers_redeemed:
+            return False
+        self.vouchers_redeemed.append(voucher_name)
+
+        match voucher_name:
+            case VoucherName.OVERSTOCK | VoucherName.OVERSTOCK_PLUS:
+                self.shop_size += 1
+            case VoucherName.TAROT_MERCHANT:
+                self.tarot_rate = 4.0 * 2.4
+            case VoucherName.TAROT_TYCOON:
+                self.tarot_rate = 4.0 * 8.0
+            case VoucherName.PLANET_MERCHANT:
+                self.planet_rate = 4.0 * 2.4
+            case VoucherName.PLANET_TYCOON:
+                self.planet_rate = 4.0 * 8.0
+            case VoucherName.HONE:
+                self.edition_rate = max(self.edition_rate, 2.0)
+            case VoucherName.GLOW_UP:
+                self.edition_rate = max(self.edition_rate, 4.0)
+            case VoucherName.MAGIC_TRICK | VoucherName.ILLUSION:
+                self.playing_card_rate = 4.0
+            case VoucherName.CRYSTAL_BALL:
+                self.inventory.consumable_slots += 1
+            case VoucherName.ANTIMATTER:
+                self.inventory.joker_slots += 1
+            case VoucherName.PAINT_BRUSH | VoucherName.PALETTE:
+                self.hand.max_size += 1
+            case VoucherName.REROLL_SURPLUS | VoucherName.REROLL_GLUT:
+                self.base_reroll_cost = max(0, self.base_reroll_cost - 2)
+                if adjust_round_counters:
+                    self.reroll_cost = max(0, self.reroll_cost - 2)
+            case VoucherName.GRABBER | VoucherName.NACHO_TONG:
+                if adjust_round_counters:
+                    self.hands_left += 1
+            case VoucherName.WASTEFUL | VoucherName.RECYCLOMANCY:
+                if adjust_round_counters:
+                    self.discards_left += 1
+            case VoucherName.HIEROGLYPH:
+                self.ante = max(1, self.ante - 1)
+                if adjust_round_counters:
+                    self.hands_left = max(1, self.hands_left - 1)
+            case VoucherName.PETROGLYPH:
+                self.ante = max(1, self.ante - 1)
+                if adjust_round_counters:
+                    self.discards_left = max(0, self.discards_left - 1)
+            case _:
+                # BLANK, CLEARANCE_SALE, LIQUIDATION, SEED_MONEY, MONEY_TREE,
+                # TELESCOPE, OBSERVATORY, OMEN_GLOBE, DIRECTORS_CUT, RETCON
+                pass
+        return True
+
+    def get_observatory_x_mult(self, poker_hand: PokerHand) -> float:
+        """Returns Observatory voucher X-mult (1.5^n for matching held Planet cards)."""
+        if VoucherName.OBSERVATORY not in self.vouchers_redeemed or not self.inventory:
+            return 1.0
+        target_planet = {
+            PokerHand.PAIR: PlanetName.MERCURY,
+            PokerHand.THREE_OF_A_KIND: PlanetName.VENUS,
+            PokerHand.TWO_PAIR: PlanetName.URANUS,
+            PokerHand.FULL_HOUSE: PlanetName.EARTH,
+            PokerHand.FLUSH: PlanetName.JUPITER,
+            PokerHand.STRAIGHT: PlanetName.SATURN,
+            PokerHand.FOUR_OF_A_KIND: PlanetName.MARS,
+            PokerHand.STRAIGHT_FLUSH: PlanetName.NEPTUNE,
+            PokerHand.FIVE_OF_A_KIND: PlanetName.PLANET_X,
+            PokerHand.FLUSH_HOUSE: PlanetName.CERES,
+            PokerHand.FLUSH_FIVE: PlanetName.ERIS,
+            PokerHand.HIGH_CARD: PlanetName.PLUTO,
+        }.get(poker_hand)
+        if target_planet is None:
+            return 1.0
+        matches = sum(1 for c in self.inventory.consumables if c.name == target_planet)
+        return float(1.5**matches)
+
+    def balance_plasma_score(self, chips: float, mult: float) -> tuple[float, float]:
+        """Balances Chips and Mult on Plasma Deck (back.lua:125-128)."""
+        if self.deck != Deck.PLASMA_DECK:
+            return chips, mult
+        balanced = math.floor((chips + mult) / 2.0)
+        return balanced, balanced
 
     def roll_boss_blind(self, is_reroll: bool = False) -> BlindName | None:
         """Deterministically evaluates or updates the Boss Blind using Balatro PRNG based on seed."""
@@ -408,6 +759,109 @@ class GameState:
         uid = self._next_slot_uid
         self._next_slot_uid += 1
         return uid
+
+    def assign_joker_id(self, joker: Joker, *, force_new: bool = False) -> int:
+        """Assigns a unique persistent non-zero ID to `joker` (skipping existing IDs)."""
+        existing = self.inventory.jokers if self.inventory else []
+        used_ids = {j.id for j in existing if j is not joker and j.id != 0}
+        if not force_new and joker.id != 0 and joker.id not in used_ids:
+            self._next_joker_id = max(self._next_joker_id, joker.id + 1)
+            return joker.id
+
+        uid = max(self._next_joker_id, max(used_ids, default=0) + 1)
+        while uid in used_ids:
+            uid += 1
+        joker.id = uid
+        self._next_joker_id = uid + 1
+        return uid
+
+    def ensure_joker_ids(self) -> None:
+        """Ensures every Joker in inventory has a distinct non-zero persistent ID."""
+        if not self.inventory or not self.inventory.jokers:
+            return
+        seen: set[int] = set()
+        for j in self.inventory.jokers:
+            if j.id != 0 and j.id not in seen:
+                seen.add(j.id)
+                self._next_joker_id = max(self._next_joker_id, j.id + 1)
+            else:
+                self.assign_joker_id(j, force_new=True)
+                seen.add(j.id)
+
+    def _match_observed_jokers(self, observed_jokers: Sequence[Joker]) -> list[Joker | None]:
+        """Matches visually observed CV Jokers against tracked inventory Jokers.
+
+        Prioritizes exact attribute matches before edition/name fallbacks, and resolves
+        visually indistinguishable copies (e.g. duplicate Blueprints or Showman copies)
+        arbitrarily in pool order so persistent IDs remain valid across drag reordering.
+        """
+        self.ensure_joker_ids()
+        existing = list(self.inventory.jokers) if self.inventory else []
+        available = list(range(len(existing)))
+        matched: list[Joker | None] = [None] * len(observed_jokers)
+
+        predicates: tuple[Callable[[Joker, Joker], bool], ...] = (
+            lambda e, o: (
+                e.name == o.name
+                and e.edition == o.edition
+                and e.eternal == o.eternal
+                and e.perishable == o.perishable
+                and e.rental == o.rental
+                and e.debuffed == o.debuffed
+                and e.facing_back == o.facing_back
+            ),
+            lambda e, o: e.name == o.name and e.edition == o.edition,
+            lambda e, o: e.name == o.name,
+        )
+
+        for pred in predicates:
+            for obs_idx, obs in enumerate(observed_jokers):
+                if matched[obs_idx] is not None:
+                    continue
+                for pos, ex_idx in enumerate(available):
+                    if pred(existing[ex_idx], obs):
+                        matched[obs_idx] = existing[ex_idx]
+                        available.pop(pos)
+                        break
+
+        return matched
+
+    def match_cv_joker_order(self, observed_jokers: Sequence[Joker]) -> list[int]:
+        """Returns persistent Joker IDs matching observed left-to-right CV order."""
+        if not self.inventory or len(observed_jokers) != len(self.inventory.jokers):
+            return []
+        matched = self._match_observed_jokers(observed_jokers)
+        if any(m is None for m in matched):
+            return []
+        return [m.id for m in matched if m is not None]
+
+    def reconcile_cv_jokers(
+        self,
+        observed_jokers: Sequence[Joker],
+        *,
+        trigger_added_hooks: bool = False,
+    ) -> list[int]:
+        """Reconciles `inventory.jokers` with CV observations, preserving IDs & scaled stats."""
+        if not self.inventory:
+            return []
+        matched = self._match_observed_jokers(observed_jokers)
+        try:
+            from game.engine.jokers import on_joker_added, sync_dynamic_joker_states
+        except ImportError:
+            from engine.jokers import on_joker_added, sync_dynamic_joker_states
+
+        reconciled: list[Joker] = [
+            match_j if match_j is not None else copy.deepcopy(obs)
+            for obs, match_j in zip(observed_jokers, matched)
+        ]
+        self.inventory.jokers = reconciled
+        for j, match_j in zip(reconciled, matched):
+            if match_j is None:
+                self.assign_joker_id(j)
+                if trigger_added_hooks:
+                    on_joker_added(self, j)
+        sync_dynamic_joker_states(self)
+        return [j.id for j in self.inventory.jokers]
 
     def ensure_slot_uids(self) -> None:
         """Assigns persistent slot UIDs and initializes CardBounds for any unassigned hand cards."""
@@ -737,6 +1191,28 @@ _TRACKED_STATE_FIELDS: tuple[str, ...] = (
     "discard_pile",
     "played_cards_this_round",
     "played_cards_this_ante",
+    "base_hands",
+    "base_discards",
+    "base_reroll_cost",
+    "shop_size",
+    "tarot_rate",
+    "planet_rate",
+    "playing_card_rate",
+    "spectral_rate",
+    "edition_rate",
+    "no_interest",
+    "ante_scaling",
+    "enable_eternals_in_shop",
+    "enable_perishables_in_shop",
+    "enable_rentals_in_shop",
+    "coupon_shop_active",
+    "pre_pack_location",
+    "pending_packs",
+    "small_blind_orbital_hand",
+    "big_blind_orbital_hand",
+    "temp_hand_size_bonus",
+    "round_advanced",
+    "pending_blind_advance",
     "seed",
 )
 

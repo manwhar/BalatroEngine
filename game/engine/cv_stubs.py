@@ -16,7 +16,7 @@ Deterministic non-visible state, RNG rolls, and Boss Blinds are resolved via PRN
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Sequence
 
 try:
     from game.balatro_models import (
@@ -155,25 +155,55 @@ for j in JokerName:
     _JOKER_LOOKUP[_clean_str(j.name)] = j
 
 _JOKER_ALIASES: dict[str, JokerName] = {
-    "caino": JokerName.CANIO,
-    "gluttenousjoker": JokerName.GLUTTONOUS_JOKER,
-    "driverslicense": JokerName.DRIVER,
-    "ringmaster": JokerName.SHOWMAN,
-    "selzer": JokerName.SELTZER,
-    "delayedgrat": JokerName.DELAYED_GRATIFICATION,
-    "trading": JokerName.TRADING_CARD,
-    "trousers": JokerName.SPARE_TROUSERS,
-    "ticket": JokerName.GOLDEN_TICKET,
-    "mail": JokerName.MAIL_IN_REBATE,
-    "oops": JokerName.OOPS_ALL_6S,
-    "smiley": JokerName.SMILEY_FACE,
-    "flash": JokerName.FLASH_CARD,
+    "abstract": JokerName.ABSTRACT_JOKER,
+    "ancient": JokerName.ANCIENT_JOKER,
     "baseball": JokerName.BASEBALL_CARD,
+    "burnt": JokerName.BURNT_JOKER,
     "business": JokerName.BUSINESS_CARD,
+    "caino": JokerName.CANIO,
     "ceremonial": JokerName.CEREMONIAL_DAGGER,
     "chaos": JokerName.CHAOS_THE_CLOWN,
+    "clever": JokerName.CLEVER_JOKER,
+    "crafty": JokerName.CRAFTY_JOKER,
+    "crazy": JokerName.CRAZY_JOKER,
+    "delayedgrat": JokerName.DELAYED_GRATIFICATION,
+    "devious": JokerName.DEVIOUS_JOKER,
+    "driverslicense": JokerName.DRIVER,
+    "droll": JokerName.DROLL_JOKER,
+    "duo": JokerName.THE_DUO,
+    "faceless": JokerName.FACELESS_JOKER,
+    "family": JokerName.THE_FAMILY,
+    "flash": JokerName.FLASH_CARD,
     "gift": JokerName.GIFT_CARD,
+    "glass": JokerName.GLASS_JOKER,
+    "gluttenousjoker": JokerName.GLUTTONOUS_JOKER,
+    "golden": JokerName.GOLDEN_JOKER,
+    "half": JokerName.HALF_JOKER,
+    "idol": JokerName.THE_IDOL,
+    "invisible": JokerName.INVISIBLE_JOKER,
+    "jolly": JokerName.JOLLY_JOKER,
+    "mad": JokerName.MAD_JOKER,
+    "mail": JokerName.MAIL_IN_REBATE,
+    "marble": JokerName.MARBLE_JOKER,
+    "oops": JokerName.OOPS_ALL_6S,
+    "order": JokerName.THE_ORDER,
+    "ringmaster": JokerName.SHOWMAN,
+    "selzer": JokerName.SELTZER,
+    "sly": JokerName.SLY_JOKER,
+    "smeared": JokerName.SMEARED_JOKER,
+    "smiley": JokerName.SMILEY_FACE,
+    "space": JokerName.SPACE_JOKER,
+    "square": JokerName.SQUARE_JOKER,
     "stencil": JokerName.JOKER_STENCIL,
+    "stone": JokerName.STONE_JOKER,
+    "ticket": JokerName.GOLDEN_TICKET,
+    "trading": JokerName.TRADING_CARD,
+    "tribe": JokerName.THE_TRIBE,
+    "trio": JokerName.THE_TRIO,
+    "trousers": JokerName.SPARE_TROUSERS,
+    "wee": JokerName.WEE_JOKER,
+    "wily": JokerName.WILY_JOKER,
+    "zany": JokerName.ZANY_JOKER,
 }
 _JOKER_LOOKUP.update(_JOKER_ALIASES)
 
@@ -272,7 +302,8 @@ def validate_hand_cards_location(state: Any) -> None:
     round_won = getattr(state, "round_won", False)
     active_pack = getattr(state, "active_pack", None)
 
-    # 1. Cash out screen
+    # 1. Cash out screen (post_processing uses Location.CASH_OUT internally;
+    #    GameState keeps Location.BLIND with round_won=True)
     if round_won:
         raise InvalidLocationError(
             f"Cannot detect hand cards: round is won / currently in cash out screen (location='{loc}')."
@@ -327,7 +358,8 @@ def validate_shop_cards_location(state: Any) -> None:
     round_won = getattr(state, "round_won", False)
     active_pack = getattr(state, "active_pack", None)
 
-    # 1. Cash out screen
+    # 1. Cash out screen (post_processing uses Location.CASH_OUT internally;
+    #    GameState keeps Location.BLIND with round_won=True)
     if round_won:
         raise InvalidLocationError(
             f"Cannot detect shop cards: currently in the cash out screen (location='{loc}')."
@@ -657,6 +689,31 @@ def cv_detect_shop_cards(
         consumables=consumables,
         pack_cards=pack_items,
         raw_output=rec_output,
+    )
+
+
+def match_cv_joker_order(state: Any, observed_jokers: Sequence[Joker]) -> list[int]:
+    """Matches CV-observed Jokers (id=0) to tracked `state.inventory.jokers` persistent IDs.
+
+    Visually identical copies (e.g. duplicate Blueprints or same-edition Showman duplicates)
+    are matched arbitrarily in order so `Action(joker_order=...)` works without Lua IDs.
+    """
+    if state is None or not hasattr(state, "match_cv_joker_order"):
+        return []
+    return state.match_cv_joker_order(observed_jokers)
+
+
+def reconcile_cv_jokers(
+    state: Any,
+    observed_jokers: Sequence[Joker],
+    *,
+    trigger_added_hooks: bool = False,
+) -> list[int]:
+    """Reconciles `state.inventory.jokers` against CV observations while preserving persistent IDs."""
+    if state is None or not hasattr(state, "reconcile_cv_jokers"):
+        return []
+    return state.reconcile_cv_jokers(
+        observed_jokers, trigger_added_hooks=trigger_added_hooks
     )
 
 

@@ -42,6 +42,7 @@ class TriggerContext:
     target_card: "Any | None" = None
     extra: dict[str, Any] | None = None
     is_blueprint: bool = False
+    hook: bool = False
     scoring_cards: list[Any] = field(default_factory=list)
     full_hand: list[Any] = field(default_factory=list)
     poker_hand: Any = None

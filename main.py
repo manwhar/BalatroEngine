@@ -57,7 +57,7 @@ if __name__ == "__main__":
     )
     template_key = {template.name: i for i, template in enumerate(templates)}
 
-    def process_frame(video_frame) -> tuple[int, list, dict[str, float], int | None]:
+    def process_frame(video_frame) -> tuple[int, list, dict[str, float], dict | None]:
         frame_idx = video_frame.index
         ts_str = format_timestamp(video_frame.timestamp_seconds, frame_idx)
 
@@ -80,7 +80,10 @@ if __name__ == "__main__":
             if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
                 matches.append((template, result.plot_kwargs))
             if result.found and result.clicked:
-                template_clicked = template_key[result.template_name]
+                template_clicked = {
+                    "action": template_key[result.template_name],
+                    "box": list(result.box) if result.box is not None else None,
+                }
                 break  # only one template can be clicked in a given frame
         t2 = time.perf_counter()
 

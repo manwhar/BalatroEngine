@@ -28,7 +28,7 @@ PROD_WEIGHTS_DIR = PROJECT_ROOT / "classifiers" / "prod_weights"
 
 # Explicit relative imports from pipelines
 # pyrefly: ignore [missing-import]
-from classifiers.card_classifier.pipeline import CardRecognitionPipeline, CardResult
+from classifiers.card_classifier.pipeline import CardRecognitionPipeline, CardResult, decode_card_prediction, determine_card_selection
 # pyrefly: ignore [missing-import]
 from classifiers.shop_classifier.pipeline import ShopRecognitionPipeline, ShopItemResult
 # pyrefly: ignore [missing-import]
@@ -37,15 +37,15 @@ from classifiers.common.video_utils import scale_roi_pixels
 BASE_WIDTH = 1920.0
 BASE_HEIGHT = 1080.0
 
-# 1920x1080 Balatro UI ROI coordinates
+# 1920x1080 Balatro UI ROI coordinates (calibrated in balatro_mod/dataset/boxes.lua)
 ROIS = {
     "card_hand": {"x": 508.319934, "y": 567.839093, "w": 1071.056521, "h": 322.734447},
-    "joker_bar": {"x": 320.0, "y": 10.0, "w": 1280.0, "h": 260.0},
-    "consumeables": {"x": 1250.0, "y": 10.0, "w": 420.0, "h": 260.0},
-    "shop": {"x": 360.0, "y": 140.0, "w": 1200.0, "h": 380.0},
-    "voucher": {"x": 880.0, "y": 355.0, "w": 340.0, "h": 300.0},
-    "booster": {"x": 1540.0, "y": 355.0, "w": 360.0, "h": 300.0},
-    "pack": {"x": 300.0, "y": 260.0, "w": 1320.0, "h": 500.0},
+    "joker_bar": {"x": 512.701385, "y": 20.409878, "w": 868.473724, "h": 259.967609},
+    "consumeables": {"x": 1369.783812, "y": 30.836806, "w": 425.206356, "h": 270.406328},
+    "shop": {"x": 818.386186, "y": 369.181989, "w": 720.772049, "h": 280.979925},
+    "voucher": {"x": 656.059547, "y": 714.459732, "w": 360.743773, "h": 284.420985},
+    "booster": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
+    "pack": {"x": 565.612571, "y": 588.005101, "w": 960.654887, "h": 307.239491},
 }
 
 
@@ -155,6 +155,18 @@ def _crop_roi_to_pil(full_bgr: np.ndarray, roi_key: str) -> tuple[Image.Image, t
     return Image.fromarray(crop_rgb), (rx, ry, rw, rh)
 
 
+def _offset_box(box: list[int], rx: int, ry: int) -> list[int]:
+    """Translates an ROI-local [x1, y1, x2, y2] box into full-frame pixel coordinates."""
+    return [box[0] + rx, box[1] + ry, box[2] + rx, box[3] + ry]
+
+
+def _translate_item_boxes(items: Sequence[Any], rx: int, ry: int) -> Any:
+    """Translates item.box in-place from ROI-local pixels into full-frame pixels."""
+    for item in items:
+        item.box = _offset_box(item.box, rx, ry)
+    return items
+
+
 # =====================================================================
 # Single Frame Recognition Functions
 # =====================================================================
@@ -164,12 +176,13 @@ def recognize_hand_cards(
     conf_threshold: float = 0.50,
     device: str | None = None
 ) -> HandRecognitionOutput:
-    """Evaluates the player hand on a single video frame."""
+    """Evaluates the player hand on a single video frame (boxes returned in full-frame pixels)."""
     img_bgr, f_idx, ts = _extract_frame_image_and_meta(video_frame)
     pipeline = get_card_pipeline(device=device)
 
     crop_pil, roi_coords = _crop_roi_to_pil(img_bgr, "card_hand")
     cards = pipeline.predict(crop_pil, conf=conf_threshold)
+    _translate_item_boxes(cards, roi_coords[0], roi_coords[1])
 
     return HandRecognitionOutput(
         frame_index=f_idx,
@@ -185,7 +198,7 @@ def recognize_shop(
     conf_threshold: float = 0.35,
     device: str | None = None
 ) -> ShopRecognitionOutput:
-    """Evaluates all relevant shelves on a single shop or booster pack video frame."""
+    """Evaluates all relevant shelves on a shop or pack frame (boxes returned in full-frame pixels)."""
     img_bgr, f_idx, ts = _extract_frame_image_and_meta(video_frame)
     pipeline = get_shop_pipeline(device=device)
 
@@ -195,24 +208,36 @@ def recognize_shop(
         mode=mode
     )
 
-    joker_pil, _ = _crop_roi_to_pil(img_bgr, "joker_bar")
-    output.joker_bar = pipeline.predict(joker_pil, conf_threshold=conf_threshold)
+    joker_pil, joker_roi = _crop_roi_to_pil(img_bgr, "joker_bar")
+    output.joker_bar = _translate_item_boxes(
+        pipeline.predict(joker_pil, conf_threshold=conf_threshold), joker_roi[0], joker_roi[1]
+    )
 
-    cons_pil, _ = _crop_roi_to_pil(img_bgr, "consumeables")
-    output.consumeables = pipeline.predict(cons_pil, conf_threshold=conf_threshold)
+    cons_pil, cons_roi = _crop_roi_to_pil(img_bgr, "consumeables")
+    output.consumeables = _translate_item_boxes(
+        pipeline.predict(cons_pil, conf_threshold=conf_threshold), cons_roi[0], cons_roi[1]
+    )
 
     if mode == "pack":
-        pack_pil, _ = _crop_roi_to_pil(img_bgr, "pack")
-        output.pack_items = pipeline.predict(pack_pil, conf_threshold=conf_threshold)
+        pack_pil, pack_roi = _crop_roi_to_pil(img_bgr, "pack")
+        output.pack_items = _translate_item_boxes(
+            pipeline.predict(pack_pil, conf_threshold=conf_threshold), pack_roi[0], pack_roi[1]
+        )
     else:
-        shop_pil, _ = _crop_roi_to_pil(img_bgr, "shop")
-        output.shop_items = pipeline.predict(shop_pil, conf_threshold=conf_threshold)
+        shop_pil, shop_roi = _crop_roi_to_pil(img_bgr, "shop")
+        output.shop_items = _translate_item_boxes(
+            pipeline.predict(shop_pil, conf_threshold=conf_threshold), shop_roi[0], shop_roi[1]
+        )
 
-        voucher_pil, _ = _crop_roi_to_pil(img_bgr, "voucher")
-        output.vouchers = pipeline.predict(voucher_pil, conf_threshold=conf_threshold)
+        voucher_pil, voucher_roi = _crop_roi_to_pil(img_bgr, "voucher")
+        output.vouchers = _translate_item_boxes(
+            pipeline.predict(voucher_pil, conf_threshold=conf_threshold), voucher_roi[0], voucher_roi[1]
+        )
 
-        booster_pil, _ = _crop_roi_to_pil(img_bgr, "booster")
-        output.boosters = pipeline.predict(booster_pil, conf_threshold=conf_threshold)
+        booster_pil, booster_roi = _crop_roi_to_pil(img_bgr, "booster")
+        output.boosters = _translate_item_boxes(
+            pipeline.predict(booster_pil, conf_threshold=conf_threshold), booster_roi[0], booster_roi[1]
+        )
 
     return output
 
@@ -287,7 +312,7 @@ def batch_recognize_hands(
                 crop_metadata.append((f_i, [x1, y1, x2, y2], ih))
 
         # Stage 2 Batched CNN forward pass across all cards in this chunk
-        all_card_preds = []
+        all_card_preds = {}
         if all_crops_tensors:
             batched_cards = torch.stack(all_crops_tensors).to(pipeline.device)
             with torch.no_grad():
@@ -295,42 +320,28 @@ def batch_recognize_hands(
 
         # Assemble per-frame outputs
         frame_cards_map: dict[int, list[CardResult]] = {i: [] for i in range(len(chunk))}
-        for (f_i, box, ih), attrs in zip(crop_metadata, all_card_preds):
-            card_res = CardResult(
-                index=len(frame_cards_map[f_i]),
-                rank=attrs["rank"],
-                suit=attrs["suit"],
-                edition=attrs["edition"],
-                enhancement=attrs["enhancement"],
-                seal=attrs["seal"],
-                selected=False,  # Updated below
-                debuffed=attrs["debuffed"],
-                face_down=attrs["face_down"],
+        for pred_idx, (f_i, box, _) in enumerate(crop_metadata):
+            card_res = decode_card_prediction(
+                all_card_preds,
+                pred_idx,
+                index=len(frame_cards_map[f_i]) + 1,
                 box=box,
-                confidences={
-                    "rank": attrs["rank_conf"],
-                    "suit": attrs["suit_conf"],
-                    "edition": attrs["edition_conf"],
-                    "enhancement": attrs["enhancement_conf"],
-                    "seal": attrs["seal_conf"],
-                    "debuffed": attrs["debuffed_conf"],
-                    "face_down": attrs["face_down_conf"],
-                }
+                selected=False,  # Updated below
             )
             frame_cards_map[f_i].append(card_res)
 
-        # Calculate card raise/selection per frame
+        # Calculate card raise/selection per frame before translating boxes to full-frame space
         for f_i, cards_list in frame_cards_map.items():
+            f_idx, ts, roi_coords = metas[f_i]
             if cards_list:
-                _, _, roi_coords = metas[f_i]
-                ih = roi_coords[3]
+                rx, ry, _, rh = roi_coords
+                crop_ih = max(1, rh)  # roi_coords is (rx, ry, rw, rh)
                 boxes_only = [c.box for c in cards_list]
-                from classifiers.card_classifier.pipeline import determine_card_selection
-                selected_flags = determine_card_selection(boxes_only, ih)
+                selected_flags = determine_card_selection(boxes_only, crop_ih)
                 for c_obj, is_sel in zip(cards_list, selected_flags):
                     c_obj.selected = is_sel
+                _translate_item_boxes(cards_list, rx, ry)
 
-            f_idx, ts, roi_coords = metas[f_i]
             outputs.append(HandRecognitionOutput(
                 frame_index=f_idx,
                 timestamp_seconds=ts,
@@ -349,7 +360,7 @@ def batch_recognize_shops(
     device: str | None = None
 ) -> list[ShopRecognitionOutput]:
     """
-    Group-batches shop detection across collected frames.
+    Group-batches shop detection across collected frames (boxes returned in full-frame pixels).
     Groups crops by shelf region (joker_bar, shop, voucher, booster, etc.) so that
     each batch consists of uniformly-sized images sent to the GPU together.
     """
@@ -372,7 +383,12 @@ def batch_recognize_shops(
 
     for shelf_key in shelves:
         # 1. Extract uniformly shaped crops for this specific shelf across all frames
-        shelf_crops = [_crop_roi_to_pil(img_bgr, shelf_key)[0] for img_bgr, _, _ in unwrapped]
+        shelf_crops = []
+        shelf_rois = []
+        for img_bgr, _, _ in unwrapped:
+            crop_pil, roi_coords = _crop_roi_to_pil(img_bgr, shelf_key)
+            shelf_crops.append(crop_pil)
+            shelf_rois.append(roi_coords)
 
         # 2. Batch process in chunks of `batch_size`
         for chunk_start in range(0, len(shelf_crops), batch_size):
@@ -445,6 +461,7 @@ def batch_recognize_shops(
 
             # Distribute regular shop items back into their respective frame output
             for (g_idx, box, card_type, det_conf), attrs in zip(shop_metadata, attr_preds):
+                rx, ry = shelf_rois[g_idx][:2]
                 item_res = ShopItemResult(
                     index=0,  # Ordered below
                     card_type=card_type,
@@ -454,7 +471,7 @@ def batch_recognize_shops(
                     perishable=attrs["perishable"],
                     rental=attrs["rental"],
                     debuffed=attrs["debuffed"],
-                    box=box,
+                    box=_offset_box(box, rx, ry),
                     confidences={
                         "detection": det_conf,
                         "key": attrs["key_conf"],
@@ -483,6 +500,7 @@ def batch_recognize_shops(
 
             # Distribute playing cards back into their respective frame output
             for (g_idx, box, card_type, det_conf), c_res in zip(card_metadata, card_preds):
+                rx, ry = shelf_rois[g_idx][:2]
                 card_key = f"{c_res.rank} of {c_res.suit}" if c_res.rank != "Stone" else "Stone Card"
                 item_res = ShopItemResult(
                     index=0,
@@ -493,7 +511,7 @@ def batch_recognize_shops(
                     perishable=False,
                     rental=False,
                     debuffed=c_res.debuffed,
-                    box=box,
+                    box=_offset_box(box, rx, ry),
                     confidences={
                         "detection": det_conf,
                         **c_res.confidences

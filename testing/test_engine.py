@@ -463,9 +463,22 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
     entries = [json.loads(line) for line in lines]
     first_state = entries[0].get("state", {})
 
+    stake_val = first_state.get("stake", 1)
+    stake_enum = (
+        gs.STAKE_ORDER[stake_val - 1]
+        if isinstance(stake_val, int) and 1 <= stake_val <= len(gs.STAKE_ORDER)
+        else bm.Stake.WHITE
+    )
+    try:
+        deck_enum = bm.Deck(first_state.get("deck_name", bm.Deck.RED_DECK.value))
+    except ValueError:
+        deck_enum = bm.Deck.RED_DECK
+
     sim_state = gs.GameState(
         step_idx=0,
         seed=first_state.get("seed", ""),
+        deck=deck_enum,
+        stake=stake_enum,
         ante=first_state.get("ante", 1),
         round=first_state.get("round", 1),
         money=first_state.get("money", 4),
@@ -474,6 +487,7 @@ def test_trajectory_parity(telemetry_path: Path, verbose: bool = False) -> int:
         discards_left=first_state.get("discards_left", 3),
         hands_played_this_round=first_state.get("hands_played_this_round", 0),
         discards_used_this_round=first_state.get("discards_used_this_round", 0),
+        apply_deck_stake_on_init=False,
     )
     if "deck" in first_state and first_state["deck"]:
         sim_state.full_deck = [parse_playing_card(c) for c in first_state["deck"]]
@@ -1788,6 +1802,92 @@ class TestTelemetryParityAndLoggingAudit(unittest.TestCase):
         state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.CASH_OUT))
         self.assertEqual(state.location, bm.Location.SHOP)
 
+    def test_persistent_joker_ids_and_cv_duplicate_matching(self):
+        """Tests auto-assigned non-zero Joker IDs, distinguishable matching, and arbitrary identical-copy resolution."""
+        import game.engine.cv_stubs as cv_stubs
+
+        # 1. Shop purchases and spawned Jokers receive distinct non-zero IDs automatically
+        state = gs.GameState(seed="JID1", location=bm.Location.SHOP, money=30)
+        state.shop_cards = [
+            bm.Joker(name=bm.JokerName.BLUEPRINT, edition=bm.Edition.FOIL),
+            bm.Joker(name=bm.JokerName.BLUEPRINT, edition=bm.Edition.NONE),
+            bm.Joker(name=bm.JokerName.BRAINSTORM, edition=bm.Edition.NONE),
+        ]
+        for _ in range(3):
+            state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.BUY_CARD, target_idx=0))
+
+        ids = [j.id for j in state.inventory.jokers]
+        self.assertEqual(ids, [1, 2, 3])
+        self.assertEqual(len(set(ids)), 3)
+
+        # 2. Distinguishable copies (Foil vs Base Blueprint) match their true persistent IDs when swapped
+        cv_swapped = [
+            bm.Joker(name=bm.JokerName.BRAINSTORM),
+            bm.Joker(name=bm.JokerName.BLUEPRINT, edition=bm.Edition.NONE),
+            bm.Joker(name=bm.JokerName.BLUEPRINT, edition=bm.Edition.FOIL),
+        ]
+        matched_order = cv_stubs.match_cv_joker_order(state, cv_swapped)
+        self.assertEqual(matched_order, [3, 2, 1])
+
+        state, _ = gs.step_simulation(
+            state,
+            bm.Action(type=bm.ActionType.REROLL_SHOP, joker_order=matched_order),
+        )
+        self.assertEqual([j.name for j in state.inventory.jokers], [
+            bm.JokerName.BRAINSTORM,
+            bm.JokerName.BLUEPRINT,
+            bm.JokerName.BLUEPRINT,
+        ])
+        self.assertEqual([j.edition for j in state.inventory.jokers], [
+            bm.Edition.NONE,
+            bm.Edition.NONE,
+            bm.Edition.FOIL,
+        ])
+        self.assertEqual([j.id for j in state.inventory.jokers], [3, 2, 1])
+
+        # 3. Visually identical copies (e.g. two Base Blueprints or Showman duplicates) resolve arbitrarily cleanly
+        dup_state = gs.GameState(
+            location=bm.Location.BLIND,
+            inventory=bm.Inventory(
+                jokers=[
+                    bm.Joker(name=bm.JokerName.BLUEPRINT),
+                    bm.Joker(name=bm.JokerName.BLUEPRINT),
+                    bm.Joker(name=bm.JokerName.JOKER),
+                ]
+            ),
+        )
+        dup_ids = [j.id for j in dup_state.inventory.jokers]
+        self.assertEqual(dup_ids, [1, 2, 3])
+        cv_dup_reordered = [
+            bm.Joker(name=bm.JokerName.BLUEPRINT),
+            bm.Joker(name=bm.JokerName.JOKER),
+            bm.Joker(name=bm.JokerName.BLUEPRINT),
+        ]
+        dup_order = cv_stubs.match_cv_joker_order(dup_state, cv_dup_reordered)
+        self.assertEqual(set(dup_order), {1, 2, 3})
+        dup_state, _ = gs.step_simulation(
+            dup_state,
+            bm.Action(type=bm.ActionType.PLAY_HAND, joker_order=dup_order),
+        )
+        self.assertEqual(
+            [j.name for j in dup_state.inventory.jokers],
+            [bm.JokerName.BLUEPRINT, bm.JokerName.JOKER, bm.JokerName.BLUEPRINT],
+        )
+
+        # 4. reconcile_cv_jokers preserves IDs on matched Jokers and assigns a fresh ID to a newly observed one
+        new_obs = [
+            bm.Joker(name=bm.JokerName.JOKER),
+            bm.Joker(name=bm.JokerName.BLUEPRINT),
+            bm.Joker(name=bm.JokerName.BLUEPRINT),
+            bm.Joker(name=bm.JokerName.MIME),
+        ]
+        new_ids = cv_stubs.reconcile_cv_jokers(dup_state, new_obs, trigger_added_hooks=False)
+        self.assertEqual(len(new_ids), 4)
+        self.assertEqual(len(set(new_ids)), 4)
+        self.assertTrue(all(jid > 0 for jid in new_ids))
+        self.assertEqual(dup_state.inventory.jokers[-1].name, bm.JokerName.MIME)
+        self.assertGreater(dup_state.inventory.jokers[-1].id, 3)
+
     def test_sync_observations_and_setup_test_suite(self):
         """Validates that sync_cv_observations_before_action updates state variables and refreshes deck on Setup Test Suite."""
         state = gs.GameState()
@@ -1829,6 +1929,578 @@ class TestTelemetryParityAndLoggingAudit(unittest.TestCase):
                     0,
                     f"Archived telemetry run {f.name} failed parity check with {errors} discrepancies!",
                 )
+
+
+class TestNewEngineFeatures(unittest.TestCase):
+    """Tests newly integrated template, post-processing, inference, Blind/Ante, Deck/Stake, SkipTag, Consumable, Voucher, and Pricing rules."""
+
+    def test_skip_pack_template_registered(self):
+        templates_path = REPO_ROOT / "assets" / "templates" / "drspectred" / "templates.json"
+        with templates_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("Skip Pack", data)
+        self.assertEqual(data["Skip Pack"]["filenames"], ["skip.png"])
+        skip_png = REPO_ROOT / "assets" / "templates" / "drspectred" / "skip.png"
+        self.assertTrue(skip_png.exists())
+
+    def test_post_processing_remap_filter_and_pack_exit(self):
+        import post_processing
+
+        # Non-gameplay UI clicks are filtered out; "Select Card" maps to USE_IN_PACK;
+        # Pack opened via SKIP_BLIND restores Location.SELECT once exited.
+        d = {
+            "key": {
+                "Play Game": 0,
+                "Open Options Menu": 1,
+                "Open Run Info Menu": 2,
+                "Skip Blind": 3,
+                "Select Card": 4,
+                "Use Consumable": 5,
+                "Select Blind": 6,
+                "Open Pack": 7,
+                "Buy Card": 8,
+            },
+            "frames": {
+                "5": 0,    # Play Game -> filtered
+                "10": 1,   # Open Options -> filtered
+                "15": 2,   # Run Info -> filtered
+                "100": 3,  # Skip Blind -> transitions to PACK since next decisive is USE_IN_PACK
+                "150": 4,  # Select Card -> remapped to USE_IN_PACK; exits pack to SELECT
+                "200": 5,  # Use Consumable -> ambient location should be SELECT (not PACK)
+                "250": 6,  # Select Blind -> SELECT
+                "300": 7,  # Open Pack (Shop) -> PACK
+                "350": 4,  # Select Card -> exits pack to SHOP
+                "400": 8,  # Buy Card -> SHOP
+            },
+        }
+        queues = post_processing.process_actions(d)
+
+        # Filtered frames never queue any CV work
+        for filtered_base in (5, 10, 15):
+            for offset in (0, -2):
+                f_id = max(0, filtered_base + offset)
+                for q in queues.values():
+                    self.assertNotIn(f_id, q)
+
+        # "Select Card" (150 - 2 = 148) runs pack + playing card CV
+        self.assertEqual(queues["pack_cv_queue"][148], bm.ActionType.USE_IN_PACK)
+        self.assertEqual(queues["playing_card_cv_queue"][148], bm.ActionType.USE_IN_PACK)
+
+        # "Use Consumable" (200 - 2 = 198) happens in SELECT after Skip-Tag pack exited (not PACK)
+        self.assertNotIn(198, queues["pack_cv_queue"])
+        self.assertEqual(queues["joker_cv_queue"][198], bm.ActionType.USE_CONSUMABLE)
+
+        # Shop pack -> Select Card (350 - 2 = 348) -> Buy Card (400 + 0 = 400)
+        self.assertEqual(queues["pack_cv_queue"][348], bm.ActionType.USE_IN_PACK)
+        self.assertEqual(queues["shop_cv_queue"][400], bm.ActionType.BUY_CARD)
+
+    def test_the_hook_prng_discard_and_guards(self):
+        from game.engine.rng_sim.events import predict_hook_discards
+        from game.engine.rng_sim.rng import BalatroRNG
+
+        state = gs.GameState(seed="HOOKSEED1", apply_deck_stake_on_init=True)
+        state.location = bm.Location.BLIND
+        state.current_blind = bm.BlindName.THE_HOOK
+        state.hands_played_this_round = 0
+        state.inventory.jokers = [
+            bm.Joker(name=bm.JokerName.BURNT_JOKER),
+            bm.Joker(name=bm.JokerName.TRADING_CARD),
+        ]
+        cards = [
+            bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.SPADES, id=1),
+            bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.HEARTS, id=2),
+            bm.PlayingCard(rank=bm.Rank.QUEEN, suit=bm.Suit.CLUBS, id=3),
+            bm.PlayingCard(rank=bm.Rank.JACK, suit=bm.Suit.DIAMONDS, id=4),
+            bm.PlayingCard(rank=bm.Rank.TEN, suit=bm.Suit.SPADES, id=5),
+        ]
+        state.hand.cards = [
+            bm.HandCard(card=c, selected=(i == 0)) for i, c in enumerate(cards)
+        ]
+
+        expected_rng = BalatroRNG("HOOKSEED1")
+        expected_hook = predict_hook_discards(expected_rng, cards[1:])
+        self.assertEqual(len(expected_hook), 2)
+
+        start_money = state.money
+        start_hc_lvl = state.hand_levels.get(bm.PokerHand.HIGH_CARD, 1)
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.PLAY_HAND))
+
+        self.assertEqual([c.id for c in state.discard_pile[:2]], [c.id for c in expected_hook])
+        self.assertEqual(state.discard_pile[2].id, 1)
+        self.assertEqual(len(state.hand.cards), 2)
+        self.assertEqual(state.money, start_money)  # Trading Card did NOT trigger on Hook discard
+        self.assertEqual(state.hand_levels.get(bm.PokerHand.HIGH_CARD, 1), start_hc_lvl)  # Burnt Joker did NOT trigger
+
+    def test_batch_recognize_hands_matches_single_and_selection(self):
+        import cv2
+        import torch
+        from classifiers.card_classifier.pipeline import decode_card_prediction
+        from classifiers.inference import batch_recognize_hands, recognize_hand_cards
+
+        # Unit check decode_card_prediction with dict-of-tensors output & "selected": 1.0
+        preds = {
+            "rank_idx": torch.tensor([12]),
+            "rank_conf": torch.tensor([0.99]),
+            "suit_idx": torch.tensor([0]),
+            "suit_conf": torch.tensor([0.98]),
+            "enhancement_idx": torch.tensor([0]),
+            "enhancement_conf": torch.tensor([0.97]),
+            "seal_idx": torch.tensor([0]),
+            "seal_conf": torch.tensor([0.96]),
+            "edition_idx": torch.tensor([0]),
+            "edition_conf": torch.tensor([0.95]),
+            "debuffed": torch.tensor([False]),
+            "face_down": torch.tensor([False]),
+        }
+        res = decode_card_prediction(preds, 0, index=1, box=[10, 20, 90, 150], selected=True)
+        self.assertEqual(res.index, 1)
+        self.assertEqual(res.box, [10, 20, 90, 150])
+        self.assertEqual(res.confidences["selected"], 1.0)
+        self.assertTrue(res.selected)
+
+        sample_path = REPO_ROOT / "assets" / "sample_inputs" / "in_blind.jpg"
+        if sample_path.exists():
+            img = cv2.imread(str(sample_path))
+            single = recognize_hand_cards(img)
+            batch = batch_recognize_hands([img])[0]
+            self.assertEqual(
+                [(c.index, c.rank, c.suit, c.selected, c.box) for c in single.cards],
+                [(c.index, c.rank, c.suit, c.selected, c.box) for c in batch.cards],
+            )
+            rx, ry, rw, rh = single.roi
+            for c in single.cards:
+                self.assertGreaterEqual(c.box[0], rx)
+                self.assertGreaterEqual(c.box[1], ry)
+                self.assertLessEqual(c.box[2], rx + rw)
+                self.assertLessEqual(c.box[3], ry + rh)
+            self.assertEqual(single.roi[3], batch.roi[3])
+            self.assertGreater(batch.roi[3], 1)
+
+    def test_shop_full_frame_boxes_and_joker_aliases(self):
+        from unittest.mock import MagicMock, patch
+        import numpy as np
+        import torch
+        from classifiers.inference import ROIS, _offset_box, batch_recognize_shops, recognize_shop
+        from classifiers.shop_classifier.pipeline import ShopItemResult
+        from game.engine import cv_stubs
+
+        # 1. All non-placeholder j_* keys in all_keys.json resolve to exact JokerName (not fallback JOKER)
+        keys_path = REPO_ROOT / "classifiers" / "shop_classifier" / "stage2_classifier" / "all_keys.json"
+        with keys_path.open("r", encoding="utf-8") as f:
+            all_keys = json.load(f)
+        for k in all_keys:
+            if k.startswith("j_") and k not in ("j_locked", "j_undiscovered"):
+                converted = cv_stubs._convert_shop_item_result(
+                    ShopItemResult(
+                        index=0,
+                        card_type="Joker",
+                        key=k,
+                        edition="None",
+                        eternal=False,
+                        perishable=False,
+                        rental=False,
+                        debuffed=False,
+                        box=[0, 0, 10, 10],
+                        confidences={},
+                    )
+                )
+                self.assertIsInstance(converted, bm.Joker)
+                if k != "j_joker":
+                    self.assertNotEqual(converted.name, bm.JokerName.JOKER, msg=f"Unmapped key: {k}")
+
+        # 2. Both recognize_shop and batch_recognize_shops return full-frame (1920x1080) boxes
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        local_box = [10, 20, 90, 140]
+
+        mock_pipe = MagicMock()
+        mock_pipe.device = torch.device("cpu")
+        mock_pipe.class_names = {0: "Joker"}
+        mock_pipe.transform = lambda crop: torch.zeros((3, 192, 128))
+        mock_pipe.predict.side_effect = lambda crop, conf_threshold=0.35: [
+            ShopItemResult(
+                index=0,
+                card_type="Joker",
+                key="j_duo",
+                edition="None",
+                eternal=False,
+                perishable=False,
+                rental=False,
+                debuffed=False,
+                box=list(local_box),
+                confidences={},
+            )
+        ]
+
+        det_box = MagicMock()
+        det_box.__len__.return_value = 1
+        det_box.xyxy = torch.tensor([local_box], dtype=torch.float32)
+        det_box.conf = torch.tensor([0.95], dtype=torch.float32)
+        det_box.cls = torch.tensor([0.0], dtype=torch.float32)
+        det_res = MagicMock(boxes=det_box)
+        mock_pipe.detector.predict.side_effect = lambda source, **kw: [det_res for _ in source]
+        mock_pipe.classifier.predict_attributes.side_effect = lambda tensor: [
+            {
+                "key": "j_duo", "edition": "None",
+                "eternal": False, "perishable": False, "rental": False, "debuffed": False,
+                "key_conf": 0.99, "edition_conf": 0.99,
+                "eternal_conf": 0.0, "perishable_conf": 0.0, "rental_conf": 0.0, "debuffed_conf": 0.0,
+            }
+            for _ in range(len(tensor))
+        ]
+
+        with patch("classifiers.inference.get_shop_pipeline", return_value=mock_pipe):
+            single_out = recognize_shop(frame, mode="shop")
+            batch_out = batch_recognize_shops([frame], mode="shop")[0]
+
+        for shelf in ("joker_bar", "consumeables", "shop", "voucher", "booster"):
+            attr_name = {"shop": "shop_items", "voucher": "vouchers", "booster": "boosters"}.get(shelf, shelf)
+            expected_box = _offset_box(local_box, round(ROIS[shelf]["x"]), round(ROIS[shelf]["y"]))
+            self.assertEqual(getattr(single_out, attr_name)[0].box, expected_box)
+            self.assertEqual(getattr(batch_out, attr_name)[0].box, expected_box)
+
+    def test_target_chips_lut_and_round_ante_progression(self):
+        self.assertEqual(gs.calculate_target_chips(ante=1, round=1, stake=bm.Stake.WHITE), 300)
+        self.assertEqual(gs.calculate_target_chips(ante=2, round=1, stake=bm.Stake.GREEN), 900)
+        self.assertEqual(gs.calculate_target_chips(ante=8, round=3, stake=bm.Stake.GOLD), 400000)
+        self.assertEqual(
+            gs.calculate_target_chips(ante=4, blind=bm.BlindName.THE_WALL, stake=bm.Stake.WHITE),
+            20000,
+        )
+        self.assertEqual(
+            gs.calculate_target_chips(ante=1, round=1, stake=bm.Stake.WHITE, deck=bm.Deck.PLASMA_DECK),
+            600,
+        )
+        self.assertGreater(gs.calculate_target_chips(ante=10, round=1, stake=bm.Stake.WHITE), 100000)
+
+        state = gs.GameState(seed="ANTETEST", stake=bm.Stake.WHITE, apply_deck_stake_on_init=True)
+        self.assertEqual(state.target_chips, 300)
+        self.assertEqual(state.round, 1)
+        self.assertEqual(state.ante, 1)
+
+        # END_ROUND advances round 1 -> 2; CASH_OUT keeps round == 2 (no double increment)
+        state.location = bm.Location.BLIND
+        state.current_blind = bm.BlindName.SMALL
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertEqual(state.round, 2)
+        self.assertTrue(state.round_won)
+        self.assertEqual(state.location, bm.Location.BLIND)
+
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(state.round, 2)
+        self.assertEqual(state.location, bm.Location.SHOP)
+
+        # Fallback: CASH_OUT without END_ROUND on Boss Blind still advances round (2 -> 3),
+        # and NEXT_ROUND advances ante (1 -> 2) and updates target_chips (800).
+        state.current_blind = bm.BlindName.THE_HOOK
+        state.boss_blind = bm.BlindName.THE_HOOK
+        state.location = bm.Location.BLIND
+        state.round_advanced = False
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(state.round, 3)
+
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.NEXT_ROUND))
+        self.assertEqual(state.ante, 2)
+        self.assertEqual(state.current_blind, bm.BlindName.SMALL)
+        self.assertEqual(state.target_chips, 800)
+        self.assertEqual(state.location, bm.Location.SELECT)
+
+        # Missed NEXT_ROUND fallback: Boss CASH_OUT -> SELECT_BLIND still advances ante (2 -> 3)
+        state.current_blind = state.boss_blind or bm.BlindName.THE_HOOK
+        state.location = bm.Location.BLIND
+        state.round_advanced = False
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.CASH_OUT))
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertEqual(state.ante, 3)
+        self.assertEqual(state.current_blind, bm.BlindName.SMALL)
+        self.assertEqual(state.target_chips, 2000)
+
+    def test_pack_exit_restores_pre_pack_location(self):
+        # Skip Blind -> Charm Tag pack opens -> exit restores Location.SELECT
+        state = gs.GameState(seed="PACKEXIT1")
+        state.location = bm.Location.SELECT
+        state.current_blind = bm.BlindName.SMALL
+        state.small_blind_tag = bm.SkipTag.CHARM_TAG
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(state.location, bm.Location.PACK)
+        self.assertEqual(state.pre_pack_location, bm.Location.SELECT)
+
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_PACK))
+        self.assertEqual(state.location, bm.Location.SELECT)
+        self.assertIsNone(state.pre_pack_location)
+
+        # Double Tag + Charm Tag opens 2 sequential packs before restoring Location.SELECT
+        state.active_tags.append(bm.SkipTag.DOUBLE_TAG)
+        state.current_blind = bm.BlindName.BIG
+        state.big_blind_tag = bm.SkipTag.CHARM_TAG
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(state.location, bm.Location.PACK)
+        self.assertEqual(len(state.pending_packs), 1)
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_PACK))
+        self.assertEqual(state.location, bm.Location.PACK)
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_PACK))
+        self.assertEqual(state.location, bm.Location.SELECT)
+
+        # Shop pack -> exit restores Location.SHOP
+        state.location = bm.Location.SHOP
+        state.money = 20
+        state.shop_packs = [
+            bm.BoosterPack(booster_type=bm.BoosterType.ARCANA, size=bm.BoosterSize.REGULAR, cost=4, choose=1, extra=3)
+        ]
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.OPEN_PACK, target_idx=0))
+        self.assertEqual(state.location, bm.Location.PACK)
+        state, _ = gs.step_simulation(state, bm.Action(type=bm.ActionType.SKIP_PACK))
+        self.assertEqual(state.location, bm.Location.SHOP)
+
+    def test_skip_tags_with_prng(self):
+        # Double + Investment Tag -> +$50 on boss CASH_OUT
+        s = gs.GameState(seed="TAGS1", apply_deck_stake_on_init=True)
+        s.location = bm.Location.SELECT
+        s.current_blind = bm.BlindName.SMALL
+        s.small_blind_tag = bm.SkipTag.DOUBLE_TAG
+        s.big_blind_tag = bm.SkipTag.INVESTMENT_TAG
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(s.active_tags, [bm.SkipTag.DOUBLE_TAG])
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(s.active_tags.count(bm.SkipTag.INVESTMENT_TAG), 2)
+
+        money_before = s.money
+        s.location = bm.Location.BLIND
+        s.current_blind = s.boss_blind or bm.BlindName.THE_HOOK
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.END_ROUND))
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(s.money, money_before + 50)
+        self.assertNotIn(bm.SkipTag.INVESTMENT_TAG, s.active_tags)
+
+        # Top-up Tag adds 2 Common jokers via PRNG; Orbital Tag levels a hand by +3; Economy Tag doubles capped at $40
+        s2 = gs.GameState(seed="TAGS2", apply_deck_stake_on_init=True)
+        s2.location = bm.Location.SELECT
+        s2.current_blind = bm.BlindName.SMALL
+        s2.small_blind_tag = bm.SkipTag.TOP_UP_TAG
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(len(s2.inventory.jokers), 2)
+        self.assertTrue(all(j.info.rarity == bm.JokerRarity.COMMON for j in s2.inventory.jokers))
+
+        s2.current_blind = bm.BlindName.SMALL
+        s2.small_blind_tag = bm.SkipTag.ORBITAL_TAG
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(sum(v - 1 for v in s2.hand_levels.values()), 3)
+
+        s2.money = 30
+        s2.current_blind = bm.BlindName.SMALL
+        s2.small_blind_tag = bm.SkipTag.ECONOMY_TAG
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.SKIP_BLIND))
+        self.assertEqual(s2.money, 60)
+
+        # Juggle Tag gives +3 hand size on SELECT_BLIND, removed at END_ROUND
+        base_hand_size = s2.hand.max_size
+        s2.active_tags.append(bm.SkipTag.JUGGLE_TAG)
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.SELECT_BLIND))
+        self.assertEqual(s2.hand.max_size, base_hand_size + 3)
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertEqual(s2.hand.max_size, base_hand_size)
+
+        # D6 Tag zeroes reroll_cost; Coupon Tag zeroes shop card/pack cost; Foil Tag applies Foil in shop
+        s2.active_tags.extend([bm.SkipTag.D6_TAG, bm.SkipTag.COUPON_TAG, bm.SkipTag.FOIL_TAG])
+        s2.shop_cards = [bm.Joker(name=bm.JokerName.JOKER), bm.Tarot(name=bm.TarotName.FOOL)]
+        s2.location = bm.Location.BLIND
+        s2.current_blind = bm.BlindName.SMALL
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.END_ROUND))
+        s2, _ = gs.step_simulation(s2, bm.Action(type=bm.ActionType.CASH_OUT))
+        self.assertEqual(s2.reroll_cost, 0)
+        self.assertTrue(s2.coupon_shop_active)
+        self.assertEqual(s2.shop_cards[0].edition, bm.Edition.FOIL)
+        self.assertTrue(s2.shop_cards[0].couponed)
+
+    def test_all_decks_and_stakes(self):
+        # Decks
+        red = gs.GameState(deck=bm.Deck.RED_DECK)
+        self.assertEqual(red.discards_left, 4)
+
+        blue = gs.GameState(deck=bm.Deck.BLUE_DECK)
+        self.assertEqual(blue.hands_left, 5)
+
+        yellow = gs.GameState(deck=bm.Deck.YELLOW_DECK)
+        self.assertEqual(yellow.money, 14)
+
+        green = gs.GameState(deck=bm.Deck.GREEN_DECK)
+        self.assertTrue(green.no_interest)
+
+        black = gs.GameState(deck=bm.Deck.BLACK_DECK)
+        self.assertEqual(black.hands_left, 3)
+        self.assertEqual(black.inventory.joker_slots, 6)
+
+        magic = gs.GameState(deck=bm.Deck.MAGIC_DECK)
+        self.assertIn(bm.VoucherName.CRYSTAL_BALL, magic.vouchers_redeemed)
+        self.assertEqual([c.name for c in magic.inventory.consumables], [bm.TarotName.FOOL, bm.TarotName.FOOL])
+
+        nebula = gs.GameState(deck=bm.Deck.NEBULA_DECK)
+        self.assertIn(bm.VoucherName.TELESCOPE, nebula.vouchers_redeemed)
+        self.assertEqual(nebula.inventory.consumable_slots, 1)
+
+        ghost = gs.GameState(deck=bm.Deck.GHOST_DECK)
+        self.assertEqual(ghost.spectral_rate, 2.0)
+        self.assertEqual([c.name for c in ghost.inventory.consumables], [bm.SpectralName.HEX])
+
+        abandoned = gs.GameState(deck=bm.Deck.ABANDONED_DECK)
+        self.assertEqual(len(abandoned.full_deck), 40)
+        self.assertFalse(
+            any(c.rank in (bm.Rank.JACK, bm.Rank.QUEEN, bm.Rank.KING) for c in abandoned.full_deck)
+        )
+
+        checkered = gs.GameState(deck=bm.Deck.CHECKERED_DECK)
+        self.assertEqual(len(checkered.full_deck), 52)
+        self.assertEqual({c.suit for c in checkered.full_deck}, {bm.Suit.SPADES, bm.Suit.HEARTS})
+
+        zodiac = gs.GameState(deck=bm.Deck.ZODIAC_DECK)
+        self.assertEqual(zodiac.shop_size, 3)
+        self.assertEqual(zodiac.tarot_rate, 4.0 * 2.4)
+        self.assertEqual(zodiac.planet_rate, 4.0 * 2.4)
+
+        painted = gs.GameState(deck=bm.Deck.PAINTED_DECK)
+        self.assertEqual(painted.hand.max_size, 10)
+        self.assertEqual(painted.inventory.joker_slots, 4)
+
+        anaglyph = gs.GameState(deck=bm.Deck.ANAGLYPH_DECK)
+        anaglyph.location = bm.Location.BLIND
+        anaglyph.current_blind = bm.BlindName.THE_HOOK
+        anaglyph, _ = gs.step_simulation(anaglyph, bm.Action(type=bm.ActionType.END_ROUND))
+        self.assertIn(bm.SkipTag.DOUBLE_TAG, anaglyph.active_tags)
+
+        plasma = gs.GameState(deck=bm.Deck.PLASMA_DECK)
+        self.assertEqual(plasma.ante_scaling, 2.0)
+        self.assertEqual(plasma.target_chips, 600)
+        self.assertEqual(plasma.balance_plasma_score(100, 10), (55, 55))
+
+        err1 = gs.GameState(deck=bm.Deck.ERRATIC_DECK, seed="ERRATIC1")
+        err2 = gs.GameState(deck=bm.Deck.ERRATIC_DECK, seed="ERRATIC1")
+        self.assertEqual(len(err1.full_deck), 52)
+        self.assertEqual([(c.rank, c.suit) for c in err1.full_deck], [(c.rank, c.suit) for c in err2.full_deck])
+
+        challenge = gs.GameState(deck=bm.Deck.CHALLENGE_DECK)
+        self.assertEqual(len(challenge.full_deck), 52)
+
+        # Stakes
+        self.assertEqual(gs.GameState(deck=bm.Deck.BLUE_DECK, stake=bm.Stake.RED).discards_left, 3)
+        self.assertEqual(gs.GameState(stake=bm.Stake.GREEN).target_chips, 300)
+        black_s = gs.GameState(stake=bm.Stake.BLACK)
+        self.assertTrue(black_s.enable_eternals_in_shop)
+        blue_s = gs.GameState(deck=bm.Deck.BLUE_DECK, stake=bm.Stake.BLUE)
+        self.assertEqual(blue_s.discards_left, 2)
+        self.assertEqual(gs.GameState(deck=bm.Deck.RED_DECK, stake=bm.Stake.BLUE).discards_left, 3)
+        purple_s = gs.GameState(stake=bm.Stake.PURPLE, ante=2)
+        self.assertEqual(purple_s.target_chips, 1000)
+        orange_s = gs.GameState(stake=bm.Stake.ORANGE)
+        self.assertTrue(orange_s.enable_perishables_in_shop)
+        gold_s = gs.GameState(stake=bm.Stake.GOLD)
+        self.assertTrue(gold_s.enable_rentals_in_shop)
+
+    def test_consumables_planets_vouchers_and_pricing(self):
+        # 1. Planet + The Fool ordering & copy (Fool does not copy itself)
+        s = gs.GameState(seed="CONS1", apply_deck_stake_on_init=True)
+        s.inventory.consumables = [
+            bm.Planet(name=bm.PlanetName.MERCURY),
+            bm.Tarot(name=bm.TarotName.FOOL),
+        ]
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual(s.hand_levels[bm.PokerHand.PAIR], 2)
+        self.assertEqual(s.last_tarot_planet, bm.PlanetName.MERCURY)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual([c.name for c in s.inventory.consumables], [bm.PlanetName.MERCURY])
+
+        # Fool used right after Fool shouldn't spawn Fool
+        s.inventory.consumables = [bm.Tarot(name=bm.TarotName.FOOL)]
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual(s.inventory.consumables, [])
+
+        # 2. Emperor, High Priestess, Judgement, Black Hole, The Soul, Wraith
+        s.inventory.consumables = [
+            bm.Tarot(name=bm.TarotName.EMPEROR),
+            bm.Tarot(name=bm.TarotName.HIGH_PRIESTESS),
+            bm.Tarot(name=bm.TarotName.JUDGEMENT),
+            bm.Spectral(name=bm.SpectralName.BLACK_HOLE),
+            bm.Spectral(name=bm.SpectralName.THE_SOUL),
+            bm.Spectral(name=bm.SpectralName.WRAITH),
+        ]
+        s.inventory.consumable_slots = 8
+        s.inventory.joker_slots = 8
+        s.money = 50
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # Emperor (+2 Tarots)
+        self.assertEqual(sum(1 for c in s.inventory.consumables if c.type == bm.CardType.TAROT), 4)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # High Priestess (+2 Planets)
+        self.assertEqual(sum(1 for c in s.inventory.consumables if c.type == bm.CardType.PLANET), 2)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # Judgement
+        self.assertEqual(len(s.inventory.jokers), 1)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # Black Hole
+        self.assertEqual(s.hand_levels[bm.PokerHand.FLUSH], 2)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # The Soul
+        self.assertEqual(s.inventory.jokers[-1].info.rarity, bm.JokerRarity.LEGENDARY)
+        s, _ = gs.step_simulation(s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))  # Wraith
+        self.assertEqual(s.money, 0)
+        self.assertEqual(s.inventory.jokers[-1].info.rarity, bm.JokerRarity.RARE)
+
+        # 3. Ankh destroys non-eternals, preserves eternal, clones chosen without Negative
+        ankh_s = gs.GameState(seed="ANKH1")
+        ankh_s.inventory.jokers = [
+            bm.Joker(name=bm.JokerName.JOKER, id=10, edition=bm.Edition.NEGATIVE),
+            bm.Joker(name=bm.JokerName.GREEDY_JOKER, id=11, eternal=True),
+        ]
+        ankh_s.inventory.consumables = [bm.Spectral(name=bm.SpectralName.ANKH)]
+        ankh_s, _ = gs.step_simulation(ankh_s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertTrue(any(j.eternal for j in ankh_s.inventory.jokers))
+        clones = [j for j in ankh_s.inventory.jokers if j.id not in (0, 10, 11)]
+        self.assertEqual(len(clones), 1)
+        self.assertNotEqual(clones[0].edition, bm.Edition.NEGATIVE)
+
+        # 4. Ouija sets uniform rank & reduces hand size
+        ouija_s = gs.GameState(seed="OUIJA1")
+        ouija_s.hand.cards = [
+            bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.SPADES, id=1)),
+            bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.HEARTS, id=2)),
+        ]
+        ouija_s.inventory.consumables = [bm.Spectral(name=bm.SpectralName.OUIJA)]
+        start_size = ouija_s.hand.max_size
+        ouija_s, _ = gs.step_simulation(ouija_s, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual(ouija_s.hand.cards[0].card.rank, ouija_s.hand.cards[1].card.rank)
+        self.assertEqual(ouija_s.hand.max_size, start_size - 1)
+
+        # 5. Vouchers + Observatory + Pricing (Astronomer, Coupon Tag, Rental, Clearance Sale, Liquidation)
+        vs = gs.GameState(seed="VOUCH1")
+        vs.location = bm.Location.SHOP
+        vs.money = 100
+        vs.shop_vouchers = [
+            bm.Voucher(name=bm.VoucherName.OVERSTOCK),
+            bm.Voucher(name=bm.VoucherName.CLEARANCE_SALE),
+            bm.Voucher(name=bm.VoucherName.OBSERVATORY),
+        ]
+        vs, _ = gs.step_simulation(vs, bm.Action(type=bm.ActionType.REDEEM_VOUCHER, target_idx=0))
+        self.assertEqual(vs.shop_size, 3)
+        self.assertEqual(vs.money, 90)
+        vs, _ = gs.step_simulation(vs, bm.Action(type=bm.ActionType.REDEEM_VOUCHER, target_idx=0))
+        self.assertEqual(vs.discount_percent, 25)
+        vs, _ = gs.step_simulation(vs, bm.Action(type=bm.ActionType.REDEEM_VOUCHER, target_idx=0))
+        # Voucher cost with 25% discount: floor((10 + 0.5) * 0.75) = 7
+        self.assertEqual(vs.money, 90 - 10 - 7)
+
+        vs.inventory.consumables = [bm.Planet(name=bm.PlanetName.MERCURY), bm.Planet(name=bm.PlanetName.MERCURY)]
+        self.assertAlmostEqual(vs.get_observatory_x_mult(bm.PokerHand.PAIR), 2.25)
+
+        vs.inventory.jokers = [bm.Joker(name=bm.JokerName.ASTRONOMER)]
+        planet_card = bm.Planet(name=bm.PlanetName.JUPITER)
+        celestial_pack = bm.BoosterPack(booster_type=bm.BoosterType.CELESTIAL, size=bm.BoosterSize.REGULAR, cost=4, choose=1, extra=3)
+        self.assertEqual(planet_card.get_cost(astronomer=True), 0)
+        self.assertGreaterEqual(planet_card.get_sell_value(astronomer=True), 1)
+        self.assertEqual(celestial_pack.get_cost(astronomer=True), 0)
+
+        rental_joker = bm.Joker(name=bm.JokerName.BLUEPRINT, rental=True)
+        self.assertEqual(rental_joker.get_cost(discount_percent=0, inflation=10), 1)
+
+        vs.coupon_shop_active = True
+        expensive_joker = bm.Joker(name=bm.JokerName.BLUEPRINT)
+        vs.shop_cards = [expensive_joker]
+        money_pre_coupon = vs.money
+        vs, _ = gs.step_simulation(vs, bm.Action(type=bm.ActionType.BUY_CARD, target_idx=0))
+        self.assertEqual(vs.money, money_pre_coupon)
+        self.assertGreaterEqual(vs.inventory.jokers[-1].get_sell_value(), 1)
 
 
 def run_synthetic_test() -> None:
