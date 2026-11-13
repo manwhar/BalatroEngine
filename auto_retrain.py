@@ -218,8 +218,8 @@ def launch_training(
         "--stage", stage,
         "--epochs-detector", str(epochs_det),
         "--epochs-classifier", str(epochs_cls),
-        "--batch-classifier", "256",
-        "--workers", "4"
+        "--batch-classifier", "512",
+        "--workers", "8"
     ]
     print(f"Executing: {' '.join(cmd)}\n" + "=" * 70 + "\n")
 

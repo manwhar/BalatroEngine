@@ -5,6 +5,7 @@ Trains a 4-class (Joker, Tarot, Spectral, Planet) YOLOv8 model to detect cards/i
 across the 4 shop regions (joker bar, consumables area, main shop, booster packs).
 """
 
+import os
 import sys
 import shutil
 import argparse
@@ -44,6 +45,9 @@ def run_train_detector(
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         print(f"[CUDA OK] GPU Device : {gpu_name} ({vram_gb:.2f} GB VRAM)")
         device = 0
+        if vram_gb >= 20.0 and batch <= 16:
+            batch = 64
+            print(f"[AUTO] High-VRAM GPU detected ({vram_gb:.1f} GB); scaling detector batch size to {batch}.")
     else:
         print("[WARNING] CUDA not available, training on CPU.")
         device = "cpu"
@@ -69,7 +73,9 @@ def run_train_detector(
         device=device,
         project=RUNS_DIR.as_posix(),
         name=name,
-        workers=2 if sys.platform != "win32" else 0,
+        workers=min(8, os.cpu_count() or 4),
+        cache="ram",
+        amp=True,
         val=True,
         save=True,
         exist_ok=exist_ok,

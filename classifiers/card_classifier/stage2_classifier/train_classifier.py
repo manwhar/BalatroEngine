@@ -25,6 +25,12 @@ from torch.utils.data import DataLoader
 
 CURRENT_DIR = Path(__file__).resolve().parent
 CLASSIFIER_ROOT = CURRENT_DIR.parent
+REPO_ROOT = CLASSIFIER_ROOT.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from classifiers.augmentations import apply_gpu_batch_augmentations
+CLASSIFIER_ROOT = CURRENT_DIR.parent
 DATASET_DIR = CLASSIFIER_ROOT / "dataset"
 RUNS_DIR = CURRENT_DIR / "runs"
 WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
@@ -97,10 +103,16 @@ def run_train_classifier(
     print("Stage 2: Multi-Head Card Attribute Classifier Training")
     print("=" * 60)
 
-    if torch.cuda.is_available():
+    use_amp = torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    if use_amp:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"[CUDA OK] GPU Device : {gpu_name} ({vram_gb:.2f} GB VRAM)")
+        if vram_gb >= 16.0 and batch_size < 512:
+            batch_size = 512
+        print(f"[CUDA OK] GPU Device : {gpu_name} ({vram_gb:.2f} GB VRAM, AMP={amp_dtype})")
         device = torch.device("cuda:0")
     else:
         print("[WARNING] CUDA not available, training on CPU.")
@@ -122,10 +134,38 @@ def run_train_classifier(
     train_dataset = CardCropDataset(DATASET_DIR, split="train", val_ratio=0.20)
     val_dataset = CardCropDataset(DATASET_DIR, split="val", val_ratio=0.20)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    def _make_loader(ds, shuffle):
+        if getattr(ds, "uses_ram_cache", False):
+            return None
+        kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "pin_memory": use_amp,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = 4
+        return DataLoader(ds, **kwargs)
+
+    def _iter_batches(ds, loader, shuffle):
+        if not getattr(ds, "uses_ram_cache", False):
+            yield from loader
+            return
+        n = len(ds)
+        perm = torch.randperm(n) if shuffle else torch.arange(n)
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            imgs = ds._cached_images[idx]
+            tgts = {k: v[idx] for k, v in ds._targets.items()}
+            yield imgs, tgts
+
+    train_loader = _make_loader(train_dataset, shuffle=True)
+    val_loader = _make_loader(val_dataset, shuffle=False)
 
     model = MultiHeadCardClassifier(backbone_name=backbone, pretrained=True, dropout=0.2).to(device)
+    if use_amp:
+        model = model.to(memory_format=torch.channels_last)
 
     # Loss criteria
     criterion_ce = nn.CrossEntropyLoss()
@@ -133,6 +173,7 @@ def run_train_classifier(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     best_exact_match = -1.0
     history = []
@@ -141,24 +182,35 @@ def run_train_classifier(
         # 1. Training Phase
         model.train()
         train_loss = 0.0
-        for images, targets in train_loader:
-            images = images.to(device)
-            targets = {k: v.to(device) for k, v in targets.items()}
+        for images, targets in _iter_batches(train_dataset, train_loader, shuffle=True):
+            images = images.to(device, non_blocking=True)
+            if train_dataset.raw_tensor_mode:
+                images = apply_gpu_batch_augmentations(images, is_train=True, compression_prob=0.5, cursor_prob=0.3, color_jitter=True)
+            if use_amp:
+                images = images.contiguous(memory_format=torch.channels_last)
+            targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-            optimizer.zero_grad()
-            logits = model(images)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                logits = model(images)
 
-            l_rank = criterion_ce(logits["rank"], targets["rank"])
-            l_suit = criterion_ce(logits["suit"], targets["suit"])
-            l_edition = criterion_ce(logits["edition"], targets["edition"])
-            l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
-            l_seal = criterion_ce(logits["seal"], targets["seal"])
-            l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
-            l_fd = criterion_bce(logits["face_down"], targets["face_down"])
+                l_rank = criterion_ce(logits["rank"], targets["rank"])
+                l_suit = criterion_ce(logits["suit"], targets["suit"])
+                l_edition = criterion_ce(logits["edition"], targets["edition"])
+                l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
+                l_seal = criterion_ce(logits["seal"], targets["seal"])
+                l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
+                l_fd = criterion_bce(logits["face_down"], targets["face_down"])
 
-            loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
-            loss.backward()
-            optimizer.step()
+                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             train_loss += loss.item() * len(images)
 
         train_loss /= len(train_dataset)
@@ -181,21 +233,26 @@ def run_train_classifier(
         }
 
         with torch.no_grad():
-            for images, targets in val_loader:
-                images = images.to(device)
-                targets = {k: v.to(device) for k, v in targets.items()}
+            for images, targets in _iter_batches(val_dataset, val_loader, shuffle=False):
+                images = images.to(device, non_blocking=True)
+                if val_dataset.raw_tensor_mode:
+                    images = apply_gpu_batch_augmentations(images, is_train=False)
+                if use_amp:
+                    images = images.contiguous(memory_format=torch.channels_last)
+                targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-                logits = model(images)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    logits = model(images)
 
-                l_rank = criterion_ce(logits["rank"], targets["rank"])
-                l_suit = criterion_ce(logits["suit"], targets["suit"])
-                l_edition = criterion_ce(logits["edition"], targets["edition"])
-                l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
-                l_seal = criterion_ce(logits["seal"], targets["seal"])
-                l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
-                l_fd = criterion_bce(logits["face_down"], targets["face_down"])
+                    l_rank = criterion_ce(logits["rank"], targets["rank"])
+                    l_suit = criterion_ce(logits["suit"], targets["suit"])
+                    l_edition = criterion_ce(logits["edition"], targets["edition"])
+                    l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
+                    l_seal = criterion_ce(logits["seal"], targets["seal"])
+                    l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
+                    l_fd = criterion_bce(logits["face_down"], targets["face_down"])
 
-                loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
+                    loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
                 val_loss += loss.item() * len(images)
 
                 p_rank = logits["rank"].argmax(dim=-1)
@@ -227,17 +284,16 @@ def run_train_classifier(
                 exact = m_rank & m_suit & m_ed & m_enh & m_seal & m_deb & m_fd
                 exact_matches += exact.sum().item()
 
-                # Accumulate confusion matrices
-                for t_i, p_i in zip(targets["rank"].cpu().numpy(), p_rank.cpu().numpy()):
-                    cms["rank"][t_i, p_i] += 1
-                for t_i, p_i in zip(targets["suit"].cpu().numpy(), p_suit.cpu().numpy()):
-                    cms["suit"][t_i, p_i] += 1
-                for t_i, p_i in zip(targets["edition"].cpu().numpy(), p_ed.cpu().numpy()):
-                    cms["edition"][t_i, p_i] += 1
-                for t_i, p_i in zip(targets["enhancement"].cpu().numpy(), p_enh.cpu().numpy()):
-                    cms["enhancement"][t_i, p_i] += 1
-                for t_i, p_i in zip(targets["seal"].cpu().numpy(), p_seal.cpu().numpy()):
-                    cms["seal"][t_i, p_i] += 1
+                # Vectorized confusion matrix accumulation
+                for name, t_tensor, p_tensor, n_cls in (
+                    ("rank", targets["rank"], p_rank, len(RANKS)),
+                    ("suit", targets["suit"], p_suit, len(SUITS)),
+                    ("edition", targets["edition"], p_ed, len(EDITIONS)),
+                    ("enhancement", targets["enhancement"], p_enh, len(ENHANCEMENTS)),
+                    ("seal", targets["seal"], p_seal, len(SEALS)),
+                ):
+                    cm_batch = torch.bincount(t_tensor * n_cls + p_tensor, minlength=n_cls * n_cls).reshape(n_cls, n_cls)
+                    cms[name] += cm_batch.cpu().numpy()
 
         val_loss /= total_val
         accs = {k: v / total_val for k, v in correct_counts.items()}
@@ -324,7 +380,7 @@ def run_train_classifier(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stage 2 Multi-Head Card Classifier")
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size (default: 512)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Backbone model")
     parser.add_argument("--name", type=str, default="card_classifier", help="Run directory name")

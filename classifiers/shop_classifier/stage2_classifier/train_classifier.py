@@ -19,6 +19,12 @@ from torch.utils.data import DataLoader
 
 CURRENT_DIR = Path(__file__).resolve().parent
 CLASSIFIER_ROOT = CURRENT_DIR.parent
+REPO_ROOT = CLASSIFIER_ROOT.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from classifiers.augmentations import apply_gpu_batch_augmentations
+CLASSIFIER_ROOT = CURRENT_DIR.parent
 DATASET_DIR = CLASSIFIER_ROOT / "dataset"
 RUNS_DIR = CURRENT_DIR / "runs"
 WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
@@ -65,10 +71,16 @@ def run_train_classifier(
     print("=" * 60)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    use_amp = (device.type == "cuda")
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"[CUDA OK] GPU Device : {gpu_name} ({vram_gb:.2f} GB VRAM)")
+        if vram_gb >= 16.0 and batch_size < 512:
+            batch_size = 512
+        print(f"[CUDA OK] GPU Device : {gpu_name} ({vram_gb:.2f} GB VRAM, AMP={amp_dtype})")
     else:
         print("[WARNING] CUDA not available, training on CPU.")
 
@@ -88,26 +100,44 @@ def run_train_classifier(
         print("[Error] No training samples found. Please sync the dataset first.")
         return None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers if sys.platform != "win32" else 0,
-        pin_memory=(device.type == "cuda"),
-        drop_last=(len(train_dataset) > batch_size)
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers if sys.platform != "win32" else 0,
-        pin_memory=(device.type == "cuda")
-    )
+    def _make_loader(ds, shuffle, drop_last):
+        if getattr(ds, "uses_ram_cache", False):
+            return None
+        kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "pin_memory": (device.type == "cuda"),
+            "drop_last": drop_last,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = 4
+        return DataLoader(ds, **kwargs)
+
+    def _iter_batches(ds, loader, shuffle, drop_last):
+        if not getattr(ds, "uses_ram_cache", False):
+            yield from loader
+            return
+        n = len(ds)
+        perm = torch.randperm(n) if shuffle else torch.arange(n)
+        limit = (n // batch_size) * batch_size if (drop_last and n > batch_size) else n
+        for start in range(0, limit, batch_size):
+            idx = perm[start:start + batch_size]
+            imgs = ds._cached_images[idx]
+            tgts = {k: v[idx] for k, v in ds._targets.items()}
+            yield imgs, tgts
+
+    train_loader = _make_loader(train_dataset, shuffle=True, drop_last=(len(train_dataset) > batch_size))
+    val_loader = _make_loader(val_dataset, shuffle=False, drop_last=False)
 
     # 2. Model & Optimizer
     model = MultiHeadItemClassifier(backbone_name=backbone, pretrained=True).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     ce_loss = nn.CrossEntropyLoss()
     bce_loss = nn.BCEWithLogitsLoss()
@@ -122,33 +152,43 @@ def run_train_classifier(
         total_loss = 0.0
         train_batches = 0
 
-        for images, targets in train_loader:
+        for images, targets in _iter_batches(train_dataset, train_loader, shuffle=True, drop_last=(len(train_dataset) > batch_size)):
             images = images.to(device, non_blocking=True)
+            if train_dataset.raw_tensor_mode:
+                images = apply_gpu_batch_augmentations(images, is_train=True, compression_prob=0.5, cursor_prob=0.3, color_jitter=True)
+            if device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
             for k in targets:
                 targets[k] = targets[k].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            logits = model(images)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                logits = model(images)
 
-            loss_key = ce_loss(logits["key"], targets["key"])
-            loss_edition = ce_loss(logits["edition"], targets["edition"])
-            loss_eternal = bce_loss(logits["eternal"], targets["eternal"])
-            loss_perishable = bce_loss(logits["perishable"], targets["perishable"])
-            loss_rental = bce_loss(logits["rental"], targets["rental"])
-            loss_debuffed = bce_loss(logits["debuffed"], targets["debuffed"])
+                loss_key = ce_loss(logits["key"], targets["key"])
+                loss_edition = ce_loss(logits["edition"], targets["edition"])
+                loss_eternal = bce_loss(logits["eternal"], targets["eternal"])
+                loss_perishable = bce_loss(logits["perishable"], targets["perishable"])
+                loss_rental = bce_loss(logits["rental"], targets["rental"])
+                loss_debuffed = bce_loss(logits["debuffed"], targets["debuffed"])
 
-            # Weighted sum: prioritize item identity key, then edition & stickers
-            loss = (
-                loss_key * 2.0 +
-                loss_edition * 1.0 +
-                loss_eternal * 0.5 +
-                loss_perishable * 0.5 +
-                loss_rental * 0.5 +
-                loss_debuffed * 0.5
-            )
+                # Weighted sum: prioritize item identity key, then edition & stickers
+                loss = (
+                    loss_key * 2.0 +
+                    loss_edition * 1.0 +
+                    loss_eternal * 0.5 +
+                    loss_perishable * 0.5 +
+                    loss_rental * 0.5 +
+                    loss_debuffed * 0.5
+                )
 
-            loss.backward()
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
             train_batches += 1
@@ -169,21 +209,26 @@ def run_train_classifier(
         total_samples = 0
 
         with torch.no_grad():
-            for images, targets in val_loader:
+            for images, targets in _iter_batches(val_dataset, val_loader, shuffle=False, drop_last=False):
                 images = images.to(device, non_blocking=True)
+                if val_dataset.raw_tensor_mode:
+                    images = apply_gpu_batch_augmentations(images, is_train=False)
+                if device.type == "cuda":
+                    images = images.contiguous(memory_format=torch.channels_last)
                 for k in targets:
                     targets[k] = targets[k].to(device, non_blocking=True)
 
-                logits = model(images)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    logits = model(images)
 
-                l_k = ce_loss(logits["key"], targets["key"])
-                l_e = ce_loss(logits["edition"], targets["edition"])
-                l_et = bce_loss(logits["eternal"], targets["eternal"])
-                l_p = bce_loss(logits["perishable"], targets["perishable"])
-                l_r = bce_loss(logits["rental"], targets["rental"])
-                l_d = bce_loss(logits["debuffed"], targets["debuffed"])
+                    l_k = ce_loss(logits["key"], targets["key"])
+                    l_e = ce_loss(logits["edition"], targets["edition"])
+                    l_et = bce_loss(logits["eternal"], targets["eternal"])
+                    l_p = bce_loss(logits["perishable"], targets["perishable"])
+                    l_r = bce_loss(logits["rental"], targets["rental"])
+                    l_d = bce_loss(logits["debuffed"], targets["debuffed"])
 
-                v_loss = l_k * 2.0 + l_e + 0.5 * (l_et + l_p + l_r + l_d)
+                    v_loss = l_k * 2.0 + l_e + 0.5 * (l_et + l_p + l_r + l_d)
                 val_loss += v_loss.item()
                 val_batches += 1
 
@@ -253,11 +298,11 @@ def run_train_classifier(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stage 2 Multi-Head Shop Item Classifier")
     parser.add_argument("--epochs", type=int, default=15, help="Epoch count (default: 15)")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (default: 256)")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size (default: 512)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"])
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers")
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader CPU workers (default: 8)")
     args = parser.parse_args()
 
     run_train_classifier(

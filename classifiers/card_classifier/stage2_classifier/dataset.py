@@ -6,9 +6,13 @@ attribute target dictionaries for multi-task classification.
 Splits data by frame ID so cards from the same screenshot remain in the same split.
 """
 
+import os
 import json
 import random
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -57,13 +61,14 @@ def get_transforms(is_train: bool = True):
 
 
 class CardCropDataset(Dataset):
-    def __init__(self, data_root, split="train", val_ratio=0.20, seed=42, transform=None):
+    def __init__(self, data_root, split="train", val_ratio=0.20, seed=42, transform=None, cache_in_memory=True, max_cache_gb=12.0):
         super().__init__()
         self.data_root = Path(data_root)
         self.images_dir = self.data_root / "images"
         self.labels_dir = self.data_root / "labels_json"
         self.is_train = (split == "train")
-        self.transform = transform or get_transforms(is_train=self.is_train)
+        self.raw_tensor_mode = (transform is None)
+        self.transform = transform
 
         # 1. Discover all matching frame image & json pairs
         json_files = sorted(list(self.labels_dir.glob("*.json")))
@@ -125,39 +130,91 @@ class CardCropDataset(Dataset):
 
         print(f"[{split.upper()}] Loaded {len(self.samples)} card crops across {len(selected_frames)} frames.")
 
+        # Precompute contiguous target tensors
+        n = len(self.samples)
+        none_rank_idx = RANK_TO_IDX.get("None", 0)
+        self._targets = {
+            "rank": torch.tensor([RANK_TO_IDX.get(s["rank"], none_rank_idx) for s in self.samples], dtype=torch.long),
+            "suit": torch.tensor([SUIT_TO_IDX.get(s["suit"], 4) for s in self.samples], dtype=torch.long),
+            "edition": torch.tensor([EDITION_TO_IDX.get(s["edition"], 0) for s in self.samples], dtype=torch.long),
+            "enhancement": torch.tensor([ENHANCEMENT_TO_IDX.get(s["enhancement"], 0) for s in self.samples], dtype=torch.long),
+            "seal": torch.tensor([SEAL_TO_IDX.get(s["seal"], 0) for s in self.samples], dtype=torch.long),
+            "debuffed": torch.tensor([1.0 if s["debuffed"] else 0.0 for s in self.samples], dtype=torch.float32),
+            "face_down": torch.tensor([1.0 if s["face_down"] else 0.0 for s in self.samples], dtype=torch.float32),
+        }
+
+        self._cached_images = None
+        self.uses_ram_cache = False
+        est_bytes = n * 3 * CROP_HEIGHT * CROP_WIDTH
+        if cache_in_memory and self.raw_tensor_mode and n > 0 and est_bytes <= int(max_cache_gb * (1024 ** 3)):
+            self._preload_crops_to_ram()
+
+    def _preload_crops_to_ram(self):
+        n = len(self.samples)
+        buf = torch.empty((n, 3, CROP_HEIGHT, CROP_WIDTH), dtype=torch.uint8)
+        groups = defaultdict(list)
+        for idx, s in enumerate(self.samples):
+            groups[s["img_path"]].append((idx, s["box_pixel"]))
+
+        def _process_frame(item):
+            img_path, entries = item
+            try:
+                with Image.open(img_path) as full_img:
+                    img_rgb = full_img.convert("RGB")
+                    iw, ih = img_rgb.size
+                    for idx, box in entries:
+                        px, py, pw, ph = box
+                        if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+                            crop = img_rgb
+                        else:
+                            x1 = max(0, min(iw - 1, px))
+                            y1 = max(0, min(ih - 1, py))
+                            x2 = max(x1 + 1, min(iw, x1 + pw))
+                            y2 = max(y1 + 1, min(ih, y1 + ph))
+                            crop = img_rgb.crop((x1, y1, x2, y2))
+                        resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
+                        arr = np.asarray(resized, dtype=np.uint8)
+                        buf[idx].copy_(torch.from_numpy(arr).permute(2, 0, 1))
+            except Exception:
+                for idx, _ in entries:
+                    buf[idx].fill_(128)
+
+        workers = min(16, max(4, os.cpu_count() or 8))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_process_frame, groups.items()))
+
+        self._cached_images = buf
+        self.uses_ram_cache = True
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        item = self.samples[idx]
-        
-        # Load image and crop card region
-        try:
-            with Image.open(item["img_path"]) as full_img:
-                full_img = full_img.convert("RGB")
-                px, py, pw, ph = item["box_pixel"]
-                iw, ih = full_img.size
-                if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
-                    crop = full_img.copy()
-                else:
-                    x1 = max(0, min(iw - 1, px))
-                    y1 = max(0, min(ih - 1, py))
-                    x2 = max(x1 + 1, min(iw, x1 + pw))
-                    y2 = max(y1 + 1, min(ih, y1 + ph))
-                    crop = full_img.crop((x1, y1, x2, y2))
-        except Exception:
-            crop = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (128, 128, 128))
+        if self.uses_ram_cache:
+            tensor_img = self._cached_images[idx]
+        else:
+            item = self.samples[idx]
+            try:
+                with Image.open(item["img_path"]) as full_img:
+                    full_img = full_img.convert("RGB")
+                    px, py, pw, ph = item["box_pixel"]
+                    iw, ih = full_img.size
+                    if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+                        crop = full_img.copy()
+                    else:
+                        x1 = max(0, min(iw - 1, px))
+                        y1 = max(0, min(ih - 1, py))
+                        x2 = max(x1 + 1, min(iw, x1 + pw))
+                        y2 = max(y1 + 1, min(ih, y1 + ph))
+                        crop = full_img.crop((x1, y1, x2, y2))
+            except Exception:
+                crop = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (128, 128, 128))
 
-        tensor_img = self.transform(crop)
+            if self.raw_tensor_mode:
+                resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
+                tensor_img = torch.from_numpy(np.asarray(resized, dtype=np.uint8)).permute(2, 0, 1).contiguous()
+            else:
+                tensor_img = self.transform(crop)
 
-        targets = {
-            "rank": torch.tensor(RANK_TO_IDX.get(item["rank"], RANK_TO_IDX.get("None", 0)), dtype=torch.long),
-            "suit": torch.tensor(SUIT_TO_IDX.get(item["suit"], 4), dtype=torch.long),
-            "edition": torch.tensor(EDITION_TO_IDX.get(item["edition"], 0), dtype=torch.long),
-            "enhancement": torch.tensor(ENHANCEMENT_TO_IDX.get(item["enhancement"], 0), dtype=torch.long),
-            "seal": torch.tensor(SEAL_TO_IDX.get(item["seal"], 0), dtype=torch.long),
-            "debuffed": torch.tensor(1.0 if item["debuffed"] else 0.0, dtype=torch.float32),
-            "face_down": torch.tensor(1.0 if item["face_down"] else 0.0, dtype=torch.float32),
-        }
-
+        targets = {k: v[idx] for k, v in self._targets.items()}
         return tensor_img, targets

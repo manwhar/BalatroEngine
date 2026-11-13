@@ -6,9 +6,13 @@ and provides multi-head target dictionaries for classification.
 Splits data by frame ID to prevent data leakage between train and val splits.
 """
 
+import os
 import json
 import random
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -57,13 +61,14 @@ def get_transforms(is_train: bool = True):
 
 
 class ItemCropDataset(Dataset):
-    def __init__(self, data_root, split="train", val_ratio=0.20, seed=42, transform=None):
+    def __init__(self, data_root, split="train", val_ratio=0.20, seed=42, transform=None, cache_in_memory=True, max_cache_gb=12.0):
         super().__init__()
         self.data_root = Path(data_root)
         self.images_dir = self.data_root / "images"
         self.labels_dir = self.data_root / "labels_json"
         self.is_train = (split == "train")
-        self.transform = transform or get_transforms(is_train=self.is_train)
+        self.raw_tensor_mode = (transform is None)
+        self.transform = transform
 
         # 1. Discover all matching frame image & json pairs
         json_files = sorted(list(self.labels_dir.glob("*.json")))
@@ -106,40 +111,84 @@ class ItemCropDataset(Dataset):
             except Exception:
                 continue
 
+        # Precompute contiguous target tensors
+        n = len(self.samples)
+        unknown_idx = KEY_TO_IDX.get("unknown", 0)
+        self._targets = {
+            "key": torch.tensor([KEY_TO_IDX.get(s["key"], unknown_idx) for s in self.samples], dtype=torch.long),
+            "edition": torch.tensor([EDITION_TO_IDX.get(s["edition"], 0) for s in self.samples], dtype=torch.long),
+            "eternal": torch.tensor([1.0 if s["eternal"] else 0.0 for s in self.samples], dtype=torch.float32),
+            "perishable": torch.tensor([1.0 if s["perishable"] else 0.0 for s in self.samples], dtype=torch.float32),
+            "rental": torch.tensor([1.0 if s["rental"] else 0.0 for s in self.samples], dtype=torch.float32),
+            "debuffed": torch.tensor([1.0 if s["debuffed"] else 0.0 for s in self.samples], dtype=torch.float32),
+        }
+
+        self._cached_images = None
+        self.uses_ram_cache = False
+        est_bytes = n * 3 * CROP_HEIGHT * CROP_WIDTH
+        if cache_in_memory and self.raw_tensor_mode and n > 0 and est_bytes <= int(max_cache_gb * (1024 ** 3)):
+            self._preload_crops_to_ram()
+
+    def _preload_crops_to_ram(self):
+        n = len(self.samples)
+        buf = torch.empty((n, 3, CROP_HEIGHT, CROP_WIDTH), dtype=torch.uint8)
+        groups = defaultdict(list)
+        for idx, s in enumerate(self.samples):
+            groups[s["img_path"]].append((idx, s["box_pixel"]))
+
+        def _process_frame(item):
+            img_path, entries = item
+            try:
+                with Image.open(img_path) as full_img:
+                    img_rgb = full_img.convert("RGB")
+                    iw, ih = img_rgb.size
+                    for idx, box in entries:
+                        x, y, w, h = box
+                        x1 = max(0, int(round(x)))
+                        y1 = max(0, int(round(y)))
+                        x2 = min(iw, int(round(x + w)))
+                        y2 = min(ih, int(round(y + h)))
+                        crop = img_rgb if (x2 <= x1 or y2 <= y1) else img_rgb.crop((x1, y1, x2, y2))
+                        resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
+                        arr = np.asarray(resized, dtype=np.uint8)
+                        buf[idx].copy_(torch.from_numpy(arr).permute(2, 0, 1))
+            except Exception:
+                buf[entries[0][0]].fill_(128)
+                for idx, _ in entries[1:]:
+                    buf[idx].fill_(128)
+
+        workers = min(16, max(4, os.cpu_count() or 8))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_process_frame, groups.items()))
+
+        self._cached_images = buf
+        self.uses_ram_cache = True
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img_path = sample["img_path"]
-        box = sample["box_pixel"]
+        if self.uses_ram_cache:
+            crop_tensor = self._cached_images[idx]
+        else:
+            sample = self.samples[idx]
+            img_path = sample["img_path"]
+            box = sample["box_pixel"]
 
-        # Crop the item from the source ROI image
-        with Image.open(img_path) as full_img:
-            img_rgb = full_img.convert("RGB")
-            iw, ih = img_rgb.size
+            with Image.open(img_path) as full_img:
+                img_rgb = full_img.convert("RGB")
+                iw, ih = img_rgb.size
+                x, y, w, h = box
+                x1 = max(0, int(round(x)))
+                y1 = max(0, int(round(y)))
+                x2 = min(iw, int(round(x + w)))
+                y2 = min(ih, int(round(y + h)))
+                crop = img_rgb if (x2 <= x1 or y2 <= y1) else img_rgb.crop((x1, y1, x2, y2))
+                if self.raw_tensor_mode:
+                    resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
+                    crop_tensor = torch.from_numpy(np.asarray(resized, dtype=np.uint8)).permute(2, 0, 1).contiguous()
+                else:
+                    crop_tensor = self.transform(crop)
 
-            # box_pixel is [x, y, w, h] relative to the ROI image
-            x, y, w, h = box
-            x1 = max(0, int(round(x)))
-            y1 = max(0, int(round(y)))
-            x2 = min(iw, int(round(x + w)))
-            y2 = min(ih, int(round(y + h)))
-
-            if x2 <= x1 or y2 <= y1:
-                crop = img_rgb
-            else:
-                crop = img_rgb.crop((x1, y1, x2, y2))
-
-        crop_tensor = self.transform(crop)
-
-        targets = {
-            "key": torch.tensor(KEY_TO_IDX.get(sample["key"], KEY_TO_IDX.get("unknown", 0)), dtype=torch.long),
-            "edition": torch.tensor(EDITION_TO_IDX.get(sample["edition"], 0), dtype=torch.long),
-            "eternal": torch.tensor(1.0 if sample["eternal"] else 0.0, dtype=torch.float32),
-            "perishable": torch.tensor(1.0 if sample["perishable"] else 0.0, dtype=torch.float32),
-            "rental": torch.tensor(1.0 if sample["rental"] else 0.0, dtype=torch.float32),
-            "debuffed": torch.tensor(1.0 if sample["debuffed"] else 0.0, dtype=torch.float32),
-        }
-
+        targets = {k: v[idx] for k, v in self._targets.items()}
         return crop_tensor, targets
