@@ -11,7 +11,7 @@ import cv2
 import cv2.mat_wrapper
 
 from config import Config
-from debug_plotter import plot
+from tools.debug_plotter import plot
 from geometry import PixelROI, crop_image_to_roi
 from matcher import TemplateMatch, find_element
 from shadow_evaluator import analyze_shadow_presence

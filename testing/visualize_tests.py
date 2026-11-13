@@ -15,7 +15,7 @@ from template import template_loader
 from matcher import find_element
 from shadow_evaluator import analyze_shadow_presence
 from geometry import ImageSize, PixelROI, crop_image_to_roi
-from debug_plotter import plot
+from tools.debug_plotter import plot
 
 # Set to True to only visualize/show failed tests. Set to False to view all tests.
 SHOW_ONLY_FAILURES = True

@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from debug_plotter import plot
+from tools.debug_plotter import plot
 from geometry import PixelROI
 from matcher import find_element
 

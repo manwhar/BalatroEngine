@@ -12,10 +12,10 @@ Supported Models:
     --model auto   (detects active generation directory automatically)
 
 Usage:
-    python auto_retrain.py
-    python auto_retrain.py --model shop --target 10000 --interval 5
-    python auto_retrain.py --model card --target 10000
-    python auto_retrain.py --model both --clean-shop --target 10000
+    python tools/auto_retrain.py
+    python tools/auto_retrain.py --model shop --target 10000 --interval 5
+    python tools/auto_retrain.py --model card --target 10000
+    python tools/auto_retrain.py --model both --clean-shop --target 10000
 """
 
 import os
@@ -27,7 +27,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 APPDATA_MOD_DIR = Path(os.path.expandvars(r"%APPDATA%\Balatro\Mods\gamestate_dataset_cv"))
 REPO_MOD_DIR = ROOT_DIR / "balatro_mod"

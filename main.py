@@ -10,7 +10,7 @@ import cv2
 from tqdm import tqdm
 
 from config import Config, configure_logging, get_config
-from debug_plotter import plot
+from tools.debug_plotter import plot
 from eval_template import eval, format_timestamp
 from frame import iter_video_frames
 from template import template_loader
