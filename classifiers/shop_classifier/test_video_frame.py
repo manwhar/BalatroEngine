@@ -278,7 +278,7 @@ def main():
     parser.add_argument("--image", type=Path, default=None, help="Path to screenshot image")
     parser.add_argument("--already-cropped", action="store_true", help="Set if image is already cropped to single shop shelf")
     parser.add_argument("--mode", type=str, default="shop", choices=["shop", "pack"], help="Shop screen mode (default: shop)")
-    parser.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.80, help="Detection confidence threshold")
     parser.add_argument("--detector-weights", type=Path, default=None, help="Custom detector .pt path")
     parser.add_argument("--classifier-weights", type=Path, default=None, help="Custom classifier .pt path")
     parser.add_argument("--output", type=Path, default=None, help="Output diagnosis image path")

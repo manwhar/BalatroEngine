@@ -208,7 +208,7 @@ def _get_shelves_for_mode(mode: str) -> list[str]:
 def recognize_shop(
     video_frame: Any,
     mode: str = "shop",
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.80,
     device: str | None = None
 ) -> ShopRecognitionOutput:
     """Evaluates all relevant shelves on a shop, pack, or HUD frame (boxes returned in full-frame pixels)."""
@@ -355,7 +355,7 @@ def batch_recognize_hands(
 def batch_recognize_shops(
     frames: Sequence[Any],
     mode: str = "shop",
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.80,
     batch_size: int = 32,
     device: str | None = None
 ) -> list[ShopRecognitionOutput]:
@@ -543,7 +543,7 @@ def process_frames_iterator(
         for f in frames_iterator:
             yield recognize_hand_cards(f, conf_threshold=thresh)
     elif target == "shop":
-        thresh = conf_threshold if conf_threshold is not None else 0.35
+        thresh = conf_threshold if conf_threshold is not None else 0.80
         for f in frames_iterator:
             yield recognize_shop(f, mode=mode, conf_threshold=thresh)
     else:

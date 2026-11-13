@@ -1,13 +1,13 @@
 {
   "_notes": [
     "Add real 1920x1080 (or 16:9) Balatro screenshot entries under each list below.",
-    "Only list actual files you place in testing/real_image_fixtures/{hand,shop,pack,joker_bar}/.",
+    "Place screenshot files in testing/real_image_fixtures/images/ and reference them as 'images/<filename>'.",
     "Within each expected card dict, omitted fields are ignored so you can annotate as little or as much detail as you want."
   ],
   "schema_examples_reference_only": {
     "hand": [
       {
-        "image": "hand/blind_hand_01.png",
+        "image": "images/blind_hand_01.png",
         "cards": [
           {
             "rank": "Ace",
@@ -24,7 +24,7 @@
     ],
     "shop": [
       {
-        "image": "shop/shop_01.png",
+        "image": "images/shop_01.png",
         "shop_cards": [
           {"type": "Joker", "name": "Blueprint", "edition": "none", "eternal": false, "perishable": false, "rental": false},
           {"type": "Tarot", "name": "The Fool", "edition": "none"}
@@ -45,7 +45,7 @@
     ],
     "pack": [
       {
-        "image": "pack/arcana_pack_01.png",
+        "image": "images/arcana_pack_01.png",
         "cards": [
           {"type": "Tarot", "name": "The Hermit"},
           {"type": "Tarot", "name": "Death"}
@@ -54,7 +54,7 @@
     ],
     "joker_bar": [
       {
-        "image": "joker_bar/select_blind_01.png",
+        "image": "images/select_blind_01.png",
         "location": "select",
         "round_won": false,
         "jokers": [
@@ -64,8 +64,143 @@
       }
     ]
   },
-  "hand": [],
-  "shop": [],
-  "pack": [],
-  "joker_bar": []
+  "hand": [
+      {
+        "image": "images/blind_1.png",
+        "cards": [
+          {
+            "rank": "Ace",
+            "suit": "Hearts",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "King",
+            "suit": "Spades",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "King",
+            "suit": "Hearts",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "King",
+            "suit": "Clubs",
+            "enhancement": "Gold",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "Jack",
+            "suit": "Spades",
+            "enhancement": "Lucky",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "Jack",
+            "suit": "Hearts",
+            "enhancement": "Lucky",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "7",
+            "suit": "Hearts",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          },
+          {
+            "rank": "4",
+            "suit": "Spades",
+            "enhancement": "none",
+            "edition": "none",
+            "seal": "none",
+            "selected": false,
+            "debuffed": false,
+            "facing_back": false
+          }
+        ]
+      }
+    ],
+  "shop": [
+    {
+        "image": "images/shop_1.png",
+        "shop_cards": [
+          {"type": "Planet", "name": "Neptune"},
+          {"type": "Joker", "name": "Chaos the Clown", "rental": true}
+        ],
+        "vouchers": [],
+        "packs": [
+          {"booster_type": "Arcana", "size": "Regular"},
+          {"booster_type": "Arcana", "size": "Jumbo"}
+        ],
+        "joker_bar": [
+          {"type": "Joker", "name": "Half Joker", "edition": "none", "eternal": true},
+          {"type": "Joker", "name": "Lucky Cat", "edition": "none", "eternal": true},
+          {"type": "Joker", "name": "Acrobat", "edition": "none", "eternal": true},
+          {"type": "Joker", "name": "Blueprint", "edition": "none"},
+          {"type": "Joker", "name": "Hanging Chad", "edition": "none", "eternal": true},
+          {"type": "Joker", "name": "Diet Cola", "edition": "none"},
+          {"type": "Joker", "name": "To-Do List", "edition": "Negative", "perishable": true}
+        ],
+        "consumables": [
+          {"type": "Tarot", "name": "The Sun"},
+          {"type": "Tarot", "name": "The Hierophant"}
+        ]
+      }
+    ],
+  "pack": [
+    {
+        "image": "images/pack_1.png",
+        "cards": [
+          {"type": "Tarot", "name": "Temperance"},
+          {"type": "Tarot", "name": "Strength"},
+          {"type": "Tarot", "name": "Death"},
+          {"type": "Tarot", "name": "The Emperor"},
+          {"type": "Tarot", "name": "The Sun"}
+        ]
+      }
+    ],
+  "joker_bar": [
+      {
+        "image": "images/blind_1.png",
+        "jokers": [
+          {"name": "Gros Michel", "edition": "none", "perishable": true},
+          {"name": "Half Joker", "edition": "none", "eternal": true},
+          {"name": "Lucky Cat", "edition": "none", "eternal": true},
+          {"name": "Acrobat", "edition": "none", "eternal": true},
+          {"name": "Cloud 9", "edition": "none", "perishable": true},
+          {"name": "Ice Cream", "edition": "none", "rental": true}
+        ]
+      }
+    ]
 }

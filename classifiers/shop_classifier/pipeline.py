@@ -138,7 +138,7 @@ class ShopRecognitionPipeline:
             6: "PlayingCard"
         }
 
-    def predict(self, image_input, conf_threshold=0.35, iou_threshold=0.45) -> list[ShopItemResult]:
+    def predict(self, image_input, conf_threshold=0.80, iou_threshold=0.45) -> list[ShopItemResult]:
         """
         Runs full two-stage inference on an ROI crop or screenshot.
         Args:

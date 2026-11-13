@@ -693,7 +693,7 @@ def cv_detect_hand_cards(
 def cv_detect_shop_cards(
     state_or_frame: Any,
     frame_or_state: Any = None,
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.80,
     device: str | None = None,
 ) -> ShopCardsResult:
     """Evaluates the shop ROI for cards, vouchers, and booster packs from the video frame.
@@ -749,7 +749,7 @@ def cv_detect_shop_cards(
 def cv_detect_pack_cards(
     state_or_frame: Any,
     frame_or_state: Any = None,
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.80,
     device: str | None = None,
 ) -> list[Any]:
     """Evaluates the open booster pack ROI for pack offerings from the video frame.
@@ -789,7 +789,7 @@ def cv_detect_pack_cards(
 def cv_detect_joker_bar(
     state_or_frame: Any,
     frame_or_state: Any = None,
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.80,
     device: str | None = None,
 ) -> list[Joker]:
     """Evaluates the top Joker bar ROI from the video frame on any active gameplay screen.

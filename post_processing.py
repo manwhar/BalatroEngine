@@ -780,7 +780,7 @@ def build_run_trajectory(
     stake: Stake = Stake.WHITE,
     fps: float | None = None,
     conf_threshold_hand: float = 0.50,
-    conf_threshold_shop: float = 0.35,
+    conf_threshold_shop: float = 0.80,
     batch_size: int = 32,
     device: str | None = None,
     deduplicate: bool = True,
