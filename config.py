@@ -1,10 +1,16 @@
 import argparse
+from dataclasses import dataclass, field
 import logging
-from dataclasses import dataclass
+import os
 
 import cv2
 
 from geometry import ImageSize
+
+
+def _default_max_workers() -> int:
+    # Match physical core count to avoid SMT/GIL contention with the NVDEC reader thread.
+    return max(1, min(8, (os.cpu_count() or 8) // 2))
 
 
 @dataclass
@@ -26,6 +32,11 @@ class Config:
 
     start_timestamp: float | None = 0
     end_timestamp: float | None = 100
+
+    use_hwaccel: bool = True
+    coarse_to_fine: bool = True
+    coarse_margin: float = 0.04
+    max_workers: int = field(default_factory=_default_max_workers)
 
     debug_plot: bool = False
     setup_mode: bool = False
@@ -55,6 +66,20 @@ def get_config() -> Config:
     )
     parser.add_argument("--skip-frames", type=int, default=default_cfg.skip_frames)
     parser.add_argument(
+        "--use-hwaccel",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.use_hwaccel,
+    )
+    parser.add_argument(
+        "--coarse-to-fine",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.coarse_to_fine,
+    )
+    parser.add_argument(
+        "--coarse-margin", type=float, default=default_cfg.coarse_margin
+    )
+    parser.add_argument("--max-workers", type=int, default=default_cfg.max_workers)
+    parser.add_argument(
         "--debug-plot",
         action=argparse.BooleanOptionalAction,
         default=default_cfg.debug_plot,
@@ -80,6 +105,10 @@ def get_config() -> Config:
         start_timestamp=args.start_timestamp,
         end_timestamp=args.end_timestamp,
         skip_frames=args.skip_frames,
+        use_hwaccel=args.use_hwaccel,
+        coarse_to_fine=args.coarse_to_fine,
+        coarse_margin=args.coarse_margin,
+        max_workers=max(1, int(args.max_workers)),
         debug_plot=args.debug_plot,
         setup_mode=args.setup_mode,
         run_benchmark=args.run_benchmark,

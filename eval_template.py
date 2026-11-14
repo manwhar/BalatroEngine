@@ -5,7 +5,6 @@ Evaluates a given template for a given frame.
 import json
 import logging
 from dataclasses import dataclass
-from itertools import product
 
 import cv2
 import cv2.mat_wrapper
@@ -13,7 +12,7 @@ import cv2.mat_wrapper
 from config import Config
 from tools.debug_plotter import plot
 from geometry import PixelROI, crop_image_to_roi
-from matcher import TemplateMatch, find_element
+from matcher import TemplateMatch, find_element, find_element_coarse_to_fine
 from shadow_evaluator import analyze_shadow_presence
 from template import Template
 
@@ -46,60 +45,62 @@ def eval(
     img_gray: cv2.mat_wrapper.Mat,
     config: Config,
     video_timestamp_str: str = "",
+    img_gray_half: cv2.mat_wrapper.Mat | None = None,
 ) -> EvaluationResult:
     if img is None or img_gray is None:
         raise ValueError("Got None for image")
 
-    from geometry import ImageSize
+    img_h, img_w = img.shape[:2]
+    should_plot = config.debug_plot or (config.setup_mode and not template.adjusted)
+    use_coarse = config.coarse_to_fine and not should_plot
 
-    for (image, image_gray, mask), px_roi in product(
-        zip(template.images, template.images_gray, template.masks), template.px_rois
-    ):
-        h_inp, w_inp = image.shape[:2]
-
-        img_h, img_w = img.shape[:2]
-        expanded_x1, expanded_y1, expanded_x2, expanded_y2 = px_roi.expanded_bounds(
-            config.expand_roi_factor
+    if use_coarse and img_gray_half is None and img_w >= 16 and img_h >= 16:
+        img_gray_half = cv2.resize(
+            img_gray, (img_w // 2, img_h // 2), interpolation=cv2.INTER_NEAREST
         )
 
-        y1, y2 = max(0, expanded_y1), min(img_h, expanded_y2)
-        x1, x2 = max(0, expanded_x1), min(img_w, expanded_x2)
+    debug_enabled = logger.isEnabledFor(logging.DEBUG)
+    info_enabled = logger.isEnabledFor(logging.INFO)
+    specs = template.get_compiled_specs(img_w, img_h, config.expand_roi_factor)
 
-        # ensure roi is large enough for template
-        if (y2 - y1) < h_inp:
-            diff = h_inp - (y2 - y1)
-            y1 = max(0, y1 - diff // 2)
-            y2 = y1 + h_inp
-            if y2 > img_h:
-                y2 = img_h
-                y1 = max(0, y2 - h_inp)
-        if (x2 - x1) < w_inp:
-            diff = w_inp - (x2 - x1)
-            x1 = max(0, x1 - diff // 2)
-            x2 = x1 + w_inp
-            if x2 > img_w:
-                x2 = img_w
-                x1 = max(0, x2 - w_inp)
-
-        if (y2 - y1) < h_inp or (x2 - x1) < w_inp:
-            logger.warning("ROI is too small and cannot be expanded!")
-            continue
+    for spec in specs:
+        w_inp = spec.template_size.width
+        h_inp = spec.template_size.height
+        x1, y1, x2, y2 = spec.x1, spec.y1, spec.x2, spec.y2
 
         roi_img_gray = img_gray[y1:y2, x1:x2]
         roi_img = img[y1:y2, x1:x2]
 
-        match = find_element(
-            roi_img_gray,
-            image_gray,
-            mask,
-            roi_img,
-            image[:, :, :3],
-            ImageSize(width=w_inp, height=h_inp),
-            config.matching_method,
-            px_roi,
-            config.elem_conf_thresh,
-        )
-        top_left = (match.top_left[0] + x1, match.top_left[1] + y1)
+        if use_coarse and spec.can_coarse and img_gray_half is not None:
+            match, (dx, dy) = find_element_coarse_to_fine(
+                roi_img_gray,
+                roi_img,
+                spec.image_gray,
+                spec.image_bgr,
+                spec.mask,
+                img_gray_half[spec.hy1:spec.hy2, spec.hx1:spec.hx2],
+                spec.image_gray_half,
+                spec.mask_half,
+                spec.template_size,
+                config.matching_method,
+                spec.px_roi,
+                config.elem_conf_thresh,
+                coarse_margin=config.coarse_margin,
+            )
+            top_left = (match.top_left[0] + x1 + dx, match.top_left[1] + y1 + dy)
+        else:
+            match = find_element(
+                roi_img_gray,
+                spec.image_gray,
+                spec.mask,
+                roi_img,
+                spec.image_bgr,
+                spec.template_size,
+                config.matching_method,
+                spec.px_roi,
+                config.elem_conf_thresh,
+            )
+            top_left = (match.top_left[0] + x1, match.top_left[1] + y1)
 
         if match.found:
             bottom_left = (top_left[0], top_left[1] + h_inp)
@@ -122,20 +123,21 @@ def eval(
             )
             clicked = not has_shadow
 
-            logger.info(
-                f"FOUND {template.name} at {top_left} with confidence of {match.confidence:.4f}; Clicked={clicked}"
-            )
+            if info_enabled:
+                logger.info(
+                    f"FOUND {template.name} at {top_left} with confidence of {match.confidence:.4f}; Clicked={clicked}"
+                )
         else:
-            logger.debug(
-                f"Did not find {template.name} in ROI; highest confidence of {match.confidence:.4f}"
-            )
+            if debug_enabled:
+                logger.debug(
+                    f"Did not find {template.name} in ROI; highest confidence of {match.confidence:.4f}"
+                )
             clicked = False
 
-        should_plot = config.debug_plot or (config.setup_mode and not template.adjusted)
         if should_plot and match.found:
             plot_kwargs = {
                 "img": img,
-                "template": image,
+                "template": spec.image_bgr,
                 "roi": (x1, y1, x2, y2),
                 "found_target": match.found,
                 "match": match.score_map,
@@ -182,7 +184,7 @@ def eval(
                 found=True,
                 match=match,
                 clicked=clicked,
-                template_filename=None,  # not implemented rn, maybe will later
+                template_filename=None,
                 box=(top_left[0], top_left[1], top_left[0] + w_inp, top_left[1] + h_inp),
             )
 

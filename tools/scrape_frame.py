@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -10,10 +11,29 @@ except ImportError:
 
 
 # Edit these values before running this script.
-VIDEO_URL = "https://www.youtube.com/watch?v=_ZuzKjGVRPs"
-DOWNLOAD_VIDEO = True
-VIDEO_FILENAME = r"assets\sample_inputs\videos\bu_magic_deck_11-13-26"
+# Dictionary of {Filename: URL} to download sequentially.
+# The .mp4 extension will be added automatically if omitted.
+VIDEOS_TO_DOWNLOAD = {
+    "bu_erratic_deck_11-11-26": "https://www.youtube.com/watch?v=0kX6s4QM-EE",
+    "bu_anaglyph_deck_11-10-26": "https://www.youtube.com/watch?v=KAqHsU2t_f8",
+    "bu_magic_deck_11-9-26": "https://www.youtube.com/watch?v=J-O0iYtULa4",
+    "bu_erratic_deck_11-5-26": "https://www.youtube.com/watch?v=88TnVBTs8HE",
+    "bu_anaglyph_deck_10-31-26": "https://www.youtube.com/watch?v=0DcMgXRUDj8",
+    "bu_erratic_deck_10-29-26": "https://www.youtube.com/watch?v=OdMPYOtOlBE",
+    "bu_magic_deck_11-6-26": "https://www.youtube.com/watch?v=Gn-QP_dwV9w",
+    "bu_anaglyph_deck_11-7-26": "https://www.youtube.com/watch?v=XSKyU4GM8js",
+}
+
+# Download settings
+DOWNLOAD_VIDEOS = True
+DOWNLOAD_VIDEO = DOWNLOAD_VIDEOS  # Alias for backward compatibility
+DELAY_BETWEEN_DOWNLOADS = (
+    2.0  # Seconds to wait between downloads to avoid rate limiting
+)
+
+# Frame scraping settings (if needed)
 DOWNLOAD_FRAME = False
+FRAME_VIDEO_URL = "https://www.youtube.com/watch?v=FyVXc7DaeqE"
 FRAME_TIMESTAMP = "00:01:23.500"
 FRAME_FILENAME = "scraped_frame.jpg"
 
@@ -51,18 +71,59 @@ def get_1080p_stream(video_url: str) -> str:
 def download_video(video_url: str, output_path: Path) -> None:
     """Download the complete video and merge separate audio/video streams."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Avoid duplicate extensions if already provided in output_path
+    stem_path = (
+        output_path.with_suffix("")
+        if output_path.suffix.lower() == ".mp4"
+        else output_path
+    )
+    outtmpl = f"{stem_path}.%(ext)s"
+
     ydl_opts = {
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "outtmpl": str(output_path),
+        "outtmpl": outtmpl,
     }
 
-    print(f"Downloading video to: {output_path}")
+    print(f"Downloading video to: {stem_path}.mp4")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
     except yt_dlp.utils.DownloadError as e:
         raise ValueError(f"Failed to download video: {e}") from e
+
+
+def download_all_videos(
+    videos: dict[str, str],
+    output_dir: Path,
+    delay_seconds: float = 2.0,
+) -> None:
+    """Sequentially downloads multiple videos to avoid rate limiting and network saturation."""
+    if not videos:
+        print("No videos specified in VIDEOS_TO_DOWNLOAD.")
+        return
+
+    total = len(videos)
+    print(f"Starting sequential download of {total} video(s)...")
+
+    for idx, (filename, url) in enumerate(videos.items(), start=1):
+        print(f"\n[{idx}/{total}] Target: {filename} -> {url}")
+        output_path = output_dir / filename
+        try:
+            download_video(url, output_path)
+            print(f"[{idx}/{total}] Successfully processed '{filename}'")
+        except Exception as e:
+            print(
+                f"[{idx}/{total}] Error downloading '{filename}': {e}", file=sys.stderr
+            )
+
+        # Sleep briefly between downloads to avoid YouTube rate limiting (HTTP 429)
+        if idx < total and delay_seconds > 0:
+            print(
+                f"Waiting {delay_seconds}s before next download to avoid rate limits..."
+            )
+            time.sleep(delay_seconds)
 
 
 def grab_frame(video_url: str, timestamp: str, output_path: Path) -> None:
@@ -107,15 +168,16 @@ def grab_frame(video_url: str, timestamp: str, output_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    if not VIDEO_URL:
-        raise ValueError("Set VIDEO_URL before running scrape_frame.py")
-
-    if DOWNLOAD_VIDEO:
-        download_video(VIDEO_URL, VIDEO_OUTPUT_DIR / VIDEO_FILENAME)
+    if DOWNLOAD_VIDEOS or DOWNLOAD_VIDEO:
+        download_all_videos(
+            VIDEOS_TO_DOWNLOAD,
+            VIDEO_OUTPUT_DIR,
+            delay_seconds=DELAY_BETWEEN_DOWNLOADS,
+        )
 
     if DOWNLOAD_FRAME:
         grab_frame(
-            VIDEO_URL,
+            FRAME_VIDEO_URL,
             FRAME_TIMESTAMP,
             FRAME_OUTPUT_DIR / FRAME_FILENAME,
         )

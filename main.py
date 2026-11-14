@@ -5,7 +5,10 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
+import threading
 import time
+from typing import Any, Sequence
 
 import cv2
 from tqdm import tqdm
@@ -55,91 +58,129 @@ def get_expected_frame_count(config: Config) -> int | None:
     return math.ceil(frame_span / step)
 
 
-if __name__ == "__main__":
-    configure_logging()
-
-    logger = logging.getLogger(__name__)
-
-    config = get_config()
-    templates = template_loader(
-        config.template_json_path,
-        config.template_img_dir,
-        config.resolution,
+def _process_frame(
+    video_frame: Any,
+    active_templates: Sequence[Any],
+    template_key: dict[str, int],
+    config: Config,
+    logger: logging.Logger,
+) -> tuple[int, list, dict[str, float], dict | None, str | None]:
+    frame_idx = video_frame.index
+    need_ts = config.debug_plot or config.setup_mode
+    ts_str = (
+        format_timestamp(video_frame.timestamp_seconds, frame_idx)
+        if need_ts
+        else ""
     )
-    template_key = {template.name: i for i, template in enumerate(templates)}
-    # Starting mid-run is out of scope: screen gating begins in PRE_GAME.
-    screen_tracker = ScreenStateTracker()
 
-    def process_frame(
-        video_frame, active_templates
-    ) -> tuple[int, list, dict[str, float], dict | None, str | None]:
-        frame_idx = video_frame.index
-        ts_str = format_timestamp(video_frame.timestamp_seconds, frame_idx)
-
+    if logger.isEnabledFor(logging.INFO):
         logger.info(f"Processing frame {frame_idx}...")
 
-        t0 = time.perf_counter()
-        img_gray = cv2.cvtColor(video_frame.image, cv2.COLOR_BGR2GRAY)
-        t1 = time.perf_counter()
+    t0 = time.perf_counter()
+    img_gray = cv2.cvtColor(video_frame.image, cv2.COLOR_BGR2GRAY)
+    img_gray_half = (
+        cv2.resize(
+            img_gray,
+            (img_gray.shape[1] // 2, img_gray.shape[0] // 2),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        if config.coarse_to_fine and not need_ts
+        else None
+    )
+    t1 = time.perf_counter()
 
-        matches = []
-        template_clicked = None
-        clicked_name = None
-        for template in active_templates:
-            result = eval(
-                template,
-                video_frame.image,
-                img_gray,
-                config,
-                video_timestamp_str=ts_str,
-            )
-            if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
-                matches.append((template, result.plot_kwargs))
-            if result.found and result.clicked:
-                clicked_name = result.template_name
-                template_clicked = {
-                    "action": template_key[result.template_name],
-                    "box": list(result.box) if result.box is not None else None,
-                }
-                break  # only one template can be clicked in a given frame
-        t2 = time.perf_counter()
+    matches = []
+    template_clicked = None
+    clicked_name = None
+    for template in active_templates:
+        result = eval(
+            template,
+            video_frame.image,
+            img_gray,
+            config,
+            video_timestamp_str=ts_str,
+            img_gray_half=img_gray_half,
+        )
+        if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
+            matches.append((template, result.plot_kwargs))
+        if result.found and result.clicked:
+            clicked_name = result.template_name
+            template_clicked = {
+                "action": template_key[result.template_name],
+                "box": list(result.box) if result.box is not None else None,
+            }
+            break  # only one template can be clicked in a given frame
+    t2 = time.perf_counter()
 
-        metrics = {
-            "grayscale_time": t1 - t0,
-            "eval_time": t2 - t1,
-        }
-        return frame_idx, matches, metrics, template_clicked, clicked_name
+    metrics = {
+        "grayscale_time": t1 - t0,
+        "eval_time": t2 - t1,
+    }
+    return frame_idx, matches, metrics, template_clicked, clicked_name
 
-    def chunked_iterable(iterable, size):
-        it = iter(iterable)
-        while True:
-            chunk = tuple(itertools.islice(it, size))
-            if not chunk:
-                break
-            yield chunk
 
-    def prefetch_generator(iterable, prefetch=64):
-        import queue
-        import threading
+def _chunked_iterable(iterable, size: int):
+    it = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(it, size))
+        if not chunk:
+            break
+        yield chunk
 
-        q = queue.Queue(maxsize=prefetch)
-        sentinel = object()
 
-        def producer():
-            try:
-                for item in iterable:
-                    q.put(item)
-            finally:
-                q.put(sentinel)
+def _prefetch_generator(iterable, prefetch: int = 64):
+    q = queue.Queue(maxsize=prefetch)
+    sentinel = object()
+    producer_exc: list[BaseException | None] = [None]
 
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
+    def producer():
+        try:
+            for item in iterable:
+                q.put(item)
+        except BaseException as exc:
+            producer_exc[0] = exc
+        finally:
+            q.put(sentinel)
 
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            yield item
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+
+    while True:
+        item = q.get()
+        if item is sentinel:
+            if producer_exc[0] is not None:
+                raise producer_exc[0]
+            break
+        yield item
+
+
+def detect_video_actions(
+    config: Config,
+    *,
+    write_output: bool = True,
+    output_json_path: str | None = None,
+    templates: Sequence[Any] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+    progress_desc: str = "Processing video",
+) -> tuple[dict[str, Any], str | None]:
+    """Runs first-pass template action detection on `config.input_video_path`.
+
+    Returns `(output_payload, written_json_path)` where `output_payload` always
+    contains `"key"` and `"frames"` (plus `"meta"` when `extra_metadata` is supplied).
+    """
+    logger = logging.getLogger(__name__)
+    loaded_templates = (
+        list(templates)
+        if templates is not None
+        else template_loader(
+            config.template_json_path,
+            config.template_img_dir,
+            config.resolution,
+        )
+    )
+    template_key = {template.name: i for i, template in enumerate(loaded_templates)}
+    # Starting mid-run is out of scope: screen gating begins in PRE_GAME.
+    screen_tracker = ScreenStateTracker()
 
     raw_frames = iter_video_frames(
         config.input_video_path,
@@ -147,6 +188,7 @@ if __name__ == "__main__":
         config.skip_frames,
         start_timestamp_seconds=config.start_timestamp,
         end_timestamp_seconds=config.end_timestamp,
+        use_hwaccel=config.use_hwaccel,
     )
 
     video_extract_times = []
@@ -163,7 +205,7 @@ if __name__ == "__main__":
                 video_extract_times.append(t1 - t0)
             yield frame
 
-    prefetched_frames = prefetch_generator(raw_frames, prefetch=128)
+    prefetched_frames = _prefetch_generator(raw_frames, prefetch=128)
     frames = timed_frames(prefetched_frames)
 
     start = time.perf_counter()
@@ -172,15 +214,16 @@ if __name__ == "__main__":
     total_eval_time = 0.0
 
     num_workers = 1
-
-    action_frames = {}
+    action_frames: dict[int, dict[str, Any]] = {}
 
     if config.debug_plot or config.setup_mode:
         # Sequential processing to ensure safe UI/Plotting on the main thread
         for video_frame in frames:
-            active_templates = screen_tracker.filter_templates(templates)
-            frame_idx, matches, metrics, template_clicked, clicked_name = process_frame(
-                video_frame, active_templates
+            active_templates = screen_tracker.filter_templates(loaded_templates)
+            frame_idx, matches, metrics, template_clicked, clicked_name = (
+                _process_frame(
+                    video_frame, active_templates, template_key, config, logger
+                )
             )
             if template_clicked is not None and clicked_name is not None:
                 action_frames[frame_idx] = template_clicked
@@ -219,19 +262,23 @@ if __name__ == "__main__":
     else:
         # Chunked multithreaded processing for CPU maximum speed (avoids OOM on large videos)
         total_frames = get_expected_frame_count(config)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.max_workers
+        ) as executor:
             num_workers = executor._max_workers
             with tqdm(
-                total=total_frames, desc="Processing video", unit="frame"
+                total=total_frames, desc=progress_desc, unit="frame"
             ) as pbar:
-                for chunk in chunked_iterable(frames, 64):
+                for chunk in _chunked_iterable(frames, 64):
                     pending = list(chunk)
                     while pending:
-                        active_templates = screen_tracker.filter_templates(templates)
+                        active_templates = screen_tracker.filter_templates(
+                            loaded_templates
+                        )
                         chunk_outputs = list(
                             executor.map(
-                                lambda vf, tmpls=active_templates: process_frame(
-                                    vf, tmpls
+                                lambda vf, tmpls=active_templates: _process_frame(
+                                    vf, tmpls, template_key, config, logger
                                 ),
                                 pending,
                             )
@@ -270,7 +317,15 @@ if __name__ == "__main__":
                         else:
                             pending = []
 
+    output_payload: dict[str, Any] = {
+        "key": template_key,
+        "frames": action_frames,
+    }
+    if extra_metadata is not None:
+        output_payload["meta"] = extra_metadata
+
     num_frames = len(results)
+    out_path: str | None = None
     if num_frames > 0:
         elapsed = time.perf_counter() - start
         avg_wall_time = elapsed / num_frames
@@ -293,14 +348,17 @@ if __name__ == "__main__":
             print(f"Other (Overhead):   {wall_other:.5f}s ({pct_other:4.1f}%)")
             print("-----------------------------------------------------------")
 
-        out_path = build_output_json_path(config.output_dir, config.input_video_path)
+        if write_output:
+            out_path = output_json_path or build_output_json_path(
+                config.output_dir, config.input_video_path
+            )
+            os.makedirs(Path(out_path).parent, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(output_payload, f, indent=2)
 
-        output_payload = {
-            "key": template_key,
-            "frames": action_frames,
-        }
+    return output_payload, out_path
 
-        os.makedirs(config.output_dir, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(output_payload, f, indent=2)
-            f.close()
+
+if __name__ == "__main__":
+    configure_logging()
+    detect_video_actions(get_config())

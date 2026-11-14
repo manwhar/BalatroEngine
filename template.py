@@ -1,10 +1,39 @@
+from dataclasses import dataclass, field
+from itertools import product
 import json
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+import logging
+from typing import Any
 
 import cv2
 from cv2.typing import MatLike
+import numpy as np
+
 from geometry import ImageSize, NormalizedROI, PixelROI
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledTemplateSpec:
+    """Precomputed contiguous buffers & clamped ROI slices for one variant x ROI."""
+
+    image_bgr: MatLike
+    image_gray: MatLike
+    mask: MatLike | None
+    image_gray_half: MatLike
+    mask_half: MatLike | None
+    template_size: ImageSize
+    px_roi: PixelROI
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    hx1: int
+    hy1: int
+    hx2: int
+    hy2: int
+    can_coarse: bool
+
 
 @dataclass
 class Template:
@@ -19,6 +48,98 @@ class Template:
     shadow_dw: int
     shadow_dh: int
     adjusted: bool
+    _compiled_specs_cache: dict[tuple[int, int, float], tuple[CompiledTemplateSpec, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def get_compiled_specs(
+        self, img_w: int, img_h: int, expand_roi_factor: float
+    ) -> tuple[CompiledTemplateSpec, ...]:
+        """Returns cached static ROI bounds & contiguous template slices for `(img_w, img_h)`."""
+        key = (img_w, img_h, round(expand_roi_factor, 4))
+        cached = self._compiled_specs_cache.get(key)
+        if cached is not None:
+            return cached
+
+        specs: list[CompiledTemplateSpec] = []
+        half_w = img_w // 2
+        half_h = img_h // 2
+
+        for (image, image_gray, mask), px_roi in product(
+            zip(self.images, self.images_gray, self.masks), self.px_rois
+        ):
+            h_inp, w_inp = image.shape[:2]
+            ex1, ey1, ex2, ey2 = px_roi.expanded_bounds(expand_roi_factor)
+
+            y1, y2 = max(0, ey1), min(img_h, ey2)
+            x1, x2 = max(0, ex1), min(img_w, ex2)
+
+            if (y2 - y1) < h_inp:
+                diff = h_inp - (y2 - y1)
+                y1 = max(0, y1 - diff // 2)
+                y2 = y1 + h_inp
+                if y2 > img_h:
+                    y2 = img_h
+                    y1 = max(0, y2 - h_inp)
+            if (x2 - x1) < w_inp:
+                diff = w_inp - (x2 - x1)
+                x1 = max(0, x1 - diff // 2)
+                x2 = x1 + w_inp
+                if x2 > img_w:
+                    x2 = img_w
+                    x1 = max(0, x2 - w_inp)
+
+            if (y2 - y1) < h_inp or (x2 - x1) < w_inp:
+                logger.warning("ROI is too small and cannot be expanded!")
+                continue
+
+            # Align full-res ROI start down to an even pixel so half-res coordinates map exactly by 2x.
+            x1 &= ~1
+            y1 &= ~1
+            hx1 = x1 // 2
+            hy1 = y1 // 2
+            hx2 = min(half_w, (x2 + 1) // 2)
+            hy2 = min(half_h, (y2 + 1) // 2)
+
+            im_bgr = np.ascontiguousarray(image[:, :, :3])
+            im_gray = np.ascontiguousarray(image_gray)
+            im_mask = np.ascontiguousarray(mask) if mask is not None else None
+            im_gray_half = np.ascontiguousarray(im_gray[::2, ::2])
+            im_mask_half = (
+                np.ascontiguousarray(im_mask[::2, ::2]) if im_mask is not None else None
+            )
+
+            can_coarse = (
+                im_gray_half.shape[0] >= 8
+                and im_gray_half.shape[1] >= 8
+                and (hy2 - hy1) >= im_gray_half.shape[0]
+                and (hx2 - hx1) >= im_gray_half.shape[1]
+            )
+
+            specs.append(
+                CompiledTemplateSpec(
+                    image_bgr=im_bgr,
+                    image_gray=im_gray,
+                    mask=im_mask,
+                    image_gray_half=im_gray_half,
+                    mask_half=im_mask_half,
+                    template_size=ImageSize(width=w_inp, height=h_inp),
+                    px_roi=px_roi,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    hx1=hx1,
+                    hy1=hy1,
+                    hx2=hx2,
+                    hy2=hy2,
+                    can_coarse=can_coarse,
+                )
+            )
+
+        compiled = tuple(specs)
+        self._compiled_specs_cache[key] = compiled
+        return compiled
 
 
 def template_loader(
