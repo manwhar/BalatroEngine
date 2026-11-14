@@ -36,7 +36,7 @@ In `balatro_source/game.lua:2489-2498` and `2617-2634`:
 From `common_events.lua:6-7` (`G.play.T.x = G.hand.T.x + (G.hand.T.w - G.play.T.w)/2`, `G.play.T.y = G.hand.T.y - 3.6`) and `game.lua:2224-2227` (`play_W = 5.3*G.CARD_W`, `play_H = 0.95*G.CARD_H`), `G.play` sits directly in the vertical band between `joker_bar` and `card_hand` in `classifiers/inference.py:41-43`:
 - `joker_bar`: `y = 20.41 .. 280.38`
 - `card_hand`: `y = 567.84 .. 890.57`, `x = 508.32 .. 1579.38`
-- **Suggested `play_area` ROI (1920x1080 base)**: roughly `x ≈ 508..1579, y ≈ 280..568` (~`1071 x 288`, ~3.7:1 aspect ratio), calibrated precisely with the existing `balatro_mod` ROI tool and scaled via `scale_roi_pixels` (`classifiers/common/video_utils.py`).
+- **Calibrated `play_area` ROI (1920x1080 base)**: `x = 518.702717, y = 421.037276, w = 1034.463019, h = 287.461606` (~`1034 x 287`, ~3.60:1 aspect ratio, spanning `x ≈ 519..1553, y ≈ 421..708`), calibrated with the `balatro_mod` ROI tool and scaled via `scale_roi_pixels` (`classifiers/common/video_utils.py`).
 - This keeps `G.hand` triggers below out of the crop, avoids the right-side overlay zone (`x > 1600`), retains enough headroom for scoring popups, and clearly observes `G.round_eval` sliding over the center when Cash Out appears.
 
 ### Why Whole-Clip Fractional Position Regression Is Fragile

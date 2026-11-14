@@ -135,6 +135,7 @@ def is_action_clickable_in_gamestate(state: GameState, template_name: str) -> bo
         return state.location in (
             Location.SELECT,
             Location.BLIND,
+            Location.CASH_OUT,
             Location.SHOP,
             Location.PACK,
         )

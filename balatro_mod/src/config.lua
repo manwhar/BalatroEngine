@@ -3,9 +3,11 @@
 local Config = {}
 
 local DEFAULT_CONFIG = {
-    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier'
+    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier'
     calibration_mode = 'setup', -- 'setup' or 'generation'
     max_frames = 20000,
+    max_clips = 1000, -- Target clip count cap for end_round_classifier
+    end_round_frames_per_tick = 2, -- 15fps clip frames simulated per LÖVE tick (2 ~= 8x realtime @ 60Hz)
     frames_per_phase = 100, -- 100 shop screens, then 100 pack screens
     perkeo_max_consumables = 10, -- Max consumables in perkeo mode (configurable)
     show_shop_prices = false, -- Synchronously render price labels below shop items (disabled for fast animation-free generation)
@@ -13,6 +15,7 @@ local DEFAULT_CONFIG = {
     frame_wait_time = 0.08, -- Seconds to wait between generation and capture
     rois = {
         card_hand    = {x = 508.319934,  y = 567.839093, w = 1071.056521, h = 322.734447},
+        play_area    = {x = 518.702717,  y = 421.037276, w = 1034.463019, h = 287.461606},
         joker_bar    = {x = 512.701385,  y = 20.409878,  w = 868.473724,  h = 259.967609},
         shop         = {x = 818.386186,  y = 369.181989, w = 720.772049,  h = 280.979925},
         voucher      = {x = 656.059547,  y = 714.459732, w = 360.743773,  h = 284.420985},
@@ -35,6 +38,8 @@ function Config.init(mod)
         mode = DEFAULT_CONFIG.mode,
         calibration_mode = DEFAULT_CONFIG.calibration_mode,
         max_frames = DEFAULT_CONFIG.max_frames,
+        max_clips = DEFAULT_CONFIG.max_clips,
+        end_round_frames_per_tick = DEFAULT_CONFIG.end_round_frames_per_tick,
         frames_per_phase = DEFAULT_CONFIG.frames_per_phase,
         perkeo_max_consumables = DEFAULT_CONFIG.perkeo_max_consumables,
         show_shop_prices = DEFAULT_CONFIG.show_shop_prices,
@@ -52,7 +57,7 @@ function Config.init(mod)
     end
 
     mod.selected_target = 'roi_joker_bar'
-    mod.frame_counts = {card = 0, shop = 0}
+    mod.frame_counts = {card = 0, shop = 0, end_round = 0}
 
     Config.init_directories()
     mod:load_config()
@@ -70,7 +75,8 @@ function Config.init_directories()
         "Mods/gamestate_dataset_cv/dataset_shop/labels",
         "Mods/gamestate_dataset_cv/dataset_card_crops",
         "Mods/gamestate_dataset_cv/dataset_card_crops/images",
-        "Mods/gamestate_dataset_cv/dataset_card_crops/labels"
+        "Mods/gamestate_dataset_cv/dataset_card_crops/labels",
+        "Mods/gamestate_dataset_cv/dataset_end_round",
     }
     for _, dir in ipairs(dirs) do
         love.filesystem.createDirectory(dir)
@@ -111,8 +117,34 @@ function Config.init_frame_counts(mod)
         end
     end
     mod.frame_counts.shop = max_shop_idx + 1
-    mod.frame_count = (mod.config.mode == 'shop_classifier') and mod.frame_counts.shop or mod.frame_counts.card
-    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d", mod.frame_counts.card, mod.frame_counts.shop))
+
+    -- 3. End-round dataset clip counter (ignore empty orphan clip directories)
+    local max_er_idx = -1
+    local er_dir = "Mods/gamestate_dataset_cv/dataset_end_round"
+    if love.filesystem.getInfo(er_dir) then
+        local items = love.filesystem.getDirectoryItems(er_dir)
+        for _, item in ipairs(items) do
+            local num = item:match("^clip_(%d+)$")
+            if num then
+                local clip_path = er_dir .. "/" .. item
+                local info = love.filesystem.getInfo(clip_path)
+                if info and info.type == "directory" and love.filesystem.getInfo(clip_path .. "/meta.json") then
+                    local n = tonumber(num)
+                    if n and n > max_er_idx then max_er_idx = n end
+                end
+            end
+        end
+    end
+    mod.frame_counts.end_round = max_er_idx + 1
+
+    if mod.config.mode == 'shop_classifier' then
+        mod.frame_count = mod.frame_counts.shop
+    elseif mod.config.mode == 'end_round_classifier' then
+        mod.frame_count = mod.frame_counts.end_round
+    else
+        mod.frame_count = mod.frame_counts.card
+    end
+    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d, EndRound Clips: %d", mod.frame_counts.card, mod.frame_counts.shop, mod.frame_counts.end_round))
 end
 
 function Config.init_classes(mod)
@@ -143,12 +175,33 @@ function Config.clear_all_dataset_data(mod)
         end
     end
 
+    local er_root = "Mods/gamestate_dataset_cv/dataset_end_round"
+    if love.filesystem.getInfo(er_root) then
+        for _, sub in ipairs(love.filesystem.getDirectoryItems(er_root)) do
+            local sub_path = er_root .. "/" .. sub
+            local info = love.filesystem.getInfo(sub_path)
+            if info and info.type == "directory" then
+                for _, f in ipairs(love.filesystem.getDirectoryItems(sub_path)) do
+                    if love.filesystem.remove(sub_path .. "/" .. f) then
+                        removed_count = removed_count + 1
+                    end
+                end
+                love.filesystem.remove(sub_path)
+            else
+                if love.filesystem.remove(sub_path) then
+                    removed_count = removed_count + 1
+                end
+            end
+        end
+    end
+
     mod.frame_counts = mod.frame_counts or {}
     mod.frame_counts.card = 0
     mod.frame_counts.shop = 0
+    mod.frame_counts.end_round = 0
     mod.frame_count = 0
     mod.phase_step = 0
-    mod.stats_text = string.format("Card Frames: 0  |  Shop Frames: 0  |  Phase: %s",
+    mod.stats_text = string.format("Card: 0  |  Shop: 0  |  EndRound Clips: 0  |  Phase: %s",
         string.upper(mod.shop_phase or 'shop'))
 
     print(string.format("DATASET: Cleared %d files from dataset directories.", removed_count))
@@ -164,6 +217,8 @@ function G.DATASET_MOD:save_config()
     content = content .. string.format("  mode = %q,\n", self.config.mode or 'off')
     content = content .. string.format("  calibration_mode = %q,\n", self.config.calibration_mode or 'setup')
     content = content .. string.format("  max_frames = %d,\n", self.config.max_frames or 20000)
+    content = content .. string.format("  max_clips = %d,\n", self.config.max_clips or 1000)
+    content = content .. string.format("  end_round_frames_per_tick = %d,\n", self.config.end_round_frames_per_tick or 2)
     content = content .. string.format("  frames_per_phase = %d,\n", self.config.frames_per_phase or 100)
     content = content .. string.format("  perkeo_max_consumables = %d,\n", self.config.perkeo_max_consumables or 10)
     content = content .. string.format("  show_shop_prices = %s,\n", self.config.show_shop_prices ~= false and "true" or "false")
@@ -198,6 +253,8 @@ function G.DATASET_MOD:load_config()
                 if t.mode then self.config.mode = t.mode end
                 if t.calibration_mode then self.config.calibration_mode = t.calibration_mode end
                 if t.max_frames then self.config.max_frames = tonumber(t.max_frames) or 20000 end
+                if t.max_clips then self.config.max_clips = tonumber(t.max_clips) or 1000 end
+                if t.end_round_frames_per_tick then self.config.end_round_frames_per_tick = tonumber(t.end_round_frames_per_tick) or 2 end
                 if t.frames_per_phase then self.config.frames_per_phase = tonumber(t.frames_per_phase) or 100 end
                 if t.perkeo_max_consumables then self.config.perkeo_max_consumables = tonumber(t.perkeo_max_consumables) or 10 end
                 if t.show_shop_prices ~= nil then self.config.show_shop_prices = (t.show_shop_prices == true) end
@@ -256,9 +313,15 @@ function G.DATASET_MOD:load_config()
 end
 
 function G.DATASET_MOD:set_mode(mode)
-    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'off' then
+    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'off' then
         if mode ~= 'shop_classifier' and self.restore_joker_display_config then
             self:restore_joker_display_config()
+        end
+        if mode ~= 'end_round_classifier' and self.EndRoundCapture then
+            if self._active_end_round_clip then
+                self.EndRoundCapture.stop(self)
+            end
+            self.EndRoundCapture.release_gpu_resources()
         end
         self.config.mode = mode
         if mode == 'card_classifier' then
@@ -267,6 +330,9 @@ function G.DATASET_MOD:set_mode(mode)
         elseif mode == 'shop_classifier' then
             self.selected_target = 'roi_joker_bar'
             self.frame_count = self.frame_counts.shop
+        elseif mode == 'end_round_classifier' then
+            self.selected_target = 'roi_play_area'
+            self.frame_count = self.frame_counts.end_round
         end
         print("DATASET: Mode set to " .. tostring(mode))
     end

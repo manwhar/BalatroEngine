@@ -64,14 +64,18 @@ local function load_submodule(rel_path)
 end
 
 -- Load Modular Components
-local ConfigModule   = load_submodule("src/config.lua")
-local CardsGenModule = load_submodule("src/cards_gen.lua")
-local ShopGenModule  = load_submodule("src/shop_gen.lua")
-local CaptureModule  = load_submodule("src/capture.lua")
-local UIModule       = load_submodule("src/ui.lua")
-local RunTracker     = load_submodule("src/run_tracker.lua")
+local ConfigModule          = load_submodule("src/config.lua")
+local CardsGenModule        = load_submodule("src/cards_gen.lua")
+local ShopGenModule         = load_submodule("src/shop_gen.lua")
+local CaptureModule         = load_submodule("src/capture.lua")
+local EndRoundGenModule     = load_submodule("src/end_round_gen.lua")
+local EndRoundCaptureModule = load_submodule("src/end_round_capture.lua")
+local UIModule              = load_submodule("src/ui.lua")
+local RunTracker            = load_submodule("src/run_tracker.lua")
 
 G.DATASET_MOD.ShopGen = ShopGenModule
+G.DATASET_MOD.EndRoundGen = EndRoundGenModule
+G.DATASET_MOD.EndRoundCapture = EndRoundCaptureModule
 G.DATASET_MOD.RunTracker = RunTracker
 
 -- Initialize configuration, counters, and directories
@@ -193,6 +197,11 @@ function Card:draw(layer)
                     if c == self then tracked = true; break end
                 end
             end
+            if not tracked and G.DATASET_MOD.config.calibration_mode == 'setup' and G.play and G.play.cards then
+                for _, c in ipairs(G.play.cards) do
+                    if c == self then tracked = true; break end
+                end
+            end
         elseif mode == 'shop_classifier' then
             if G.jokers and G.jokers.cards then
                 for _, c in ipairs(G.jokers.cards) do
@@ -262,10 +271,18 @@ function nuGC(time_budget, memory_ceiling, disable_otherwise)
     end
 end
 
--- 4. love.update hook
+-- 4. love.update & love.draw hooks
 local orig_love_update = love.update
+local orig_love_draw = love.draw
+
 function love.update(dt)
-    if orig_love_update then orig_love_update(dt) end
+    local handled = false
+    if G.DATASET_MOD and G.DATASET_MOD.EndRoundCapture then
+        handled = G.DATASET_MOD.EndRoundCapture.step_love_update(G.DATASET_MOD, dt, orig_love_update, orig_love_draw)
+    end
+    if not handled and orig_love_update then
+        orig_love_update(dt)
+    end
     if G.DATASET_MOD then
         G.DATASET_MOD:update(dt)
         if G.DATASET_MOD.config and G.DATASET_MOD.config.mode ~= 'off' then
@@ -274,11 +291,14 @@ function love.update(dt)
     end
 end
 
--- 4. love.draw hook
-local orig_love_draw = love.draw
 function love.draw()
     if orig_love_draw then orig_love_draw() end
-    if G.DATASET_MOD then G.DATASET_MOD:draw_debug() end
+    if G.DATASET_MOD and G.DATASET_MOD.EndRoundCapture then
+        G.DATASET_MOD.EndRoundCapture.capture_after_draw(G.DATASET_MOD)
+    end
+    if G.DATASET_MOD and not (G.DATASET_MOD.EndRoundCapture and G.DATASET_MOD.EndRoundCapture.in_internal_draw) then
+        G.DATASET_MOD:draw_debug()
+    end
 end
 
 -- 5. love.keypressed hook

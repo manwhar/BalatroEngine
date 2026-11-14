@@ -12,6 +12,7 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'roi_pack' then return self.config.rois.pack, 'roi', "ROI: Booster Opening Screen"
     elseif t == 'roi_consumeables' then return self.config.rois.consumeables, 'roi', "ROI: Consumables (Top Right)"
     elseif t == 'roi_card_hand' then return self.config.rois.card_hand, 'roi', "ROI: Card Hand"
+    elseif t == 'roi_play_area' then return self.config.rois.play_area, 'roi', "ROI: Play Area (G.play)"
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
     elseif t == 'box_item' then return self.config.boxes.item_card, 'box', "Box: Shop/Pack Item"
     elseif t == 'box_consumeable' then return self.config.boxes.consumeable_card, 'box', "Box: Consumable Card"
@@ -332,7 +333,8 @@ function UI.init_callbacks(mod)
         local mode_map = {
             ['Off'] = 'off',
             ['Card Classifier'] = 'card_classifier',
-            ['Shop Classifier'] = 'shop_classifier'
+            ['Shop Classifier'] = 'shop_classifier',
+            ['End Round Classifier'] = 'end_round_classifier',
         }
         local chosen = mode_map[args.to_val] or 'off'
         mod:set_mode(chosen)
@@ -345,14 +347,24 @@ function UI.init_callbacks(mod)
         }
         mod.config.calibration_mode = state_map[args.to_val] or 'setup'
         mod.state = 'idle'
-        if mod.config.calibration_mode ~= 'generation' and mod.restore_joker_display_config then
-            mod:restore_joker_display_config()
+        if mod.config.calibration_mode ~= 'generation' then
+            if mod.restore_joker_display_config then mod:restore_joker_display_config() end
+            if mod.EndRoundCapture and mod._active_end_round_clip then mod.EndRoundCapture.stop(mod) end
         end
     end
 
     G.FUNCS.gdcv_change_max_frames = function(args)
         local frames = tonumber(args.to_val) or 10000
         mod.config.max_frames = frames
+    end
+
+    G.FUNCS.gdcv_change_max_clips = function(args)
+        mod.config.max_clips = tonumber(args.to_val) or 1000
+    end
+
+    G.FUNCS.gdcv_change_er_batch = function(args)
+        local n = tonumber(tostring(args.to_val or '2'):match('^(%d+)')) or 2
+        mod.config.end_round_frames_per_tick = n
     end
 
     G.FUNCS.gdcv_change_perkeo_max = function(args)
@@ -421,6 +433,18 @@ function UI.init_callbacks(mod)
                 load_sub("src/cards_gen.lua")
                 load_sub("src/shop_gen.lua")
                 load_sub("src/capture.lua")
+                local er_gen = load_sub("src/end_round_gen.lua")
+                if er_gen then mod.EndRoundGen = er_gen end
+                if mod.EndRoundCapture then
+                    if mod._active_end_round_clip and mod.EndRoundCapture.stop then
+                        mod.EndRoundCapture.stop(mod)
+                    end
+                    if mod.EndRoundCapture.release_gpu_resources then
+                        mod.EndRoundCapture.release_gpu_resources()
+                    end
+                end
+                local er_cap = load_sub("src/end_round_capture.lua")
+                if er_cap then mod.EndRoundCapture = er_cap end
                 local ui_m = load_sub("src/ui.lua")
                 if ui_m then
                     ui_m.init_callbacks(mod)
@@ -956,10 +980,20 @@ function UI.build_page_definition(mod)
     end
 
     -- Default page: 'dataset'
-    local current_mode_idx = (mod.config.mode == 'card_classifier' and 2) or (mod.config.mode == 'shop_classifier' and 3) or 1
+    local current_mode_idx = (mod.config.mode == 'card_classifier' and 2)
+        or (mod.config.mode == 'shop_classifier' and 3)
+        or (mod.config.mode == 'end_round_classifier' and 4)
+        or 1
 
     local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
     local current_mf_idx = find_option_index(max_frames_options, mod.config.max_frames or 10000, 4)
+
+    local max_clips_options = {'250', '500', '1000', '2500', '5000'}
+    local current_mc_idx = find_option_index(max_clips_options, mod.config.max_clips or 1000, 3)
+
+    local er_batch_options = {'1 (4x)', '2 (8x)', '4 (16x)'}
+    local cur_batch_val = tonumber(mod.config.end_round_frames_per_tick) or 2
+    local current_er_idx = (cur_batch_val == 1 and 1) or (cur_batch_val == 4 and 3) or 2
 
     local perkeo_max_options = {'4', '5', '6', '7', '8', '9', '10'}
     local current_pm_idx = find_option_index(perkeo_max_options, mod.config.perkeo_max_consumables or 10, 7)
@@ -984,8 +1018,10 @@ function UI.build_page_definition(mod)
         n = G.UIT.ROOT,
         config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
         nodes = {
-            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier'}, current_mode_idx, 'gdcv_change_mode'),
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier'}, current_mode_idx, 'gdcv_change_mode'),
             make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
+            make_cycle_row("End-Round Clip Cap", 'gdcv_mc_cycle', max_clips_options, current_mc_idx, 'gdcv_change_max_clips'),
+            make_cycle_row("End-Round Sim Batch", 'gdcv_er_cycle', er_batch_options, current_er_idx, 'gdcv_change_er_batch'),
             make_cycle_row("Perkeo Max Consumables", 'gdcv_pm_cycle', perkeo_max_options, current_pm_idx, 'gdcv_change_perkeo_max'),
             make_cycle_row("Card Selection Chance", 'gdcv_sc_cycle', selection_chance_options, current_sc_idx, 'gdcv_change_card_selection_chance'),
             make_cycle_row("Frame Wait Time", 'gdcv_fw_cycle', frame_wait_options, current_fw_idx, 'gdcv_change_frame_wait_time'),
@@ -1006,9 +1042,10 @@ function UI.create_config_tab()
     mod.clear_confirm_timer = 0
     mod.clear_button_text = "Clear Dataset"
     mod.config_page = mod.config_page or 'dataset'
-    mod.stats_text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
+    mod.stats_text = string.format("Card: %d  |  Shop: %d  |  EndRound Clips: %d  |  Phase: %s",
         mod.frame_counts and mod.frame_counts.card or 0,
         mod.frame_counts and mod.frame_counts.shop or 0,
+        mod.frame_counts and mod.frame_counts.end_round or 0,
         string.upper(mod.shop_phase or 'shop'))
 
     local active_page = mod.config_page
@@ -1134,6 +1171,11 @@ function G.DATASET_MOD:draw_debug()
     if self.config.mode == 'card_classifier' then
         local is_sel = (self.selected_target == 'roi_card_hand')
         draw_roi_box(self.config.rois.card_hand, "[ROI: CARD HAND]", is_sel, 0, 1, 0)
+        local is_play_sel = (self.selected_target == 'roi_play_area')
+        draw_roi_box(self.config.rois.play_area, "[ROI: PLAY AREA]", is_play_sel, 0.2, 0.8, 1)
+    elseif self.config.mode == 'end_round_classifier' then
+        local is_play_sel = (self.selected_target == 'roi_play_area')
+        draw_roi_box(self.config.rois.play_area, "[ROI: PLAY AREA (256x72 @ 15fps)]", is_play_sel, 0.2, 0.8, 1)
     elseif self.config.mode == 'shop_classifier' then
         local sel = self.selected_target
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
@@ -1161,6 +1203,11 @@ function G.DATASET_MOD:draw_debug()
         if self.config.mode == 'card_classifier' then
             if G.hand and G.hand.cards then
                 for _, c in ipairs(G.hand.cards) do
+                    if c == card then return true end
+                end
+            end
+            if self.config.calibration_mode == 'setup' and G.play and G.play.cards then
+                for _, c in ipairs(G.play.cards) do
                     if c == card then return true end
                 end
             end
@@ -1247,7 +1294,9 @@ function G.DATASET_MOD:draw_debug()
     love.graphics.setLineWidth(1)
     love.graphics.rectangle('line', 8, 8, 920, 185, 8, 8)
 
-    local mode_str = (self.config.mode == 'card_classifier' and "CARD CLASSIFIER") or "SHOP & JOKER CLASSIFIER"
+    local mode_str = (self.config.mode == 'card_classifier' and "CARD CLASSIFIER")
+        or (self.config.mode == 'end_round_classifier' and "END ROUND CLASSIFIER")
+        or "SHOP & JOKER CLASSIFIER"
     love.graphics.setColor(1, 0.85, 0.2, 1)
     love.graphics.print(string.format("GAMESTATE CV CALIBRATION  -  [%s]", mode_str), 18, 14)
 
@@ -1267,8 +1316,10 @@ function G.DATASET_MOD:draw_debug()
         else
             love.graphics.print("Keys: 1: ROI Jokers | 2: ROI Shop | 3: ROI Boosters | 4: ROI Consumables | V: ROI Vouchers | 5-9: Boxes", 18, 58)
         end
+    elseif self.config.mode == 'end_round_classifier' then
+        love.graphics.print("Keys: 3: ROI Play Area | R: Preview Scenario | C: Record 1 Test Clip | TAB: Auto-Generate Clips", 18, 58)
     else
-        love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card", 18, 58)
+        love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card | 3: ROI Play Area", 18, 58)
     end
 
     love.graphics.setColor(0.9, 0.9, 0.9, 1)
@@ -1276,17 +1327,26 @@ function G.DATASET_MOD:draw_debug()
     love.graphics.print("TAB: Toggle Gen/Setup  |  R: Randomize  |  P: Switch Shop/Pack View  |  C: Capture Test", 18, 102)
     love.graphics.print("[, ]: Save / Load Config (dataset/boxes.lua)", 18, 124)
 
-    local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
-    local phase_extra = ""
-    if self.config.mode == 'shop_classifier' then
-        local p_kind = (self.shop_phase == 'pack') and (self.current_pack_kind or 'Pack') or "Shop"
-        local perk_str = self.is_perkeo_active and " [PERKEO]" or ""
-        local show_str = self.pack_has_showman and " [SHOWMAN]" or ""
-        phase_extra = string.format(" | Phase: %s (%d/100)%s%s", p_kind, self.phase_step or 0, perk_str, show_str)
-    end
-
     love.graphics.setColor(1, 1, 0.4, 1)
-    love.graphics.print(string.format("Next Frame: %04d / %d%s | Lua Mem: %.1f MB", cur_frame, self.config.max_frames or 10000, phase_extra, collectgarbage("count") / 1024), 18, 146)
+    if self.config.mode == 'end_round_classifier' then
+        local cur_clips = (self.frame_counts and self.frame_counts.end_round) or 0
+        local max_clips = self.config.max_clips or 1000
+        local clip = self._active_end_round_clip
+        local rec_str = clip
+            and string.format(" | REC %s frame=%d (%s)", clip.id, #clip.frame_bytes, clip.scenario and clip.scenario.archetype or "")
+            or string.format(" | Batch=%dx", self.config.end_round_frames_per_tick or 2)
+        love.graphics.print(string.format("Next Clip: %06d / %d%s | Lua Mem: %.1f MB", cur_clips, max_clips, rec_str, collectgarbage("count") / 1024), 18, 146)
+    else
+        local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
+        local phase_extra = ""
+        if self.config.mode == 'shop_classifier' then
+            local p_kind = (self.shop_phase == 'pack') and (self.current_pack_kind or 'Pack') or "Shop"
+            local perk_str = self.is_perkeo_active and " [PERKEO]" or ""
+            local show_str = self.pack_has_showman and " [SHOWMAN]" or ""
+            phase_extra = string.format(" | Phase: %s (%d/100)%s%s", p_kind, self.phase_step or 0, perk_str, show_str)
+        end
+        love.graphics.print(string.format("Next Frame: %04d / %d%s | Lua Mem: %.1f MB", cur_frame, self.config.max_frames or 10000, phase_extra, collectgarbage("count") / 1024), 18, 146)
+    end
 
     local stg_cnt = (G.STAGE_OBJECTS and G.STAGE_OBJECTS[G.STAGE] and #G.STAGE_OBJECTS[G.STAGE]) or 0
     local mov_cnt = (G.MOVEABLES and #G.MOVEABLES) or 0
@@ -1321,6 +1381,9 @@ function G.DATASET_MOD:on_keypressed(key)
         else
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
+            if self.EndRoundCapture and self.config.mode == 'end_round_classifier' then
+                self.EndRoundCapture.stop(self)
+            end
             if self.restore_joker_display_config then self:restore_joker_display_config() end
             self.capture_flash = 2.0
             self.capture_flash_text = "CALIBRATION SETUP MODE ACTIVE."
@@ -1331,7 +1394,10 @@ function G.DATASET_MOD:on_keypressed(key)
         if self.config.mode == 'card_classifier' then
             if key == '1' then self.selected_target = 'roi_card_hand'
             elseif key == '2' then self.selected_target = 'box_card'
+            elseif key == '3' then self.selected_target = 'roi_play_area'
             end
+        elseif self.config.mode == 'end_round_classifier' then
+            if key == '3' or key == '1' then self.selected_target = 'roi_play_area' end
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'
             elseif key == '2' then self.selected_target = 'roi_shop'
@@ -1356,6 +1422,14 @@ function G.DATASET_MOD:on_keypressed(key)
         if key == 'r' then
             if self.config.mode == 'card_classifier' then
                 self:generate_random_hand()
+            elseif self.config.mode == 'end_round_classifier' then
+                if self.EndRoundGen and G and G.STAGE == G.STAGES.RUN then
+                    self.EndRoundGen.setup_clip_scenario(self)
+                    self.EndRoundGen.restore_user_state(self)
+                else
+                    self.capture_flash = 2.0
+                    self.capture_flash_text = "ENTER A RUN FIRST TO PREVIEW END_ROUND SCENARIO!"
+                end
             else
                 if (self.shop_phase or 'shop') == 'shop' then
                     self:setup_shop_screen()
@@ -1374,7 +1448,11 @@ function G.DATASET_MOD:on_keypressed(key)
         elseif key == 't' and self.config.mode == 'card_classifier' then
             self:randomize_hand_selection()
         elseif key == 'c' then
-            self:capture_frame()
+            if self.config.mode == 'end_round_classifier' and self.EndRoundCapture then
+                self.EndRoundCapture.run_single_test_clip(self)
+            else
+                self:capture_frame()
+            end
         elseif key == ',' or key == '[' then
             self:save_config()
             self.capture_flash = 1.0
@@ -1409,9 +1487,10 @@ function G.DATASET_MOD:update(dt)
         end
     end
 
-    self.stats_text = string.format("Card Frames: %d  |  Shop Frames: %d  |  Phase: %s",
+    self.stats_text = string.format("Card: %d  |  Shop: %d  |  EndRound Clips: %d  |  Phase: %s",
         self.frame_counts and self.frame_counts.card or 0,
         self.frame_counts and self.frame_counts.shop or 0,
+        self.frame_counts and self.frame_counts.end_round or 0,
         string.upper(self.shop_phase or 'shop'))
 
     if not self.config or self.config.mode == 'off' then return end
@@ -1446,6 +1525,10 @@ function G.DATASET_MOD:update(dt)
             end
         end
     elseif self.config.calibration_mode == 'generation' then
+        if self.config.mode == 'end_round_classifier' then
+            -- Clip stepping and capture run via EndRoundCapture.step_love_update & capture_after_draw.
+            return
+        end
         local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
         local max_frames = self.config.max_frames or 10000
 

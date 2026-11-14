@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from PIL import Image
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CURSOR_PATH = PROJECT_ROOT / "assets" / "classifiers" / "cursor.png"
 
 _CACHED_CURSOR_RGBA = None

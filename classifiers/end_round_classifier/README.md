@@ -1,6 +1,6 @@
 # `end_round_classifier` — Temporal `END_ROUND` Detection Workspace
 
-Detects the implicit **`END_ROUND`** moment (`calculate_joker({end_of_round = true})` in Balatro's scoring/cleanup flow) within variable-length `[PLAY_HAND, CASH_OUT]` video segments cropped strictly to the central `play_area` (`G.play`, `1920x1080` reference ROI `x=508.32, y=280.38, w=1071.06, h=287.46` -> resized to `256x72` at `15.0 FPS`).
+Detects the implicit **`END_ROUND`** moment (`calculate_joker({end_of_round = true})` in Balatro's scoring/cleanup flow) within variable-length `[PLAY_HAND, CASH_OUT]` video segments cropped strictly to the central `play_area` (`G.play`, `1920x1080` reference ROI `x=518.70, y=421.04, w=1034.46, h=287.46` -> resized to `256x72` at `15.0 FPS`).
 
 Excluding the right-hand screen region prevents streamer facecams, Twitch chats, and deck/burn overlays from biasing predictions.
 
@@ -73,9 +73,9 @@ When adding dataset capture support to `balatro_mod/`, write each recorded segme
   "already_cropped": true,
   "payload_file": "frames.bin",
   "roi_base_1080p": {
-    "x": 508.319934,
-    "y": 280.377487,
-    "w": 1071.056521,
+    "x": 518.702717,
+    "y": 421.037276,
+    "w": 1034.463019,
     "h": 287.461606
   },
   "events": {

@@ -144,9 +144,13 @@ class EndRoundClipDataset(Dataset):
         return torch.load(pt_path, map_location="cpu", weights_only=True)
 
     def _get_item_rng(self, idx: int) -> np.random.Generator:
-        # Use torch seed combined with idx so DataLoader workers produce varied draws cleanly
-        worker_seed = int(torch.initial_seed() % (2**31 - 1)) ^ ((idx + 1) * 2654435761)
-        return np.random.default_rng(worker_seed % (2**32))
+        if not self.is_train:
+            det_seed = (self.seed ^ ((idx + 1) * 2654435761)) % (2**32)
+            return np.random.default_rng(det_seed)
+        # Mix in a live torch RNG draw so epochs vary even when num_workers=0
+        draw = int(torch.randint(0, 2**31 - 1, (1,)).item())
+        worker_seed = (int(torch.initial_seed() % (2**31 - 1)) ^ draw ^ ((idx + 1) * 2654435761)) % (2**32)
+        return np.random.default_rng(worker_seed)
 
     def _crop_window_around_event(
         self,

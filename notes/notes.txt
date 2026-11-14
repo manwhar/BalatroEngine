@@ -1,45 +1,5 @@
-- Gamestate must include "hands played so far this round" to accommodate for card sharp
-    - also that might just be a useful parameter for the model to learn from?\
-- somehow get values from randomly selecting jokers:
-    - rebate
-    - idol
-    - to do list
-    - castle
-    - ancient joker
-- omfg should i just use seed rng for everything????
-    - things i NEED seed rng for:
-        - randomly selecting jokers (see above)
-    - things seed rng might save a headache for:
-        - lucky triggers (for lucky cat)
-        - card added to deck by certificate
-    - things seed rng might simplify / improve performance if i get the api good:
-        - Save a consumable classifier call:
-            - cartomancer card added
-            - riff raff jokers added
-            - perkeo card copied
-            - 
-
-- Some jokers/skips have values that don't depend on actions while you have them, but actions
-you've done throughout the run. so all those actions need to be part of the gamestate
-    LIST:
-    - Fortune Teller: num tarots used
-    - Garbage Tag: num unused discards
-    - Satellite: num unique planets used
-    - Throwback + Speed Tag: num skips
-    - Supernova / Telescope: num of each hand played
-    - MAYBE: Swashbuckler: total sell value of jokers
-    - MAYBE: Handy Tag: num hands played (could be reconstructed from num of each hand played)
-    - MAYBE: Driver's License: num enhanced cards in deck
-        - these are both reconstructible; but maybe a useful parameter? could also save it in
-          gamestate to avoid recalculating constantly but not pass it as an input feature
-
-    - Secret hands unlocked
-    - Gros Michelle expired?
-    - Some jokers only show up depending on deck contents:
-        - Steel cards in deck?
-        - Stone cards in deck?
-        - Lucky cards in deck?
-        - Gold cards in deck?
-        - Glass cards in deck?
-
-- how the fuck do i deal with mr bones
+Left todos:
+- Seed / deck / stake data collection
+- [IN PROGRESS] New ML model trained to evaluate the temporal location of the "round end" action threshold
+- Generic optimizations and big-picture events (i.e., before game start (video intro etc), only scan for the "PLAY" button click or Select Blind click and then initialize gamestate)
+- All OCR
