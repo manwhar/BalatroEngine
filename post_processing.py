@@ -48,7 +48,7 @@ from game.engine.cv_stubs import (
     _convert_card_result_to_hand_card,
     _convert_items_of_type,
 )
-from game.engine.rules import on_action
+from game.engine.rules import on_action, trigger_end_of_round_effects
 from game.gamestate import GameState, RunTrajectory, _cards_match
 
 
@@ -343,6 +343,7 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
     joker_cv_queue: dict[int, ActionType] = {}
     shop_cv_queue: dict[int, ActionType] = {}
     pack_cv_queue: dict[int, ActionType] = {}
+    hud_ocr_queue: dict[int, ActionType] = {}
     scheduled_actions: list[ScheduledAction] = []
     pre_pack_loc: Location | None = None
 
@@ -401,6 +402,7 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
                 pass
 
         if action not in {A.SORT_RANK, A.SORT_SUIT}:
+            hud_ocr_queue[target_frame] = action
             if target_frame not in shop_cv_queue and target_frame not in pack_cv_queue:
                 joker_cv_queue[target_frame] = action
 
@@ -438,6 +440,7 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
         "joker_cv_queue": joker_cv_queue,
         "shop_cv_queue": shop_cv_queue,
         "pack_cv_queue": pack_cv_queue,
+        "hud_ocr_queue": hud_ocr_queue,
     }
 
 
@@ -536,11 +539,12 @@ def _run_batched_cv(
     fps: float,
     conf_threshold_hand: float,
     conf_threshold_shop: float,
+    conf_threshold_ocr: float = 0.90,
     batch_size: int,
     device: str | None,
-) -> tuple[dict[int, Any], dict[int, Any]]:
-    """Runs shop/pack/joker-bar CV first, then selectively runs hand CV."""
-    from classifiers.inference import batch_recognize_hands, batch_recognize_shops
+) -> tuple[dict[int, Any], dict[int, Any], dict[int, Any]]:
+    """Runs shop/pack/joker-bar CV first, selectively runs hand CV, and batches HUD OCR."""
+    from classifiers.inference import batch_recognize_hands, batch_recognize_hud, batch_recognize_shops
 
     def _pack_frame_inputs(frame_ids: Sequence[int]) -> list[tuple[Any, int, float]]:
         return [
@@ -629,7 +633,149 @@ def _run_batched_cv(
         for out in hand_outs:
             hand_res_by_frame[out.frame_index] = out
 
-    return shop_res_by_frame, hand_res_by_frame
+    hud_res_by_frame: dict[int, Any] = {}
+    hud_queue = queues.get("hud_ocr_queue", {})
+    hud_ids = sorted(hud_queue.keys())
+    if hud_ids:
+        base_hud_fields = ("hud_money", "hud_hands", "hud_discards", "hud_ante", "hud_round")
+        fields_by_frame: dict[int, list[str]] = {}
+        for sa in scheduled_actions:
+            if sa.target_frame not in hud_queue:
+                continue
+            f_list = fields_by_frame.setdefault(sa.target_frame, list(base_hud_fields))
+            if sa.ambient_location == Location.BLIND or sa.action_type == ActionType.END_ROUND:
+                for extra_field in ("hud_round_score", "hud_blind_target"):
+                    if extra_field not in f_list:
+                        f_list.append(extra_field)
+            if sa.ambient_location == Location.SHOP and "hud_reroll_cost" not in f_list:
+                f_list.append("hud_reroll_cost")
+
+        hud_outs = batch_recognize_hud(
+            _pack_frame_inputs(hud_ids),
+            fields_by_frame=fields_by_frame,
+            conf_threshold=conf_threshold_ocr,
+            batch_size=max(batch_size, 128),
+            device=device,
+        )
+        for out in hud_outs:
+            hud_res_by_frame[out.frame_index] = out
+
+    return shop_res_by_frame, hand_res_by_frame, hud_res_by_frame
+
+
+def _has_end_round_after(
+    scheduled_actions: Sequence[ScheduledAction], start_idx: int
+) -> bool:
+    """Returns True if an explicit END_ROUND action follows before CASH_OUT/SELECT_BLIND."""
+    for nxt in scheduled_actions[start_idx + 1 :]:
+        if nxt.action_type == ActionType.END_ROUND:
+            return True
+        if nxt.action_type in (
+            ActionType.CASH_OUT,
+            ActionType.SELECT_BLIND,
+            ActionType.SKIP_BLIND,
+            ActionType.NEXT_ROUND,
+        ):
+            return False
+    return False
+
+
+def _sync_hud_into_state(
+    state: GameState,
+    hud_out: Any,
+    sa: ScheduledAction,
+    action: Action,
+    *,
+    has_end_round_after: bool = False,
+) -> int | float | None:
+    """Applies validated HUD OCR readings into `state`, falling back cleanly on `None`.
+
+    Returns a deferred `current_chips` value when `PLAY_HAND` observes a score already at or
+    above `target_chips` while an `END_ROUND` action is scheduled afterwards.
+    """
+    values = getattr(hud_out, "values", None)
+    if not isinstance(values, dict) or not values:
+        return None
+
+    observed = {k: v for k, v in values.items() if v is not None}
+    if observed:
+        action.metadata["hud_ocr"] = observed
+
+    money_val = values.get("hud_money")
+    if money_val is not None:
+        if sa.action_type == ActionType.CASH_OUT and not state.round_won:
+            trigger_end_of_round_effects(state, action)
+        state.money = int(money_val)
+
+    hands_val = values.get("hud_hands")
+    if hands_val is not None and sa.action_type != ActionType.SELECT_BLIND and int(hands_val) >= 0:
+        state.hands_left = int(hands_val)
+
+    discards_val = values.get("hud_discards")
+    if (
+        discards_val is not None
+        and sa.action_type != ActionType.SELECT_BLIND
+        and int(discards_val) >= 0
+    ):
+        state.discards_left = int(discards_val)
+
+    blind_target_val = values.get("hud_blind_target")
+    if (
+        blind_target_val is not None
+        and sa.ambient_location == Location.BLIND
+        and blind_target_val > 0
+    ):
+        state.target_chips = blind_target_val
+
+    deferred_round_score: int | float | None = None
+    round_score_val = values.get("hud_round_score")
+    if (
+        round_score_val is not None
+        and sa.ambient_location == Location.BLIND
+        and round_score_val >= 0
+    ):
+        if (
+            sa.action_type == ActionType.PLAY_HAND
+            and has_end_round_after
+            and state.target_chips
+            and round_score_val >= state.target_chips
+        ):
+            deferred_round_score = round_score_val
+        else:
+            state.current_chips = round_score_val
+
+    ante_val = values.get("hud_ante")
+    if (
+        ante_val is not None
+        and sa.ambient_location == Location.BLIND
+        and not state.round_won
+        and not getattr(state, "pending_blind_advance", False)
+        and 1 <= int(ante_val) <= 39
+    ):
+        state.ante = int(ante_val)
+
+    round_val = values.get("hud_round")
+    if (
+        round_val is not None
+        and sa.ambient_location == Location.BLIND
+        and sa.action_type != ActionType.END_ROUND
+        and not getattr(state, "round_advanced", False)
+        and int(round_val) >= 1
+    ):
+        state.round = int(round_val)
+
+    reroll_val = values.get("hud_reroll_cost")
+    if reroll_val is not None and sa.ambient_location == Location.SHOP and int(reroll_val) >= 0:
+        reroll_cost = int(reroll_val)
+        if reroll_cost == 0 and state.free_rerolls > 0:
+            pass
+        elif reroll_cost > 0 and state.free_rerolls > 0:
+            state.free_rerolls = 0
+            state.reroll_cost = reroll_cost
+        else:
+            state.reroll_cost = reroll_cost
+
+    return deferred_round_score
 
 
 def _sync_bars_into_state(
@@ -895,6 +1041,7 @@ def _build_run_trajectory_with_plan(
     fps: float | None = None,
     conf_threshold_hand: float = 0.50,
     conf_threshold_shop: float = 0.80,
+    conf_threshold_ocr: float = 0.90,
     batch_size: int = 32,
     device: str | None = None,
     deduplicate: bool = True,
@@ -922,6 +1069,7 @@ def _build_run_trajectory_with_plan(
         | set(plan["joker_cv_queue"])
         | set(plan["shop_cv_queue"])
         | set(plan["pack_cv_queue"])
+        | set(plan["hud_ocr_queue"])
     )
     if preloaded_frames is not None:
         frames_by_idx = {idx: preloaded_frames[idx] for idx in needed_frames if idx in preloaded_frames}
@@ -930,13 +1078,14 @@ def _build_run_trajectory_with_plan(
     else:
         frames_by_idx = {}
 
-    shop_res_by_frame, hand_res_by_frame = _run_batched_cv(
+    shop_res_by_frame, hand_res_by_frame, hud_res_by_frame = _run_batched_cv(
         scheduled_actions,
         plan,
         frames_by_idx,
         fps=resolved_fps,
         conf_threshold_hand=conf_threshold_hand,
         conf_threshold_shop=conf_threshold_shop,
+        conf_threshold_ocr=conf_threshold_ocr,
         batch_size=batch_size,
         device=device,
     )
@@ -955,7 +1104,7 @@ def _build_run_trajectory_with_plan(
     trajectory.record_step(state, action=None)
 
     A = ActionType
-    for sa in scheduled_actions:
+    for sa_idx, sa in enumerate(scheduled_actions):
         action = Action(
             type=sa.action_type,
             frame_idx=sa.frame_id,
@@ -1055,13 +1204,25 @@ def _build_run_trajectory_with_plan(
                 ]
                 _sync_hand_into_state(state, obs_cards, action=action)
 
+        # Sync HUD OCR counters before deterministic simulation (falling back on None predictions)
+        hud_out = hud_res_by_frame.get(sa.target_frame)
+        deferred_round_score: int | float | None = None
+        if hud_out is not None:
+            deferred_round_score = _sync_hud_into_state(
+                state,
+                hud_out,
+                sa,
+                action,
+                has_end_round_after=_has_end_round_after(scheduled_actions, sa_idx),
+            )
+
         # Advance simulation
-        # OCR hook point: populate current_chips and HUD counters (money, hands, discards)
-        # around PLAY_HAND / END_ROUND / CASH_OUT when OCR is wired in.
         state.frame_idx = action.frame_idx
         state.timestamp = action.timestamp
         prev_loc = state.location
         on_action(state, action)
+        if deferred_round_score is not None:
+            state.current_chips = deferred_round_score
 
         # Post-sort reconciliation aligns actual settled positions + tightens face-down CardBounds
         if (
@@ -1108,6 +1269,7 @@ def build_run_trajectory(
     fps: float | None = None,
     conf_threshold_hand: float = 0.50,
     conf_threshold_shop: float = 0.80,
+    conf_threshold_ocr: float = 0.90,
     batch_size: int = 32,
     device: str | None = None,
     deduplicate: bool = True,
@@ -1126,6 +1288,7 @@ def build_run_trajectory(
         fps=fps,
         conf_threshold_hand=conf_threshold_hand,
         conf_threshold_shop=conf_threshold_shop,
+        conf_threshold_ocr=conf_threshold_ocr,
         batch_size=batch_size,
         device=device,
         deduplicate=deduplicate,
@@ -1140,9 +1303,9 @@ def process_actions(
 ) -> dict[str, Any]:
     """Schedules CV queues for action frames and optionally reconstructs full GameState trajectory.
 
-    When `video_path` and `preloaded_frames` are omitted, returns the 4 CV queue dicts.
+    When `video_path` and `preloaded_frames` are omitted, returns the 5 CV queue dicts.
     When either is provided, automatically detects missing `END_ROUND` transitions, runs batched
-    CV, and returns the scheduled queues alongside `state` and `trajectory`.
+    CV + HUD OCR, and returns the scheduled queues alongside `state` and `trajectory`.
     """
     if video_path is not None or kwargs.get("preloaded_frames") is not None:
         state, trajectory, plan = _build_run_trajectory_with_plan(
@@ -1153,6 +1316,7 @@ def process_actions(
             "joker_cv_queue": plan["joker_cv_queue"],
             "shop_cv_queue": plan["shop_cv_queue"],
             "pack_cv_queue": plan["pack_cv_queue"],
+            "hud_ocr_queue": plan["hud_ocr_queue"],
             "state": state,
             "trajectory": trajectory,
         }
@@ -1162,6 +1326,7 @@ def process_actions(
         "joker_cv_queue": plan["joker_cv_queue"],
         "shop_cv_queue": plan["shop_cv_queue"],
         "pack_cv_queue": plan["pack_cv_queue"],
+        "hud_ocr_queue": plan["hud_ocr_queue"],
     }
 
 

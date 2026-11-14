@@ -260,13 +260,11 @@ local function apply_random_hud_transitions(self, phase)
             -- 1. Mid-slide partial off-screen panel
             if phase == 'shop' and G.shop and G.shop.alignment and G.shop.alignment.offset then
                 G.shop.alignment.offset.y = -2.0 + math.random() * 1.5
-                if G.shop.hard_set_T then pcall(G.shop.hard_set_T, G.shop) end
                 if G.shop.recalculate then pcall(G.shop.recalculate, G.shop, true) end
                 snap_ui_tree(G.shop)
                 self.hud_corrupted_fields.hud_reroll_cost = true
             elseif phase == 'blind' and self.hud_blind_visible ~= false and G.HUD_blind and G.HUD_blind.alignment and G.HUD_blind.alignment.offset then
                 G.HUD_blind.alignment.offset.y = -5.8 + math.random() * 2.2
-                if G.HUD_blind.hard_set_T then pcall(G.HUD_blind.hard_set_T, G.HUD_blind) end
                 if G.HUD_blind.recalculate then pcall(G.HUD_blind.recalculate, G.HUD_blind, true) end
                 snap_ui_tree(G.HUD_blind)
                 self.hud_corrupted_fields.hud_blind_target = true

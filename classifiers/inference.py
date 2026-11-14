@@ -44,6 +44,10 @@ from classifiers.end_round_classifier.video_io import (
 )
 # pyrefly: ignore [missing-import]
 from classifiers.common.video_utils import scale_roi_pixels
+# pyrefly: ignore [missing-import]
+from classifiers.hud_ocr.config import DEFAULT_OCR_CONF_THRESHOLD, HUD_ROIS, HUD_ROI_FIELDS
+# pyrefly: ignore [missing-import]
+from classifiers.hud_ocr.pipeline import HudOcrPipeline, HudOcrResult
 
 BASE_WIDTH = 1920.0
 BASE_HEIGHT = 1080.0
@@ -58,14 +62,7 @@ ROIS = {
     "booster": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
     "pack": {"x": 565.612571, "y": 588.005101, "w": 960.654887, "h": 307.239491},
     "play_area": dict(PLAY_AREA_ROI),
-    "hud_round_score": {"x": 184.125227, "y": 389.166317, "w": 310.609893, "h": 91.386205},
-    "hud_money": {"x": 235.579213, "y": 810.532096, "w": 258.355712, "h": 109.781902},
-    "hud_hands": {"x": 245.551355, "y": 721.540544, "w": 103.609385, "h": 84.604535},
-    "hud_discards": {"x": 376.543146, "y": 722.718153, "w": 104.654328, "h": 79.453563},
-    "hud_ante": {"x": 237.682514, "y": 955.549886, "w": 118.302089, "h": 75.922924},
-    "hud_round": {"x": 376.753403, "y": 955.475887, "w": 105.791305, "h": 74.350088},
-    "hud_reroll_cost": {"x": 652.927185, "y": 575.954539, "w": 89.693143, "h": 65.191462},
-    "hud_blind_target": {"x": 238.315153, "y": 223.162116, "w": 243.768598, "h": 70.880588},
+    **{k: dict(v) for k, v in HUD_ROIS.items()},
 }
 
 
@@ -108,6 +105,47 @@ class ShopRecognitionOutput:
         )
 
 
+@dataclass(slots=True)
+class HudRecognitionOutput:
+    """HUD OCR predictions and parsed numeric values for a single frame."""
+    frame_index: int
+    timestamp_seconds: float
+    results: dict[str, HudOcrResult] = field(default_factory=dict)
+    values: dict[str, int | float | None] = field(default_factory=dict)
+
+    @property
+    def round_score(self) -> int | float | None:
+        return self.values.get("hud_round_score")
+
+    @property
+    def money(self) -> int | float | None:
+        return self.values.get("hud_money")
+
+    @property
+    def hands(self) -> int | float | None:
+        return self.values.get("hud_hands")
+
+    @property
+    def discards(self) -> int | float | None:
+        return self.values.get("hud_discards")
+
+    @property
+    def ante(self) -> int | float | None:
+        return self.values.get("hud_ante")
+
+    @property
+    def round(self) -> int | float | None:
+        return self.values.get("hud_round")
+
+    @property
+    def reroll_cost(self) -> int | float | None:
+        return self.values.get("hud_reroll_cost")
+
+    @property
+    def blind_target(self) -> int | float | None:
+        return self.values.get("hud_blind_target")
+
+
 # =====================================================================
 # Model Cache & Lazy Initialization
 # =====================================================================
@@ -115,6 +153,7 @@ class ShopRecognitionOutput:
 _CARD_PIPELINE: CardRecognitionPipeline | None = None
 _SHOP_PIPELINE: ShopRecognitionPipeline | None = None
 _END_ROUND_PIPELINE: EndRoundRecognitionPipeline | None = None
+_HUD_OCR_PIPELINE: HudOcrPipeline | None = None
 
 
 def get_card_pipeline(device: str | None = None) -> CardRecognitionPipeline:
@@ -169,6 +208,20 @@ def get_end_round_pipeline(device: str | None = None) -> EndRoundRecognitionPipe
     return _END_ROUND_PIPELINE
 
 
+def get_hud_ocr_pipeline(device: str | None = None) -> HudOcrPipeline:
+    """Returns singleton HudOcrPipeline loaded from classifiers/prod_weights/."""
+    global _HUD_OCR_PIPELINE
+    if _HUD_OCR_PIPELINE is None:
+        ckpt_path = PROD_WEIGHTS_DIR / "hud_ocr.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Missing production HUD OCR weights at {ckpt_path}")
+        _HUD_OCR_PIPELINE = HudOcrPipeline(
+            weights_path=ckpt_path,
+            device=device,
+        )
+    return _HUD_OCR_PIPELINE
+
+
 def _extract_frame_image_and_meta(video_frame: Any) -> tuple[np.ndarray, int, float]:
     """Helper to unwrap VideoFrame, tuple, or raw np.ndarray."""
     if hasattr(video_frame, "image") and hasattr(video_frame, "index"):
@@ -181,13 +234,19 @@ def _extract_frame_image_and_meta(video_frame: Any) -> tuple[np.ndarray, int, fl
         raise TypeError(f"Unsupported frame type: {type(video_frame)}. Expected VideoFrame or np.ndarray.")
 
 
-def _crop_roi_to_pil(full_bgr: np.ndarray, roi_key: str) -> tuple[Image.Image, tuple[int, int, int, int]]:
-    """Crops a region from full frame BGR array to PIL Image in RGB format."""
+def _crop_roi_rgb(full_bgr: np.ndarray, roi_key: str) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Crops a region from full frame BGR array into an RGB uint8 ndarray."""
     fh, fw = full_bgr.shape[:2]
     rx, ry, rw, rh = scale_roi_pixels(ROIS[roi_key], fw, fh, BASE_WIDTH, BASE_HEIGHT)
     crop_bgr = full_bgr[ry:ry + rh, rx:rx + rw]
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(crop_rgb), (rx, ry, rw, rh)
+    return crop_rgb, (rx, ry, rw, rh)
+
+
+def _crop_roi_to_pil(full_bgr: np.ndarray, roi_key: str) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Crops a region from full frame BGR array to PIL Image in RGB format."""
+    crop_rgb, coords = _crop_roi_rgb(full_bgr, roi_key)
+    return Image.fromarray(crop_rgb), coords
 
 
 def _offset_box(box: list[int], rx: int, ry: int) -> list[int]:
@@ -683,3 +742,78 @@ def batch_recognize_end_rounds(
         )
 
     return results
+
+
+def recognize_hud(
+    video_frame: Any,
+    fields: Sequence[str] | None = None,
+    conf_threshold: float = DEFAULT_OCR_CONF_THRESHOLD,
+    device: str | None = None,
+) -> HudRecognitionOutput:
+    """Runs batched HUD OCR across selected HUD ROIs on a single video frame."""
+    target_fields = tuple(fields) if fields is not None else HUD_ROI_FIELDS
+    return batch_recognize_hud(
+        [video_frame],
+        fields=target_fields,
+        conf_threshold=conf_threshold,
+        batch_size=max(1, len(target_fields)),
+        device=device,
+    )[0]
+
+
+def batch_recognize_hud(
+    frames: Sequence[Any],
+    fields_by_frame: dict[int, Sequence[str]] | None = None,
+    fields: Sequence[str] | None = None,
+    conf_threshold: float = DEFAULT_OCR_CONF_THRESHOLD,
+    batch_size: int = 128,
+    device: str | None = None,
+) -> list[HudRecognitionOutput]:
+    """Batches HUD OCR inference across multiple frames and per-frame ROI field subsets."""
+    if not frames:
+        return []
+
+    default_fields = tuple(fields) if fields is not None else HUD_ROI_FIELDS
+    pipeline = get_hud_ocr_pipeline(device=device)
+    unwrapped = [_extract_frame_image_and_meta(f) for f in frames]
+
+    outputs = [
+        HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts)
+        for _, f_idx, ts in unwrapped
+    ]
+
+    all_crops: list[np.ndarray] = []
+    all_field_names: list[str] = []
+    crop_owners: list[tuple[int, str]] = []
+
+    for out_idx, (img_bgr, f_idx, _) in enumerate(unwrapped):
+        frame_fields = (
+            tuple(fields_by_frame.get(f_idx, default_fields))
+            if fields_by_frame is not None
+            else default_fields
+        )
+        for fname in frame_fields:
+            crop_rgb, _ = _crop_roi_rgb(img_bgr, fname)
+            all_crops.append(crop_rgb)
+            all_field_names.append(fname)
+            crop_owners.append((out_idx, fname))
+
+    if not all_crops:
+        return outputs
+
+    chunk_size = max(1, int(batch_size))
+    preds: list[HudOcrResult] = []
+    for start in range(0, len(all_crops), chunk_size):
+        preds.extend(
+            pipeline.predict_crops(
+                all_crops[start : start + chunk_size],
+                field_names=all_field_names[start : start + chunk_size],
+                conf_threshold=conf_threshold,
+            )
+        )
+
+    for (out_idx, fname), res in zip(crop_owners, preds):
+        outputs[out_idx].results[fname] = res
+        outputs[out_idx].values[fname] = res.parsed_value
+
+    return outputs

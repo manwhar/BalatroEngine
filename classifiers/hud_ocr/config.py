@@ -54,6 +54,11 @@ INPUT_WIDTH: int = 192
 NORM_MEAN: tuple[float, float, float] = (0.5, 0.5, 0.5)
 NORM_STD: tuple[float, float, float] = (0.5, 0.5, 0.5)
 
+DEFAULT_OCR_CONF_THRESHOLD: float = 0.90
+REROLL_TARGET_RGB: tuple[int, int, int] = (78, 177, 127)
+REROLL_MAX_RGB_DISTANCE: float = 65.0
+REROLL_MIN_GREEN_DOMINANCE: float = 15.0
+
 HUD_ROI_FIELDS: tuple[str, ...] = (
     "hud_round_score",
     "hud_money",
@@ -79,12 +84,12 @@ FIELD_ALLOWED_CHARS: dict[str, str] = {
 
 # Base 1920x1080 ROI coordinates (updated once calibrated via balatro_mod HUD OCR mode).
 HUD_ROIS: dict[str, dict[str, float]] = {
-    "hud_round_score": {"x": 184.125227, "y": 389.166317, "w": 310.609893, "h": 91.386205},
+    "hud_round_score": {"x": 220.599731, "y": 389.166317, "w": 310.609893, "h": 91.386205},
     "hud_money": {"x": 235.579213, "y": 810.532096, "w": 258.355712, "h": 109.781902},
     "hud_hands": {"x": 245.551355, "y": 721.540544, "w": 103.609385, "h": 84.604535},
     "hud_discards": {"x": 376.543146, "y": 722.718153, "w": 104.654328, "h": 79.453563},
     "hud_ante": {"x": 237.682514, "y": 955.549886, "w": 118.302089, "h": 75.922924},
     "hud_round": {"x": 376.753403, "y": 955.475887, "w": 105.791305, "h": 74.350088},
-    "hud_reroll_cost": {"x": 652.927185, "y": 575.954539, "w": 89.693143, "h": 65.191462},
-    "hud_blind_target": {"x": 238.315153, "y": 223.162116, "w": 243.768598, "h": 70.880588},
+    "hud_reroll_cost": {"x": 629.031965, "y": 575.298322, "w": 122.196835, "h": 65.468198},
+    "hud_blind_target": {"x": 245.537867, "y": 233.218735, "w": 253.485902, "h": 88.705984},
 }

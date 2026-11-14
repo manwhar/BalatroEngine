@@ -377,17 +377,18 @@ class BalatroHudSynthesizer:
         if text_override is not None:
             target_text = text_override
 
-        base_bg = rng.choice(PANEL_COLORS)
+        is_empty_sample = augment and text_override is None and rng.random() < 0.12
+        if is_empty_sample:
+            target_text = ""
+
+        if chosen_field == "hud_reroll_cost" and not is_empty_sample:
+            base_bg = (66, 158, 107)
+        else:
+            base_bg = rng.choice(PANEL_COLORS)
         bg = tuple(max(0, min(255, c + rng.randint(-12, 12))) for c in base_bg)
         palette = TEXT_COLORS.get(chosen_field, ((255, 255, 255),))
         fg_base = rng.choice(palette)
         fg = tuple(max(0, min(255, c + rng.randint(-10, 10))) for c in fg_base)
-
-        # Empty/distractor examples (e.g. "SHOP" banner, empty box, "Reroll" label) teach the
-        # model to output "" instead of hallucinating digits on non-numeric artwork.
-        is_empty_sample = augment and text_override is None and rng.random() < 0.12
-        if is_empty_sample:
-            target_text = ""
 
         # Visually render prefixes/suffixes ("$", "/ 8") even though target_text stays numeric-only.
         if is_empty_sample:

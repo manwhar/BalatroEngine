@@ -140,15 +140,75 @@ def render_contact_sheet(
     return out_path
 
 
+def _crop_color_stats(crop_rgb: np.ndarray) -> tuple[tuple[int, int, int], int, tuple[int, int, int]]:
+    """Return `(mean_rgb, green_dominance, mean_hsv)` for an RGB crop."""
+    mean_rgb_f = crop_rgb.mean(axis=(0, 1))
+    r, g, b = (int(round(mean_rgb_f[0])), int(round(mean_rgb_f[1])), int(round(mean_rgb_f[2])))
+    g_dom = g - max(r, b)
+    hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
+    mean_hsv_f = hsv.mean(axis=(0, 1))
+    h, s, v = (int(round(mean_hsv_f[0])), int(round(mean_hsv_f[1])), int(round(mean_hsv_f[2])))
+    return (r, g, b), g_dom, (h, s, v)
+
+
+def render_single_field_grid(
+    rows: list[tuple[int, float, dict[str, tuple[np.ndarray, HudOcrResult]]]],
+    field: str,
+    out_path: Path,
+    cols: int = 12,
+) -> Path:
+    """Render a compact grid of single-field crops with OCR + average RGB/green-dominance labels."""
+    cell_w, cell_img_h, label_h = 192, 48, 44
+    pad = 8
+    n_items = len(rows)
+    n_cols = max(1, min(cols, n_items))
+    n_rows = max(1, (n_items + n_cols - 1) // n_cols)
+
+    canvas_w = pad + n_cols * (cell_w + pad)
+    canvas_h = pad + n_rows * (cell_img_h + label_h + pad)
+    canvas = np.full((canvas_h, canvas_w, 3), 24, dtype=np.uint8)
+
+    for idx, (f_idx, _sec, fmap) in enumerate(rows):
+        r_idx = idx // n_cols
+        c_idx = idx % n_cols
+        x = pad + c_idx * (cell_w + pad)
+        y = pad + r_idx * (cell_img_h + label_h + pad)
+
+        crop_rgb, res = fmap[field]
+        crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+        ch, cw = crop_bgr.shape[:2]
+        scale = min(cell_w / max(1, cw), cell_img_h / max(1, ch))
+        nw = max(1, int(round(cw * scale)))
+        nh = max(1, int(round(ch * scale)))
+        resized = cv2.resize(crop_bgr, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        y_off = y + (cell_img_h - nh) // 2
+        x_off = x + (cell_w - nw) // 2
+        canvas[y_off : y_off + nh, x_off : x_off + nw] = resized
+
+        (mr, mg, mb), g_dom, _ = _crop_color_stats(crop_rgb)
+        conf_pct = int(round(res.confidence * 100))
+        txt1 = f"f={f_idx} {res.text or '<blank>'} ({conf_pct}%)"
+        txt2 = f"RGB({mr},{mg},{mb}) G+{g_dom}"
+        color = (120, 240, 140) if g_dom >= 15 else ((200, 200, 140) if res.text == "" else (110, 130, 245))
+        cv2.putText(canvas, txt1[:26], (x + 2, y + cell_img_h + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
+        cv2.putText(canvas, txt2[:26], (x + 2, y + cell_img_h + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 215, 225), 1, cv2.LINE_AA)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), canvas)
+    return out_path
+
+
 def evaluate_vod(args: argparse.Namespace) -> Path:
     video_path = Path(args.video)
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
-    fields = tuple(args.fields) if args.fields else HUD_ROI_FIELDS
+    reroll_mode = bool(getattr(args, "reroll_color_check", False))
+    fields = ("hud_reroll_cost",) if reroll_mode else (tuple(args.fields) if args.fields else HUD_ROI_FIELDS)
+    num_frames = args.num_frames if args.num_frames is not None else (144 if reroll_mode else 12)
     indices, fps = _pick_frame_indices(
         video_path,
-        num_frames=args.num_frames,
+        num_frames=num_frames,
         explicit_frames=args.frames,
         explicit_timestamps=args.timestamps,
     )
@@ -183,14 +243,27 @@ def evaluate_vod(args: argparse.Namespace) -> Path:
         sec = f_idx / fps
         fmap = by_frame[f_idx]
         rows.append((f_idx, sec, fmap))
-        summary = " | ".join(
-            f"{f.replace('hud_', '')}={fmap[f][1].text or '?'} ({fmap[f][1].confidence:.0%})"
-            for f in fields
-        )
-        print(f"[{format_seconds(sec)} | f={f_idx}] {summary}")
+        if reroll_mode:
+            crop_rgb, res = fmap["hud_reroll_cost"]
+            (mr, mg, mb), g_dom, (mh, ms, mv) = _crop_color_stats(crop_rgb)
+            print(
+                f"[{format_seconds(sec)} | f={f_idx}] reroll={res.text or '<blank>'} ({res.confidence:.0%}) | "
+                f"RGB=({mr},{mg},{mb}) G-max(R,B)={g_dom:+d} | HSV=({mh},{ms},{mv})"
+            )
+        else:
+            summary = " | ".join(
+                f"{f.replace('hud_', '')}={fmap[f][1].text or '?'} ({fmap[f][1].confidence:.0%})"
+                for f in fields
+            )
+            print(f"[{format_seconds(sec)} | f={f_idx}] {summary}")
 
-    out_path = Path(args.out) if args.out else (CURRENT_DIR / "figures" / f"vod_preview_{video_path.stem}.png")
-    saved = render_contact_sheet(rows, fields, out_path)
+    if reroll_mode:
+        default_name = f"vod_reroll_color_{video_path.stem}.png"
+        out_path = Path(args.out) if args.out else (CURRENT_DIR / "figures" / default_name)
+        saved = render_single_field_grid(rows, "hud_reroll_cost", out_path, cols=12)
+    else:
+        out_path = Path(args.out) if args.out else (CURRENT_DIR / "figures" / f"vod_preview_{video_path.stem}.png")
+        saved = render_contact_sheet(rows, fields, out_path)
     print(f"\nSaved visual contact sheet to: {saved}")
     return saved
 
@@ -198,10 +271,11 @@ def evaluate_vod(args: argparse.Namespace) -> Path:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate HUD OCR on real VOD frames and save a contact sheet.")
     p.add_argument("--video", type=str, required=True, help="Path to a gameplay VOD (.mp4/.mkv/.avi)")
-    p.add_argument("--num-frames", type=int, default=12, help="Number of evenly spaced frames to sample")
+    p.add_argument("--num-frames", type=int, default=None, help="Number of evenly spaced frames to sample (default: 12, or 144 with --reroll-color-check)")
     p.add_argument("--frames", type=int, nargs="*", default=None, help="Specific frame indices to inspect")
     p.add_argument("--timestamps", type=str, nargs="*", default=None, help="Specific timestamps (e.g. 04:15 12:30)")
     p.add_argument("--fields", type=str, nargs="*", default=None, help="Subset of HUD fields to evaluate")
+    p.add_argument("--reroll-color-check", action="store_true", help="Sample 144 hud_reroll_cost crops and print/render average RGB, green-dominance, and HSV")
     p.add_argument("--weights", type=str, default=None, help="Optional explicit checkpoint path")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--out", type=str, default=None, help="Output contact-sheet PNG path")

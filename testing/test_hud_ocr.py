@@ -10,19 +10,22 @@ import tempfile
 import unittest
 
 import cv2
+import numpy as np
 import torch
 
 from classifiers.hud_ocr.config import (
     CHAR_TO_IDX,
+    DEFAULT_OCR_CONF_THRESHOLD,
     FIELD_ALLOWED_CHARS,
     HUD_ROI_FIELDS,
     INPUT_HEIGHT,
     INPUT_WIDTH,
     NUM_CLASSES,
+    REROLL_TARGET_RGB,
 )
 from classifiers.hud_ocr.dataset import ModHudOcrDataset, SyntheticHudOcrDataset, collate_ocr_batch
 from classifiers.hud_ocr.model import HudOcrCRNN, compute_cer, ctc_greedy_decode
-from classifiers.hud_ocr.pipeline import HudOcrPipeline, parse_hud_value
+from classifiers.hud_ocr.pipeline import HudOcrPipeline, is_reroll_button_color, parse_hud_value
 from classifiers.hud_ocr.synth import (
     BalatroHudSynthesizer,
     corrupt_hud_crop_to_empty,
@@ -225,6 +228,50 @@ class TestHudOcr(unittest.TestCase):
             seen_texts = {ds[0][2] for _ in range(150)}
             self.assertIn("42", seen_texts)
             self.assertIn("", seen_texts)
+
+    def test_reroll_color_wrapper_and_confidence_threshold(self) -> None:
+        self.assertAlmostEqual(DEFAULT_OCR_CONF_THRESHOLD, 0.90)
+
+        green_exact = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), REROLL_TARGET_RGB, dtype=np.uint8)
+        green_shifted = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), (62, 152, 108), dtype=np.uint8)
+        card_white = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), (225, 220, 215), dtype=np.uint8)
+        dark_slate = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), (32, 44, 48), dtype=np.uint8)
+        red_panel = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), (185, 60, 55), dtype=np.uint8)
+        empty_crop = np.zeros((0, 0, 3), dtype=np.uint8)
+
+        self.assertTrue(is_reroll_button_color(green_exact))
+        self.assertTrue(is_reroll_button_color(green_shifted))
+        self.assertFalse(is_reroll_button_color(card_white))
+        self.assertFalse(is_reroll_button_color(dark_slate))
+        self.assertFalse(is_reroll_button_color(red_panel))
+        self.assertFalse(is_reroll_button_color(empty_crop))
+
+        prod_weights = Path(__file__).resolve().parent.parent / "classifiers" / "prod_weights" / "hud_ocr.pt"
+        self.assertTrue(prod_weights.exists(), f"Missing production weights at {prod_weights}")
+        pipe = HudOcrPipeline(weights_path=prod_weights, device="cpu", conf_threshold=0.90)
+
+        # Render a crisp white PlayingCard-colored distraction crop with "5" on it -> color gate blocks it
+        synth = BalatroHudSynthesizer()
+        rng = random.Random(55)
+        synth_reroll, _, _ = synth.render_sample(
+            rng, field_name="hud_reroll_cost", text_override="5", augment=False
+        )
+        res_green = pipe.predict_crop(synth_reroll, field_name="hud_reroll_cost")
+        self.assertEqual(res_green.parsed_value, 5)
+        self.assertGreaterEqual(res_green.confidence, 0.90)
+
+        # Paint background white (simulating a playing card or non-reroll UI in the ROI) while keeping pixels bright
+        non_green = np.full((INPUT_HEIGHT, INPUT_WIDTH, 3), (210, 210, 210), dtype=np.uint8)
+        rejected = pipe.predict_crop(non_green, field_name="hud_reroll_cost")
+        self.assertEqual(rejected.text, "")
+        self.assertIsNone(rejected.parsed_value)
+        self.assertEqual(rejected.confidence, 0.0)
+
+        # Confidence threshold (>1.0 impossible) forces parsed_value to None while retaining decoded text
+        low_conf_filtered = pipe.predict_crop(synth_reroll, field_name="hud_reroll_cost", conf_threshold=1.01)
+        self.assertEqual(low_conf_filtered.text, "5")
+        self.assertIsNone(low_conf_filtered.parsed_value)
+        self.assertGreaterEqual(low_conf_filtered.confidence, 0.90)
 
 
 if __name__ == "__main__":
