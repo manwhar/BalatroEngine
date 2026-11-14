@@ -668,12 +668,24 @@ def batch_recognize_end_rounds(
     fps: float = 60.0,
     batch_size: int = 8,
     device: str | None = None,
+    show_progress: bool = False,
 ) -> list[EndRoundResult]:
     """Batches temporal END_ROUND detection across multiple `[PLAY_HAND, CASH_OUT]` segments."""
     if not segments:
         return []
     if video_path is None and preloaded_frames is None:
         return []
+
+    pbar = None
+    if show_progress:
+        from tqdm import tqdm
+
+        pbar = tqdm(
+            total=len(segments),
+            desc="Detecting END_ROUND transitions",
+            unit="segment",
+        )
+        pbar.set_postfix_str("reading video")
 
     if video_path is not None:
         pipeline = get_end_round_pipeline(device=device)
@@ -684,6 +696,7 @@ def batch_recognize_end_rounds(
             roi_base_1080p=pipeline.roi_base_1080p,
             out_width=pipeline.input_width,
             out_height=pipeline.input_height,
+            progress_callback=pbar.update if pbar is not None else None,
         )
     else:
         assert preloaded_frames is not None
@@ -694,6 +707,8 @@ def batch_recognize_end_rounds(
             in_range = [fid for fid in sorted_avail if s_i <= fid < e_i]
             if len(in_range) < 2:
                 # Sparse button-frame test fixtures do not hold contiguous segment frames.
+                if pbar is not None:
+                    pbar.close()
                 return []
             avail_per_seg.append(in_range)
 
@@ -721,6 +736,9 @@ def batch_recognize_end_rounds(
 
     chunk_size = max(1, int(batch_size))
     results: list[EndRoundResult] = []
+    if pbar is not None:
+        pbar.reset(total=len(clip_tensors))
+        pbar.set_postfix_str("inferring")
     for chunk_start in range(0, len(clip_tensors), chunk_size):
         chunk_clips = clip_tensors[chunk_start : chunk_start + chunk_size]
         chunk_indices = sampled_indices_list[chunk_start : chunk_start + chunk_size]
@@ -740,6 +758,11 @@ def batch_recognize_end_rounds(
                 sampled_video_frames_list=chunk_indices,
             )
         )
+        if pbar is not None:
+            pbar.update(bsz)
+
+    if pbar is not None:
+        pbar.close()
 
     return results
 

@@ -7,9 +7,11 @@ used by both `prepare_dataset.py` and `pipeline.py` (inference).
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
-from typing import Sequence
+import threading
+from typing import Any, Callable, Sequence
 
 import cv2
 import numpy as np
@@ -151,6 +153,108 @@ def read_video_segment_rgb(
         cap.release()
 
 
+def _read_video_segments_rgb_batch_decord(
+    video_path: Path | str,
+    segments: Sequence[tuple[int, int]],
+    *,
+    target_fps: float = TARGET_FPS,
+    already_cropped: bool = False,
+    roi_base_1080p: dict[str, float] | None = None,
+    out_width: int = INPUT_WIDTH,
+    out_height: int = INPUT_HEIGHT,
+    progress_callback: Callable[[int], None] | None = None,
+    max_workers: int = 4,
+) -> tuple[list[torch.Tensor], float, list[list[int]]]:
+    """Fast decord-backed implementation of `read_video_segments_rgb_batch`."""
+    import decord
+
+    vr: Any | None = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
+    try:
+        src_fps = float(vr.get_avg_fps() or 60.0)
+        if src_fps <= 0:
+            src_fps = 60.0
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise RuntimeError(f"Video has no frames: {video_path}")
+
+        ordered_segs = sorted(enumerate(segments), key=lambda item: (int(item[1][0]), int(item[1][1])))
+        tasks: list[tuple[int, list[int]]] = []
+        for orig_idx, (raw_start, raw_end) in ordered_segs:
+            s_frame = max(0, int(raw_start))
+            e_frame = min(total_frames, int(raw_end))
+            if e_frame <= s_frame:
+                raise ValueError(f"Empty video segment [{s_frame}, {e_frame}) for {video_path}")
+
+            sampled = resample_frame_indices(s_frame, e_frame, src_fps, target_fps)
+            if not sampled:
+                raise ValueError(f"No frames sampled from [{s_frame}, {e_frame}) in {video_path}")
+            tasks.append((orig_idx, sampled))
+
+        cb_lock = threading.Lock()
+
+        def _decode_segment_group(
+            reader: Any, group_tasks: Sequence[tuple[int, list[int]]]
+        ) -> list[tuple[int, torch.Tensor, list[int]]]:
+            results: list[tuple[int, torch.Tensor, list[int]]] = []
+            for orig_idx, sampled in group_tasks:
+                batch_rgb = reader.get_batch(sampled).asnumpy()
+                out_frames = [
+                    crop_and_resize_rgb(
+                        rgb,
+                        already_cropped=already_cropped,
+                        roi_base_1080p=roi_base_1080p,
+                        out_width=out_width,
+                        out_height=out_height,
+                    )
+                    for rgb in batch_rgb
+                ]
+                arr = np.stack(out_frames, axis=0)
+                tensor = torch.from_numpy(np.ascontiguousarray(arr.transpose(0, 3, 1, 2)))
+                results.append((orig_idx, tensor, sampled))
+                if progress_callback is not None:
+                    with cb_lock:
+                        progress_callback(1)
+            return results
+
+        tensors_out: list[torch.Tensor | None] = [None] * len(segments)
+        indices_out: list[list[int]] = [[] for _ in segments]
+
+        n_workers = min(max(1, int(max_workers)), len(tasks))
+        if len(tasks) < 4 or n_workers <= 1:
+            decoded = _decode_segment_group(vr, tasks)
+        else:
+            del vr
+            vr = None
+
+            k, m = divmod(len(tasks), n_workers)
+            slices = [
+                tasks[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
+                for i in range(n_workers)
+            ]
+
+            def _worker(group_tasks: list[tuple[int, list[int]]]) -> list[tuple[int, torch.Tensor, list[int]]]:
+                w_vr = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
+                try:
+                    return _decode_segment_group(w_vr, group_tasks)
+                finally:
+                    del w_vr
+
+            decoded = []
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [pool.submit(_worker, s) for s in slices if s]
+                for fut in futures:
+                    decoded.extend(fut.result())
+
+        for orig_idx, tensor, sampled in decoded:
+            tensors_out[orig_idx] = tensor
+            indices_out[orig_idx] = sampled
+
+        return [t for t in tensors_out if t is not None], src_fps, indices_out
+    finally:
+        if vr is not None:
+            del vr
+
+
 def read_video_segments_rgb_batch(
     video_path: Path | str,
     segments: Sequence[tuple[int, int]],
@@ -160,10 +264,29 @@ def read_video_segments_rgb_batch(
     roi_base_1080p: dict[str, float] | None = None,
     out_width: int = INPUT_WIDTH,
     out_height: int = INPUT_HEIGHT,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> tuple[list[torch.Tensor], float, list[list[int]]]:
-    """Decode multiple `[start_frame, end_frame)` segments from one `VideoCapture` handle."""
+    """Decode multiple `[start_frame, end_frame)` segments from one video reader."""
     if not segments:
         return [], 60.0, []
+
+    try:
+        return _read_video_segments_rgb_batch_decord(
+            video_path,
+            segments,
+            target_fps=target_fps,
+            already_cropped=already_cropped,
+            roi_base_1080p=roi_base_1080p,
+            out_width=out_width,
+            out_height=out_height,
+            progress_callback=progress_callback,
+        )
+    except ValueError:
+        raise
+    except ImportError:
+        pass
+    except Exception:
+        pass
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -201,7 +324,7 @@ def read_video_segments_rgb_batch(
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
                     cur_pos = target_idx
                     has_started = True
-                elif target_idx < cur_pos or (target_idx - cur_pos) > 64:
+                elif target_idx < cur_pos or (target_idx - cur_pos) > 240:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
                     cur_pos = target_idx
                     has_started = True
@@ -235,6 +358,8 @@ def read_video_segments_rgb_batch(
             arr = np.stack(out_frames, axis=0)
             tensors_out[orig_idx] = torch.from_numpy(np.ascontiguousarray(arr.transpose(0, 3, 1, 2)))
             indices_out[orig_idx] = actual_indices
+            if progress_callback is not None:
+                progress_callback(1)
 
         return [t for t in tensors_out if t is not None], src_fps, indices_out
     finally:

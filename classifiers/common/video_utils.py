@@ -2,8 +2,10 @@
 Common Utilities and Video Extraction Helpers for Balatro Classifiers
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable
+import threading
+from typing import Any, Callable, Iterable
 
 import cv2
 import numpy as np
@@ -55,20 +57,109 @@ def extract_video_frame(video_path: Path, timestamp_sec: float) -> tuple[np.ndar
     return frame, actual_sec, target_frame
 
 
+def _extract_video_frames_decord(
+    video_path: Path | str,
+    requested: list[int],
+    *,
+    batch_size: int = 16,
+    progress_callback: Callable[[int], None] | None = None,
+    max_workers: int = 4,
+) -> dict[int, np.ndarray]:
+    """Fast decord-backed implementation of `extract_video_frames`."""
+    import decord
+
+    vr: Any | None = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
+    try:
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise RuntimeError(f"Video has no frames: {video_path}")
+
+        target_to_origs: dict[int, list[int]] = {}
+        for orig_idx in requested:
+            target = max(0, min(total_frames - 1, orig_idx))
+            target_to_origs.setdefault(target, []).append(orig_idx)
+
+        unique_targets = sorted(target_to_origs.keys())
+        step = max(1, int(batch_size))
+        cb_lock = threading.Lock()
+
+        def _decode_targets(reader: Any, target_slice: list[int]) -> dict[int, np.ndarray]:
+            local_frames: dict[int, np.ndarray] = {}
+            for i in range(0, len(target_slice), step):
+                chunk_targets = target_slice[i : i + step]
+                batch_rgb = reader.get_batch(chunk_targets).asnumpy()
+                chunk_count = 0
+                for target, rgb in zip(chunk_targets, batch_rgb):
+                    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+                    orig_list = target_to_origs[target]
+                    for orig_idx in orig_list:
+                        local_frames[orig_idx] = bgr
+                    chunk_count += len(orig_list)
+                if progress_callback is not None and chunk_count > 0:
+                    with cb_lock:
+                        progress_callback(chunk_count)
+            return local_frames
+
+        n_workers = min(max(1, int(max_workers)), len(unique_targets) // 16)
+        if len(unique_targets) < 32 or n_workers <= 1:
+            return _decode_targets(vr, unique_targets)
+
+        # Release the probe reader before spawning parallel per-thread readers on Windows.
+        del vr
+        vr = None
+
+        k, m = divmod(len(unique_targets), n_workers)
+        slices = [
+            unique_targets[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
+            for i in range(n_workers)
+        ]
+
+        def _worker(target_slice: list[int]) -> dict[int, np.ndarray]:
+            w_vr = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
+            try:
+                return _decode_targets(w_vr, target_slice)
+            finally:
+                del w_vr
+
+        frames: dict[int, np.ndarray] = {}
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_worker, s) for s in slices if s]
+            for fut in futures:
+                frames.update(fut.result())
+        return frames
+    finally:
+        # Release Windows file handle immediately so temp files can be cleaned up.
+        if vr is not None:
+            del vr
+
+
 def extract_video_frames(
     video_path: Path | str,
     frame_indices: Iterable[int],
-    sequential_grab_threshold: int = 32,
+    sequential_grab_threshold: int = 240,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> dict[int, np.ndarray]:
     """Extracts specific BGR frames in one pass over a video file.
 
-    Opens `cv2.VideoCapture` once, processes unique indices in ascending order,
-    uses fast `cap.grab()` for small forward steps (avoiding keyframe re-seeks),
-    and returns `{requested_frame_idx: bgr_ndarray}`.
+    Uses `decord.VideoReader` when available for faster C++ seeking/batching,
+    falling back to `cv2.VideoCapture` with `cap.grab()` for intra-GOP steps.
+    Returns `{requested_frame_idx: bgr_ndarray}`.
     """
     requested = sorted({int(idx) for idx in frame_indices})
     if not requested:
         return {}
+
+    try:
+        return _extract_video_frames_decord(
+            video_path,
+            requested,
+            progress_callback=progress_callback,
+        )
+    except ImportError:
+        pass
+    except Exception:
+        # Fall back to OpenCV if decord cannot open/decode this container/codec.
+        pass
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -88,6 +179,8 @@ def extract_video_frames(
 
             if last_clamped == target and last_frame is not None:
                 frames[orig_idx] = last_frame
+                if progress_callback is not None:
+                    progress_callback(1)
                 continue
 
             if (
@@ -113,6 +206,8 @@ def extract_video_frames(
             frames[orig_idx] = frame
             last_clamped = target
             last_frame = frame
+            if progress_callback is not None:
+                progress_callback(1)
     finally:
         cap.release()
 

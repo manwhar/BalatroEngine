@@ -1724,14 +1724,20 @@ class RunTrajectory:
             except Exception:
                 pass
 
-        for delta in self.deltas:
-            step_state = self.get_state(delta.step_idx)
-            if step_state.ante in ante_bosses and not delta.boss_blind:
-                delta.boss_blind = ante_bosses[step_state.ante]
-
         for step, kf in self.keyframes.items():
             if kf.ante in ante_bosses:
                 kf.boss_blind = ante_bosses[kf.ante]
+
+        for delta in self.deltas:
+            step_state = self.get_state(delta.step_idx)
+            if step_state.ante in ante_bosses and not delta.boss_blind:
+                target_boss = ante_bosses[step_state.ante]
+                if (
+                    delta.step_idx == 0
+                    or delta.ante is not None
+                    or self.get_state(delta.step_idx - 1).boss_blind != target_boss
+                ):
+                    delta.boss_blind = target_boss
 
 
 def step_simulation(state: GameState, action: Action) -> tuple[GameState, GameStateDelta]:

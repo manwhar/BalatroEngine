@@ -190,17 +190,28 @@ class ScreenStateTracker:
     state: CoarseScreenState = CoarseScreenState.PRE_GAME
     pre_pack_location: Location | None = None
     allow_play_game: bool = True
+    last_cash_out_frame: int | None = None
+    shop_next_round_cooldown_frames: int = 60
 
-    def allowed_template_names(self) -> frozenset[str]:
+    def allowed_template_names(self, frame_idx: int | None = None) -> frozenset[str]:
         """Returns the exact set of template names valid to scan in the current state."""
         allowed = ALLOWED_TEMPLATES_BY_STATE[self.state]
         if self.allow_play_game:
-            return allowed | {"Play Game"}
+            allowed = allowed | {"Play Game"}
+        if (
+            self.state == CoarseScreenState.SHOP
+            and frame_idx is not None
+            and self.last_cash_out_frame is not None
+            and 0 <= (frame_idx - self.last_cash_out_frame) < self.shop_next_round_cooldown_frames
+        ):
+            allowed = allowed - {"Next Round"}
         return allowed
 
-    def filter_templates(self, templates: Sequence[T]) -> list[T]:
+    def filter_templates(
+        self, templates: Sequence[T], frame_idx: int | None = None
+    ) -> list[T]:
         """Filters loaded `Template` objects to those valid in the current screen state."""
-        allowed = self.allowed_template_names()
+        allowed = self.allowed_template_names(frame_idx=frame_idx)
         return [t for t in templates if getattr(t, "name", None) in allowed]
 
     def _resolve_pack_return_location(self) -> Location:
@@ -221,7 +232,9 @@ class ScreenStateTracker:
             self.pre_pack_location = None
         return self.state
 
-    def on_template_clicked(self, template_name: str) -> CoarseScreenState:
+    def on_template_clicked(
+        self, template_name: str, frame_idx: int | None = None
+    ) -> CoarseScreenState:
         """Advances coarse screen state based on a clicked template name."""
         if template_name == "Open Options Menu":
             # Options can open the New Run -> PLAY setup modal from any screen.
@@ -237,6 +250,7 @@ class ScreenStateTracker:
             self.state = CoarseScreenState.SELECT
             self.pre_pack_location = None
             self.allow_play_game = True
+            self.last_cash_out_frame = None
             return self.state
 
         # Any concrete in-run gameplay click clears temporary Options/Main-Menu Play Game flag.
@@ -245,6 +259,7 @@ class ScreenStateTracker:
         if template_name == "Select Blind":
             self.state = CoarseScreenState.BLIND
             self.pre_pack_location = None
+            self.last_cash_out_frame = None
         elif template_name == "Skip Blind":
             # Skip Tag may either jump to next blind on SELECT or immediately open a pack.
             self.state = CoarseScreenState.SELECT_OR_PACK
@@ -258,6 +273,7 @@ class ScreenStateTracker:
         elif template_name == "Cash Out":
             self.state = CoarseScreenState.SHOP
             self.pre_pack_location = None
+            self.last_cash_out_frame = frame_idx
         elif template_name in ("Buy Card", "Buy and Use", "Redeem Voucher", "Reroll Shop"):
             self.state = CoarseScreenState.SHOP
             self.pre_pack_location = None
@@ -267,6 +283,7 @@ class ScreenStateTracker:
         elif template_name == "Next Round":
             self.state = CoarseScreenState.SELECT
             self.pre_pack_location = None
+            self.last_cash_out_frame = None
         elif template_name in ("Use In Pack", "Select Card"):
             return_loc = self._resolve_pack_return_location()
             self.pre_pack_location = return_loc

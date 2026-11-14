@@ -504,7 +504,7 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         self.assertEqual(traj.deltas[7].action.target_idx, 0)  # Blueprint
         self.assertEqual(traj.deltas[7].action.joker_order, [])
         self.assertEqual(traj.deltas[8].action.target_idx, 0)  # Hermit
-        self.assertEqual(traj.deltas[8].action.joker_order, [1])
+        self.assertEqual(traj.deltas[8].action.joker_order, [])
         self.assertEqual(traj.deltas[9].action.target_idx, 0)  # Overstock
         self.assertIn(bm.VoucherName.OVERSTOCK, traj.get_state(9).vouchers_redeemed)
         self.assertEqual(traj.deltas[10].action.target_idx, 0)  # Open Arcana Pack
@@ -1007,6 +1007,372 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         )
         self.assertEqual(state.free_rerolls, 0)
         self.assertEqual(state.reroll_cost, 6)
+
+    def test_cli_deck_stake_parsing_and_main_end_to_end_wiring(self):
+        import json
+        import main as main_module
+
+        self.assertEqual(pp.parse_deck("red"), bm.Deck.RED_DECK)
+        self.assertEqual(pp.parse_deck("Plasma Deck"), bm.Deck.PLASMA_DECK)
+        self.assertEqual(pp.parse_deck("ABANDONED_DECK"), bm.Deck.ABANDONED_DECK)
+        with self.assertRaises(ValueError):
+            pp.parse_deck("not_a_deck")
+
+        self.assertEqual(pp.parse_stake("white"), bm.Stake.WHITE)
+        self.assertEqual(pp.parse_stake("Gold Stake"), bm.Stake.GOLD)
+        self.assertEqual(pp.parse_stake("PURPLE"), bm.Stake.PURPLE)
+        with self.assertRaises(ValueError):
+            pp.parse_stake("not_a_stake")
+
+        parser = main_module.build_cli_parser()
+        args = parser.parse_args(
+            [
+                "--input-video",
+                "sample.mp4",
+                "--full-video",
+                "--deck",
+                "plasma",
+                "--stake",
+                "gold",
+                "--seed",
+                "CLISEED1",
+                "--conf-ocr",
+                "0.90",
+            ]
+        )
+        cfg = main_module.config_from_cli_args(args)
+        self.assertEqual(cfg.input_video_path, "sample.mp4")
+        self.assertIsNone(cfg.end_timestamp)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actions_out = Path(tmpdir) / "actions.json"
+            traj_out = Path(tmpdir) / "traj.json"
+            args.actions_out = str(actions_out)
+            args.trajectory_out = str(traj_out)
+
+            fake_payload = {"key": {"Select Blind": 0}, "frames": {}}
+            fake_state = gs.GameState(
+                seed="CLISEED1", deck=bm.Deck.PLASMA_DECK, stake=bm.Stake.GOLD
+            )
+            fake_traj = gs.RunTrajectory()
+            fake_traj.record_step(fake_state, action=None)
+
+            with (
+                patch(
+                    "main.detect_video_actions",
+                    return_value=(fake_payload, str(actions_out)),
+                ) as mock_det,
+                patch(
+                    "main.build_run_trajectory",
+                    return_value=(fake_state, fake_traj),
+                ) as mock_pp,
+            ):
+                res = main_module.run_end_to_end(args)
+
+            mock_det.assert_called_once()
+            mock_pp.assert_called_once()
+            pp_kwargs = mock_pp.call_args.kwargs
+            self.assertEqual(pp_kwargs["deck"], bm.Deck.PLASMA_DECK)
+            self.assertEqual(pp_kwargs["stake"], bm.Stake.GOLD)
+            self.assertEqual(pp_kwargs["seed"], "CLISEED1")
+            self.assertEqual(pp_kwargs["conf_threshold_ocr"], 0.90)
+            self.assertTrue(traj_out.exists())
+            saved = json.loads(traj_out.read_text(encoding="utf-8"))
+            self.assertEqual(saved["final_state"]["deck"], "Plasma Deck")
+            self.assertEqual(saved["final_state"]["stake"], "Gold Stake")
+            self.assertEqual(res["trajectory_json"], str(traj_out))
+
+
+class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
+    """Tests premature Next Round filtering, target_card/noise cleanup, and expressive diagnostics."""
+
+    def test_filter_premature_next_rounds_respects_window_and_intervening_actions(self):
+        key = {
+            "Cash Out": 0,
+            "Next Round": 1,
+            "Select Blind": 2,
+        }
+        frames = {
+            "3600": {"action": 0, "box": [400, 300, 600, 370]},  # Cash Out
+            "3648": {
+                "action": 1,
+                "box": [100, 100, 200, 150],
+            },  # False Next Round (<60f) -> drop
+            "4000": {"action": 0, "box": [400, 300, 600, 370]},  # Cash Out
+            "4120": {
+                "action": 1,
+                "box": [100, 100, 200, 150],
+            },  # Real Next Round (>=60f) -> keep
+            "4200": {"action": 0, "box": [400, 300, 600, 370]},  # Cash Out
+            "4220": {
+                "action": 2,
+                "box": [300, 200, 420, 250],
+            },  # Select Blind resets Cash Out timer
+            "4240": {
+                "action": 1,
+                "box": [100, 100, 200, 150],
+            },  # Not dropped since Select Blind occurred
+        }
+        diag = pp._init_diagnostics()
+        filtered = pp.filter_premature_next_rounds(frames, key, diag=diag)
+        self.assertNotIn("3648", filtered)
+        self.assertIn("4120", filtered)
+        self.assertIn("4240", filtered)
+        self.assertEqual(diag["filtered_premature_next_rounds"], [3648])
+
+    def test_screen_state_tracker_shop_next_round_cooldown(self):
+        from screen_state import CoarseScreenState, ScreenStateTracker
+
+        tracker = ScreenStateTracker(state=CoarseScreenState.CASH_OUT)
+        tracker.on_template_clicked("Cash Out", frame_idx=1000)
+        self.assertEqual(tracker.state, CoarseScreenState.SHOP)
+        self.assertEqual(tracker.last_cash_out_frame, 1000)
+
+        self.assertNotIn("Next Round", tracker.allowed_template_names(frame_idx=1048))
+        self.assertIn("Next Round", tracker.allowed_template_names(frame_idx=1060))
+        self.assertIn("Next Round", tracker.allowed_template_names(frame_idx=None))
+
+        # Premature Next Round should not be included during cooldown
+        filtered_templates = tracker.filter_templates(
+            [SimpleNamespace(name="Next Round"), SimpleNamespace(name="Reroll Shop")],
+            frame_idx=1048,
+        )
+        self.assertEqual([t.name for t in filtered_templates], ["Reroll Shop"])
+
+        # Legitimate Next Round after cooldown transitions to SELECT and clears last_cash_out_frame
+        tracker.on_template_clicked("Next Round", frame_idx=1120)
+        self.assertEqual(tracker.state, CoarseScreenState.SELECT)
+        self.assertIsNone(tracker.last_cash_out_frame)
+
+    def test_rules_select_blind_from_shop_advances_cleanly(self):
+        from game.engine.rules import on_action
+
+        state = gs.GameState()
+        state.location = bm.Location.SHOP
+        state.current_blind = bm.BlindName.SMALL
+        state.pending_blind_advance = True
+        state.coupon_shop_active = True
+
+        on_action(state, bm.Action(type=bm.ActionType.SELECT_BLIND, frame_idx=100))
+        self.assertEqual(state.location, bm.Location.BLIND)
+        self.assertFalse(state.pending_blind_advance)
+        self.assertEqual(state.current_blind, bm.BlindName.BIG)
+        self.assertFalse(state.coupon_shop_active)
+
+    def test_noise_cleanup_target_card_unexplained_jokers_and_cash_out_location(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Next Round": 4,
+                "Buy Card": 5,
+                "Sell Card": 6,
+            },
+            "frames": {
+                "100": {
+                    "action": 0,
+                    "box": [300, 200, 420, 250],
+                },  # Select Blind -> 98 (Blind R1)
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand -> 200
+                "300": {"action": 2, "box": [500, 500, 600, 550]},  # End Round -> 298
+                "400": {"action": 3, "box": [400, 300, 600, 370]},  # Cash Out -> 398
+                "445": {
+                    "action": 4,
+                    "box": [100, 100, 200, 150],
+                },  # Premature Next Round (<60f) -> filtered!
+                "500": {
+                    "action": 5,
+                    "box": [855, 575, 945, 625],
+                },  # Buy Card[0] (Ramen) -> 500 (offset 0)
+                "600": {
+                    "action": 4,
+                    "box": [100, 100, 200, 150],
+                },  # Legitimate Next Round -> 598
+                "700": {
+                    "action": 0,
+                    "box": [300, 200, 420, 250],
+                },  # Select Blind -> 698 (Ramen drops!)
+                "800": {
+                    "action": 6,
+                    "box": [665, 95, 735, 165],
+                },  # Sell Card -> 798 (Ramen re-appears, sold!)
+            },
+        }
+        needed = (98, 200, 298, 398, 500, 598, 698, 798)
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in needed}
+
+        def fake_batch_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                jokers: list[Any] = []
+                shop_items: list[Any] = []
+                if f_idx == 500:
+                    shop_items = [
+                        _make_shop_item("j_ramen", "Joker", [830, 380, 970, 560])
+                    ]
+                elif f_idx == 598:
+                    jokers = [_make_shop_item("j_ramen", "Joker", [520, 40, 660, 220])]
+                elif f_idx == 698:
+                    # Ramen vanished without a Sell Card action!
+                    jokers = []
+                elif f_idx == 798:
+                    # Ramen reappears before Sell Card resolves at idx 0
+                    jokers = [_make_shop_item("j_ramen", "Joker", [520, 40, 660, 220])]
+                outs.append(
+                    ShopRecognitionOutput(
+                        frame_index=f_idx,
+                        timestamp_seconds=ts,
+                        mode=mode,
+                        joker_bar=jokers,
+                        shop_items=shop_items,
+                    )
+                )
+            return outs
+
+        def fake_batch_hands(frames, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                cards = []
+                if f_idx == 200:
+                    cards = [
+                        _make_card_res("Ace", "Spades", selected=True),
+                        _make_card_res("King", "Spades", selected=False),
+                    ]
+                elif f_idx == 798:
+                    # Raised hand card visible during Sell Card should NOT leak into Sell Card selected_cards
+                    cards = [_make_card_res("6", "Hearts", selected=True)]
+                outs.append(
+                    HandRecognitionOutput(
+                        frame_index=f_idx, timestamp_seconds=ts, cards=cards
+                    )
+                )
+            return outs
+
+        def fake_batch_hud(frames, fields_by_frame=None, conf_threshold=0.90, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals: dict[str, int | float | None] = {f: None for f in flds}
+                if f_idx == 200:
+                    vals.update({"hud_round_score": 450, "hud_blind_target": 300})
+                elif f_idx == 298:
+                    vals.update({"hud_round_score": 450, "hud_blind_target": 300})
+                outs.append(
+                    HudRecognitionOutput(
+                        frame_index=f_idx, timestamp_seconds=ts, values=vals
+                    )
+                )
+            return outs
+
+        with (
+            patch(
+                "classifiers.inference.batch_recognize_shops",
+                side_effect=fake_batch_shops,
+            ),
+            patch(
+                "classifiers.inference.batch_recognize_hands",
+                side_effect=fake_batch_hands,
+            ),
+            patch(
+                "classifiers.inference.batch_recognize_hud", side_effect=fake_batch_hud
+            ),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        diag = plan["diagnostics"]
+        self.assertEqual(diag["filtered_premature_next_rounds"], [445])
+        # CASH_OUT ambient vs BLIND round_won state should NOT trigger false location drift warning
+        self.assertEqual(diag["location_mismatches"], [])
+        # Score updates on PLAY_HAND/END_ROUND counted separately, not as OCR drift overrides
+        self.assertGreaterEqual(diag["ocr_score_updates"], 1)
+        self.assertNotIn("current_chips", diag["ocr_overrides_by_field"])
+        # Frame 700 lost Ramen without a Sell Card, frame 800 re-appeared
+        self.assertEqual(
+            diag["unexplained_joker_changes"],
+            [
+                (700, "Select Blind", ["Ramen"], []),
+                (800, "Sell Card", [], ["Ramen"]),
+            ],
+        )
+
+        # Play Hand had sequential hand order -> identity hand_order omitted
+        play_act = traj.deltas[2].action
+        self.assertEqual(play_act.type, bm.ActionType.PLAY_HAND)
+        self.assertEqual(play_act.hand_order, [])
+        self.assertEqual(len(play_act.selected_cards), 1)
+
+        # Buy Card recorded target_card="Ramen"
+        buy_act = traj.deltas[5].action
+        self.assertEqual(buy_act.type, bm.ActionType.BUY_CARD)
+        self.assertEqual(buy_act.metadata.get("target_card"), "Ramen")
+
+        # Sell Card recorded target_card="Ramen", omitted identity joker_order/hand_order, and omitted selected_cards
+        sell_act = traj.deltas[8].action
+        self.assertEqual(sell_act.type, bm.ActionType.SELL_CARD)
+        self.assertEqual(sell_act.target_idx, 0)
+        self.assertEqual(sell_act.metadata.get("target_card"), "Ramen")
+        self.assertEqual(sell_act.joker_order, [])
+        self.assertEqual(sell_act.hand_order, [])
+        self.assertEqual(sell_act.selected_cards, [])
+        self.assertEqual(state.inventory.jokers, [])
+
+    def test_impute_retroactive_boss_blinds_only_records_boss_on_changes(self):
+        traj = gs.RunTrajectory()
+        st = gs.GameState()
+        traj.record_step(st, action=None)
+        st.round = 1
+        traj.record_step(
+            st, action=bm.Action(type=bm.ActionType.SELECT_BLIND, frame_idx=10)
+        )
+        st.round = 2
+        st.boss_blind = bm.BlindName.THE_HOOK
+        traj.record_step(
+            st, action=bm.Action(type=bm.ActionType.SELECT_BLIND, frame_idx=20)
+        )
+        st.ante = 2
+        st.round = 3
+        st.boss_blind = bm.BlindName.THE_WALL
+        traj.record_step(
+            st, action=bm.Action(type=bm.ActionType.SELECT_BLIND, frame_idx=30)
+        )
+        st.round = 4
+        traj.record_step(
+            st, action=bm.Action(type=bm.ActionType.SELECT_BLIND, frame_idx=40)
+        )
+
+        traj.impute_retroactive_boss_blinds()
+        self.assertEqual(traj.deltas[0].boss_blind, bm.BlindName.THE_HOOK)
+        self.assertIsNone(traj.deltas[1].boss_blind)
+        self.assertEqual(traj.deltas[3].boss_blind, bm.BlindName.THE_WALL)
+        self.assertIsNone(traj.deltas[4].boss_blind)
+
+    def test_extract_video_frames_parallel_threshold(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "test_parallel.avi"
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            writer = cv2.VideoWriter(str(video_path), fourcc, 30.0, (64, 64))
+            self.assertTrue(writer.isOpened())
+            try:
+                for i in range(60):
+                    val = (i * 4) % 256
+                    writer.write(np.full((64, 64, 3), val, dtype=np.uint8))
+            finally:
+                writer.release()
+
+            req = list(range(0, 56))
+            progress_ticks: list[int] = []
+            extracted = extract_video_frames(
+                video_path, req, progress_callback=progress_ticks.append
+            )
+            self.assertEqual(set(extracted.keys()), set(req))
+            self.assertEqual(sum(progress_ticks), len(req))
+            self.assertAlmostEqual(float(extracted[45].mean()), 180.0, delta=3.0)
 
 
 if __name__ == "__main__":

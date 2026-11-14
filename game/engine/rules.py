@@ -1177,6 +1177,24 @@ def _apply_consumable_state(state, card) -> None:
         state.update_face_down_candidates()
 
 
+def _leave_shop(state, action: Action, *, force_advance: bool = False) -> None:
+    """Dispatches `LEAVE_SHOP` hooks, advances pending blind/ante, and enters `Location.SELECT`."""
+    state.coupon_shop_active = False
+    ctx = TriggerContext(
+        event=TriggerEvent.LEAVE_SHOP, state=state, action=action
+    )
+    dispatch_jokers(ctx)
+    _advance_blind_and_ante_if_pending(
+        state,
+        force=(
+            force_advance
+            or state.location == Location.SHOP
+            or state.current_blind not in (BlindName.SMALL, BlindName.BIG)
+        ),
+    )
+    state.location = Location.SELECT
+
+
 def on_action(state, action: Action):
     """Executes deterministic game engine state transitions and triggers."""
     # Implicit joker reordering: if the action specifies a joker order, apply it before evaluating the action!
@@ -1551,22 +1569,13 @@ def on_action(state, action: Action):
             state.pending_blind_advance = True
 
         case ActionType.NEXT_ROUND:
-            state.coupon_shop_active = False
-            ctx = TriggerContext(
-                event=TriggerEvent.LEAVE_SHOP, state=state, action=action
-            )
-            dispatch_jokers(ctx)
-            _advance_blind_and_ante_if_pending(
-                state,
-                force=(
-                    state.location == Location.SHOP
-                    or state.current_blind not in (BlindName.SMALL, BlindName.BIG)
-                ),
-            )
-            state.location = Location.SELECT
+            _leave_shop(state, action)
 
         case ActionType.SELECT_BLIND:
-            _advance_blind_and_ante_if_pending(state)
+            if state.location == Location.SHOP:
+                _leave_shop(state, action, force_advance=True)
+            else:
+                _advance_blind_and_ante_if_pending(state)
             state.round_won = False
             state.round_advanced = False
             state.coupon_shop_active = False
@@ -1672,7 +1681,10 @@ def on_action(state, action: Action):
                 state.apply_cerulean_bell()
 
         case ActionType.SKIP_BLIND:
-            _advance_blind_and_ante_if_pending(state)
+            if state.location == Location.SHOP:
+                _leave_shop(state, action, force_advance=True)
+            else:
+                _advance_blind_and_ante_if_pending(state)
             state.blinds_skipped += 1
             tag: SkipTag | None = None
             orbital_hand: PokerHand | None = None
@@ -1697,7 +1709,10 @@ def on_action(state, action: Action):
                 state.target_chips = state.compute_target_chips()
 
         case ActionType.REROLL_BOSS:
-            _advance_blind_and_ante_if_pending(state)
+            if state.location == Location.SHOP:
+                _leave_shop(state, action, force_advance=True)
+            else:
+                _advance_blind_and_ante_if_pending(state)
             state.money -= 10
             if hasattr(state, "roll_boss_blind"):
                 state.roll_boss_blind(is_reroll=True)
