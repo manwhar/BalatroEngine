@@ -507,12 +507,119 @@ function G.DATASET_MOD:capture_frame_shop()
     end)
 end
 
+-- ==========================================
+-- HUD OCR CAPTURE & EXPORT
+-- ==========================================
+local HUD_CAPTURE_FIELDS = {
+    "hud_round_score",
+    "hud_money",
+    "hud_hands",
+    "hud_discards",
+    "hud_ante",
+    "hud_round",
+    "hud_reroll_cost",
+    "hud_blind_target",
+}
+
+function G.DATASET_MOD:capture_frame_hud()
+    if not G or not G.GAME then
+        self.state = 'idle'
+        self.capture_flash = 1.5
+        self.capture_flash_text = "START A RUN FIRST!"
+        return
+    end
+
+    self.frame_counts = self.frame_counts or {card = 0, shop = 0, end_round = 0, hud_ocr = 0}
+    local current_frame = self.frame_counts.hud_ocr or 0
+    local phase = self.hud_phase or ((G.STATE == G.STATES.SHOP) and 'shop' or 'blind')
+
+    local fields_snapshot = {
+        hud_round_score = tostring(G.GAME.chips_text or (number_format and number_format(G.GAME.chips or 0)) or (G.GAME.chips or 0)),
+        hud_money = tostring(G.GAME.dollars or 0),
+        hud_hands = tostring((G.GAME.current_round and G.GAME.current_round.hands_left) or 0),
+        hud_discards = tostring((G.GAME.current_round and G.GAME.current_round.discards_left) or 0),
+        hud_ante = tostring((G.GAME.round_resets and G.GAME.round_resets.ante) or 1),
+        hud_round = tostring(G.GAME.round or 1),
+        hud_reroll_cost = (phase == 'shop') and tostring((G.GAME.current_round and G.GAME.current_round.reroll_cost) or 0) or "",
+        hud_blind_target = (phase == 'blind' and self.hud_blind_visible ~= false and G.GAME.blind and G.GAME.blind.blind_set)
+            and tostring(G.GAME.blind.chip_text or (number_format and number_format(G.GAME.blind.chips or 0)) or "0")
+            or "",
+    }
+
+    if self.hud_corrupted_fields then
+        for fname, is_corrupted in pairs(self.hud_corrupted_fields) do
+            if is_corrupted and fields_snapshot[fname] ~= nil then
+                fields_snapshot[fname] = ""
+            end
+        end
+    end
+
+    local jitter_px = (self.config and self.config.hud_capture_jitter_px) or 5
+    local rois_copy = {}
+    for _, fname in ipairs(HUD_CAPTURE_FIELDS) do
+        local r = self.config.rois[fname]
+        if r then
+            local jx = (jitter_px > 0) and math.random(-jitter_px, jitter_px) or 0
+            local jy = (jitter_px > 0) and math.random(-jitter_px, jitter_px) or 0
+            rois_copy[fname] = {x = r.x + jx, y = r.y + jy, w = r.w, h = r.h}
+        end
+    end
+
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_hud_ocr/images")
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_hud_ocr/labels")
+
+    love.graphics.captureScreenshot(function(img)
+        for _, fname in ipairs(HUD_CAPTURE_FIELDS) do
+            local r = rois_copy[fname]
+            if r then
+                local rw, rh = math.max(1, math.floor(r.w)), math.max(1, math.floor(r.h))
+                local rx, ry = math.floor(r.x), math.floor(r.y)
+                local cropped = paste_clamped_region(img, rx, ry, rw, rh)
+                local filedata = cropped:encode("png")
+                local img_path = string.format("Mods/gamestate_dataset_cv/dataset_hud_ocr/images/frame_%05d_%s.png", current_frame, fname)
+                love.filesystem.write(img_path, filedata)
+                if filedata and filedata.release then filedata:release() end
+                if cropped and cropped.release then cropped:release() end
+            end
+        end
+
+        if img and img.release then img:release() end
+
+        local field_lines = {}
+        for _, fname in ipairs(HUD_CAPTURE_FIELDS) do
+            table.insert(field_lines, string.format('    "%s": "%s"', fname, json_escape(fields_snapshot[fname] or "")))
+        end
+        local json_content = string.format(
+            '{\n  "frame_index": %d,\n  "phase": "%s",\n  "fields": {\n%s\n  }\n}\n',
+            current_frame,
+            json_escape(phase),
+            table.concat(field_lines, ",\n")
+        )
+        local json_path = string.format("Mods/gamestate_dataset_cv/dataset_hud_ocr/labels/frame_%05d.json", current_frame)
+        love.filesystem.write(json_path, json_content)
+
+        self.frame_counts.hud_ocr = current_frame + 1
+        self.frame_count = self.frame_counts.hud_ocr
+        self.state = 'idle'
+        self.capture_flash = 0.5
+        self.capture_flash_text = string.format("HUD FRAME %05d SAVED (%s)!", current_frame, string.upper(phase))
+
+        if self.ShopGen and self.ShopGen.cleanup_cycle then
+            self.ShopGen.cleanup_cycle()
+        else
+            collectgarbage("collect")
+        end
+    end)
+end
+
 -- Top-level capture dispatcher
 function G.DATASET_MOD:capture_frame()
     if self.config.mode == 'card_classifier' then
         self:capture_frame_card()
     elseif self.config.mode == 'shop_classifier' then
         self:capture_frame_shop()
+    elseif self.config.mode == 'hud_ocr' then
+        self:capture_frame_hud()
     end
 end
 

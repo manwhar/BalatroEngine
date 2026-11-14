@@ -32,20 +32,24 @@ G.DATASET_MOD.mod_path = get_mod_path()
 
 -- Submodule Loader
 local function load_submodule(rel_path)
+    local last_err = nil
     -- 1. Try SMODS.load_file
     if SMODS and SMODS.load_file then
-        local chunk = SMODS.load_file(rel_path, "gamestate_dataset_cv")
+        local chunk, err = SMODS.load_file(rel_path, "gamestate_dataset_cv")
         if chunk then return chunk() end
-        local chunk2 = SMODS.load_file(rel_path)
+        if err then last_err = err end
+        local chunk2, err2 = SMODS.load_file(rel_path)
         if chunk2 then return chunk2() end
+        if err2 then last_err = err2 end
     end
     -- 2. Try NFS.read
     if NFS and NFS.read and G.DATASET_MOD and G.DATASET_MOD.mod_path then
         local full_p = G.DATASET_MOD.mod_path .. rel_path
         local content = NFS.read(full_p)
         if content then
-            local chunk = (loadstring or load)(content, "=[GDCV " .. rel_path .. "]")
+            local chunk, err = (loadstring or load)(content, "=[GDCV " .. rel_path .. "]")
             if chunk then return chunk() end
+            if err then last_err = err end
         end
     end
     -- 3. Fallback to love.filesystem
@@ -56,11 +60,12 @@ local function load_submodule(rel_path)
     for _, path in ipairs(candidates) do
         if love.filesystem.getInfo(path) then
             local content = love.filesystem.read(path)
-            local chunk = (loadstring or load)(content, "=[GDCV " .. path .. "]")
+            local chunk, err = (loadstring or load)(content, "=[GDCV " .. path .. "]")
             if chunk then return chunk() end
+            if err then last_err = err end
         end
     end
-    error("GDCV: Failed to load module " .. tostring(rel_path))
+    error("GDCV: Failed to load module " .. tostring(rel_path) .. (last_err and (": " .. tostring(last_err)) or ""))
 end
 
 -- Load Modular Components
@@ -70,12 +75,14 @@ local ShopGenModule         = load_submodule("src/shop_gen.lua")
 local CaptureModule         = load_submodule("src/capture.lua")
 local EndRoundGenModule     = load_submodule("src/end_round_gen.lua")
 local EndRoundCaptureModule = load_submodule("src/end_round_capture.lua")
+local HudGenModule          = load_submodule("src/hud_gen.lua")
 local UIModule              = load_submodule("src/ui.lua")
 local RunTracker            = load_submodule("src/run_tracker.lua")
 
 G.DATASET_MOD.ShopGen = ShopGenModule
 G.DATASET_MOD.EndRoundGen = EndRoundGenModule
 G.DATASET_MOD.EndRoundCapture = EndRoundCaptureModule
+G.DATASET_MOD.HudGen = HudGenModule
 G.DATASET_MOD.RunTracker = RunTracker
 
 -- Initialize configuration, counters, and directories

@@ -313,16 +313,39 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
     ):
         state.locked_hand_type = poker_hand
 
-    if not hand_debuffed:
+    if hand_debuffed:
+        ctx_debuffed = TriggerContext(
+            event=TriggerEvent.DEBUFFED_HAND,
+            state=state,
+            action=action,
+            scoring_cards=scoring_cards,
+            full_hand=played_cards,
+            poker_hand=poker_hand,
+            boss_triggered=True,
+        )
+        dispatch_jokers(ctx_debuffed)
+    else:
+        boss_triggered = False
         if not state.boss_disabled:
             if state.current_blind == BlindName.THE_ARM:
                 cur_lvl = state.hand_levels.get(poker_hand, 1)
                 if cur_lvl > 1:
+                    boss_triggered = True
                     state.hand_levels[poker_hand] = cur_lvl - 1
             elif state.current_blind == BlindName.THE_OX:
                 ox_target = getattr(state, "ox_target_hand", None) or PokerHand.HIGH_CARD
                 if poker_hand == ox_target:
+                    boss_triggered = True
                     state.money = 0
+            elif state.current_blind == BlindName.THE_FLINT:
+                boss_triggered = True
+
+            if any(
+                getattr(card, "debuffed", False)
+                or (hasattr(state, "card_is_debuffed_by_boss") and state.card_is_debuffed_by_boss(card))
+                for card in scoring_cards
+            ):
+                boss_triggered = True
 
         # 1. Before play
         ctx = TriggerContext(
@@ -406,6 +429,18 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
                 if state.rng.poll_odds("glass", 1, 4, get_oops_multiplier(state)):
                     card.destroyed = True
                     state.remove_card_from_deck(card, shattered=True)
+
+        # 4b. Main Joker scoring triggers (e.g. Matador on Boss Blind triggered)
+        ctx_main = TriggerContext(
+            event=TriggerEvent.JOKER_MAIN,
+            state=state,
+            action=action,
+            scoring_cards=scoring_cards,
+            full_hand=played_cards,
+            poker_hand=poker_hand,
+            boss_triggered=boss_triggered,
+        )
+        dispatch_jokers(ctx_main)
 
         # 5. After play
         ctx_after = TriggerContext(
@@ -922,8 +957,20 @@ def _apply_consumable_state(state, card) -> None:
                         chosen.edition = ed
             else:
                 state.pending_cv_checks.add("jokers")
-        elif c_name in (TarotName.HERMIT, TarotName.TEMPERANCE):
-            state.pending_cv_checks.add("money")
+        elif c_name == TarotName.HERMIT:
+            state.money += max(0, min(state.money, 20))
+        elif c_name == TarotName.TEMPERANCE:
+            if state.inventory:
+                has_astro = _has_joker(state, JokerName.ASTRONOMER)
+                total_sell = sum(
+                    j.get_sell_value(
+                        discount_percent=state.discount_percent,
+                        inflation=state.inflation,
+                        astronomer=has_astro,
+                    )
+                    for j in state.inventory.jokers
+                )
+                state.money += min(50, total_sell)
         if isinstance(c_name, TarotName):
             state.last_tarot_planet = c_name
     elif c_type == CardType.PLANET:

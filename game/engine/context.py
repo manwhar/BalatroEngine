@@ -28,6 +28,8 @@ class TriggerEvent(Enum):
 
     # Hand Play & Discard Events
     BEFORE_PLAY = auto()
+    JOKER_MAIN = auto()
+    DEBUFFED_HAND = auto()
     AFTER_PLAY = auto()
     DISCARD = auto()
     INDIVIDUAL_CARD_SCORED = auto()
@@ -43,6 +45,7 @@ class TriggerContext:
     extra: dict[str, Any] | None = None
     is_blueprint: bool = False
     hook: bool = False
+    boss_triggered: bool = False
     scoring_cards: list[Any] = field(default_factory=list)
     full_hand: list[Any] = field(default_factory=list)
     poker_hand: Any = None

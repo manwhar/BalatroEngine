@@ -1388,14 +1388,8 @@ def handle_reserved_parking(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.MATADOR)
 def handle_matador(joker: Joker, ctx: TriggerContext):
-    # Matador's trigger depends on Balatro's internal `blind.triggered` debuff evaluation
-    # (complicated across edge cases); money updates are intentionally left to money OCR.
-    if ctx.event in (TriggerEvent.BEFORE_PLAY, TriggerEvent.DISCARD):
-        if (
-            ctx.state.current_blind not in (BlindName.SMALL, BlindName.BIG)
-            and not ctx.state.boss_disabled
-        ):
-            ctx.state.pending_cv_checks.add("money")
+    if ctx.event in (TriggerEvent.DEBUFFED_HAND, TriggerEvent.JOKER_MAIN) and ctx.boss_triggered:
+        ctx.state.money += 8
 
 
 @joker_hook(JokerName.MIDAS_MASK)
@@ -1579,6 +1573,8 @@ def dispatch_jokers(ctx: TriggerContext):
                     poker_hand=ctx.poker_hand,
                     extra=ctx.extra,
                     is_blueprint=True,
+                    hook=ctx.hook,
+                    boss_triggered=ctx.boss_triggered,
                 )
                 JOKER_EFFECTS[target.name](target, copy_ctx)
         elif j.name in JOKER_EFFECTS:

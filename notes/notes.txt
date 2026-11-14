@@ -1,5 +1,4 @@
 Left todos:
 - Seed / deck / stake data collection
-- [IN PROGRESS] New ML model trained to evaluate the temporal location of the "round end" action threshold
 - Generic optimizations and big-picture events (i.e., before game start (video intro etc), only scan for the "PLAY" button click or Select Blind click and then initialize gamestate)
 - All OCR

@@ -13,6 +13,14 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'roi_consumeables' then return self.config.rois.consumeables, 'roi', "ROI: Consumables (Top Right)"
     elseif t == 'roi_card_hand' then return self.config.rois.card_hand, 'roi', "ROI: Card Hand"
     elseif t == 'roi_play_area' then return self.config.rois.play_area, 'roi', "ROI: Play Area (G.play)"
+    elseif t == 'roi_hud_round_score' then return self.config.rois.hud_round_score, 'roi', "ROI: HUD Round Score"
+    elseif t == 'roi_hud_money' then return self.config.rois.hud_money, 'roi', "ROI: HUD Money ($)"
+    elseif t == 'roi_hud_hands' then return self.config.rois.hud_hands, 'roi', "ROI: HUD Hands"
+    elseif t == 'roi_hud_discards' then return self.config.rois.hud_discards, 'roi', "ROI: HUD Discards"
+    elseif t == 'roi_hud_ante' then return self.config.rois.hud_ante, 'roi', "ROI: HUD Ante"
+    elseif t == 'roi_hud_round' then return self.config.rois.hud_round, 'roi', "ROI: HUD Round"
+    elseif t == 'roi_hud_reroll_cost' then return self.config.rois.hud_reroll_cost, 'roi', "ROI: Shop Reroll Cost"
+    elseif t == 'roi_hud_blind_target' then return self.config.rois.hud_blind_target, 'roi', "ROI: HUD Blind Target"
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
     elseif t == 'box_item' then return self.config.boxes.item_card, 'box', "Box: Shop/Pack Item"
     elseif t == 'box_consumeable' then return self.config.boxes.consumeable_card, 'box', "Box: Consumable Card"
@@ -335,6 +343,7 @@ function UI.init_callbacks(mod)
             ['Card Classifier'] = 'card_classifier',
             ['Shop Classifier'] = 'shop_classifier',
             ['End Round Classifier'] = 'end_round_classifier',
+            ['HUD OCR'] = 'hud_ocr',
         }
         local chosen = mode_map[args.to_val] or 'off'
         mod:set_mode(chosen)
@@ -983,6 +992,7 @@ function UI.build_page_definition(mod)
     local current_mode_idx = (mod.config.mode == 'card_classifier' and 2)
         or (mod.config.mode == 'shop_classifier' and 3)
         or (mod.config.mode == 'end_round_classifier' and 4)
+        or (mod.config.mode == 'hud_ocr' and 5)
         or 1
 
     local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
@@ -1018,7 +1028,7 @@ function UI.build_page_definition(mod)
         n = G.UIT.ROOT,
         config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
         nodes = {
-            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier'}, current_mode_idx, 'gdcv_change_mode', 3.6),
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier', 'HUD OCR'}, current_mode_idx, 'gdcv_change_mode', 3.6),
             make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
             make_cycle_row("End-Round Clip Cap", 'gdcv_mc_cycle', max_clips_options, current_mc_idx, 'gdcv_change_max_clips'),
             make_cycle_row("End-Round Sim Batch", 'gdcv_er_cycle', er_batch_options, current_er_idx, 'gdcv_change_er_batch'),
@@ -1176,6 +1186,16 @@ function G.DATASET_MOD:draw_debug()
     elseif self.config.mode == 'end_round_classifier' then
         local is_play_sel = (self.selected_target == 'roi_play_area')
         draw_roi_box(self.config.rois.play_area, "[ROI: PLAY AREA (256x72 @ 15fps)]", is_play_sel, 0.2, 0.8, 1)
+    elseif self.config.mode == 'hud_ocr' then
+        local sel = self.selected_target
+        draw_roi_box(self.config.rois.hud_round_score,  "[1: ROUND SCORE]",  sel == 'roi_hud_round_score',  0.2, 0.9, 1.0)
+        draw_roi_box(self.config.rois.hud_money,        "[2: MONEY ($)]",    sel == 'roi_hud_money',        1.0, 0.85, 0.2)
+        draw_roi_box(self.config.rois.hud_hands,        "[3: HANDS]",        sel == 'roi_hud_hands',        0.3, 0.7, 1.0)
+        draw_roi_box(self.config.rois.hud_discards,     "[4: DISCARDS]",     sel == 'roi_hud_discards',     1.0, 0.4, 0.4)
+        draw_roi_box(self.config.rois.hud_ante,         "[5: ANTE]",         sel == 'roi_hud_ante',         0.7, 0.5, 1.0)
+        draw_roi_box(self.config.rois.hud_round,        "[6: ROUND]",        sel == 'roi_hud_round',        0.4, 1.0, 0.6)
+        draw_roi_box(self.config.rois.hud_reroll_cost,  "[7: REROLL COST]",  sel == 'roi_hud_reroll_cost',  0.2, 1.0, 0.3)
+        draw_roi_box(self.config.rois.hud_blind_target, "[8: BLIND TARGET]", sel == 'roi_hud_blind_target', 1.0, 0.6, 0.2)
     elseif self.config.mode == 'shop_classifier' then
         local sel = self.selected_target
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
@@ -1296,6 +1316,7 @@ function G.DATASET_MOD:draw_debug()
 
     local mode_str = (self.config.mode == 'card_classifier' and "CARD CLASSIFIER")
         or (self.config.mode == 'end_round_classifier' and "END ROUND CLASSIFIER")
+        or (self.config.mode == 'hud_ocr' and "HUD OCR")
         or "SHOP & JOKER CLASSIFIER"
     love.graphics.setColor(1, 0.85, 0.2, 1)
     love.graphics.print(string.format("GAMESTATE CV CALIBRATION  -  [%s]", mode_str), 18, 14)
@@ -1318,12 +1339,14 @@ function G.DATASET_MOD:draw_debug()
         end
     elseif self.config.mode == 'end_round_classifier' then
         love.graphics.print("Keys: 3: ROI Play Area | R: Preview Scenario | C: Record 1 Test Clip | TAB: Auto-Generate Clips", 18, 58)
+    elseif self.config.mode == 'hud_ocr' then
+        love.graphics.print("Keys: 1:Score | 2:Money | 3:Hands | 4:Discards | 5:Ante | 6:Round | 7:Reroll | 8:BlindTarget", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card | 3: ROI Play Area", 18, 58)
     end
 
     love.graphics.setColor(0.9, 0.9, 0.9, 1)
-    love.graphics.print("W, A, S, D: Move / Shift Offset  |  Arrow Keys: Adjust Size (Hold Shift: Fast)", 18, 80)
+    love.graphics.print("W, A, S, D: Move / Shift Offset  |  Arrow Keys: Adjust Size (Shift: Fast, Ctrl: Slow)", 18, 80)
     love.graphics.print("F1/F2: Switch Mode  |  TAB: Toggle Gen/Setup  |  R: Randomize  |  P: Shop/Pack  |  C: Capture", 18, 102)
     love.graphics.print("[, ]: Save / Load Config (dataset/boxes.lua)", 18, 124)
 
@@ -1336,6 +1359,12 @@ function G.DATASET_MOD:draw_debug()
             and string.format(" | REC %s frame=%d (%s)", clip.id, #clip.frame_bytes, clip.scenario and clip.scenario.archetype or "")
             or string.format(" | Batch=%dx", self.config.end_round_frames_per_tick or 2)
         love.graphics.print(string.format("Next Clip: %06d / %d%s | Lua Mem: %.1f MB", cur_clips, max_clips, rec_str, collectgarbage("count") / 1024), 18, 146)
+    elseif self.config.mode == 'hud_ocr' then
+        local cur_hud = (self.frame_counts and self.frame_counts.hud_ocr) or 0
+        local max_frames = self.config.max_frames or 10000
+        local phase_str = string.upper(self.hud_phase or 'blind')
+        love.graphics.print(string.format("Next HUD Frame: %05d / %d | Phase: %s (%d/%d) | P: Blind/Shop | Lua Mem: %.1f MB",
+            cur_hud, max_frames, phase_str, self.hud_phase_step or 0, self.config.frames_per_phase or 100, collectgarbage("count") / 1024), 18, 146)
     else
         local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
         local phase_extra = ""
@@ -1368,12 +1397,13 @@ end
 -- ==========================================
 -- KEYPRESS HANDLER
 -- ==========================================
-local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier' }
+local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr' }
 local MODE_DISPLAY_NAMES = {
     off = 'OFF',
     card_classifier = 'CARD CLASSIFIER',
     shop_classifier = 'SHOP CLASSIFIER',
     end_round_classifier = 'END ROUND CLASSIFIER',
+    hud_ocr = 'HUD OCR',
 }
 
 local function cycle_classifier_mode(mod, step)
@@ -1404,6 +1434,11 @@ function G.DATASET_MOD:on_keypressed(key)
 
     if key == 'tab' then
         if self.config.calibration_mode == 'setup' then
+            if self.config.mode == 'hud_ocr' and not (G and G.GAME) then
+                self.capture_flash = 2.0
+                self.capture_flash_text = "START A RUN FIRST BEFORE GENERATING HUD OCR DATA!"
+                return
+            end
             self.config.calibration_mode = 'generation'
             self.state = 'idle'
             self.capture_flash = 2.0
@@ -1429,6 +1464,16 @@ function G.DATASET_MOD:on_keypressed(key)
             end
         elseif self.config.mode == 'end_round_classifier' then
             if key == '3' or key == '1' then self.selected_target = 'roi_play_area' end
+        elseif self.config.mode == 'hud_ocr' then
+            if key == '1' then self.selected_target = 'roi_hud_round_score'
+            elseif key == '2' then self.selected_target = 'roi_hud_money'
+            elseif key == '3' then self.selected_target = 'roi_hud_hands'
+            elseif key == '4' then self.selected_target = 'roi_hud_discards'
+            elseif key == '5' then self.selected_target = 'roi_hud_ante'
+            elseif key == '6' then self.selected_target = 'roi_hud_round'
+            elseif key == '7' then self.selected_target = 'roi_hud_reroll_cost'
+            elseif key == '8' then self.selected_target = 'roi_hud_blind_target'
+            end
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'
             elseif key == '2' then self.selected_target = 'roi_shop'
@@ -1461,6 +1506,8 @@ function G.DATASET_MOD:on_keypressed(key)
                     self.capture_flash = 2.0
                     self.capture_flash_text = "ENTER AN ACTIVE BLIND HAND (SELECTING_HAND) FIRST!"
                 end
+            elseif self.config.mode == 'hud_ocr' then
+                self:generate_hud_step()
             else
                 if (self.shop_phase or 'shop') == 'shop' then
                     self:setup_shop_screen()
@@ -1476,6 +1523,8 @@ function G.DATASET_MOD:on_keypressed(key)
             end
         elseif key == 'p' and self.config.mode == 'shop_classifier' then
             self:toggle_shop_screen_mode()
+        elseif key == 'p' and self.config.mode == 'hud_ocr' then
+            self:toggle_hud_screen_mode()
         elseif key == 't' and self.config.mode == 'card_classifier' then
             self:randomize_hand_selection()
         elseif key == 'c' then
@@ -1531,7 +1580,13 @@ function G.DATASET_MOD:update(dt)
         if not obj then return end
 
         if obj_type == 'roi' then
-            local roi_step = love.keyboard.isDown('lshift', 'rshift') and (2500 * dt) or (750 * dt)
+            local roi_speed = 750
+            if love.keyboard.isDown('lctrl', 'rctrl') then
+                roi_speed = 40
+            elseif love.keyboard.isDown('lshift', 'rshift') then
+                roi_speed = 2500
+            end
+            local roi_step = roi_speed * dt
             if love.keyboard.isDown('w') then obj.y = obj.y - roi_step end
             if love.keyboard.isDown('s') then obj.y = obj.y + roi_step end
             if love.keyboard.isDown('a') then obj.x = obj.x - roi_step end
@@ -1541,7 +1596,13 @@ function G.DATASET_MOD:update(dt)
             if love.keyboard.isDown('left') then obj.w = obj.w - roi_step end
             if love.keyboard.isDown('right') then obj.w = obj.w + roi_step end
         elseif obj_type == 'box' then
-            local step = love.keyboard.isDown('lshift', 'rshift') and (2.0 * dt) or (0.5 * dt)
+            local box_speed = 0.5
+            if love.keyboard.isDown('lctrl', 'rctrl') then
+                box_speed = 0.05
+            elseif love.keyboard.isDown('lshift', 'rshift') then
+                box_speed = 2.0
+            end
+            local step = box_speed * dt
             local moved = false
             if love.keyboard.isDown('w') then obj.oy = obj.oy - step; moved = true end
             if love.keyboard.isDown('s') then obj.oy = obj.oy + step; moved = true end
@@ -1560,7 +1621,9 @@ function G.DATASET_MOD:update(dt)
             -- Clip stepping and capture run via EndRoundCapture.step_love_update & capture_after_draw.
             return
         end
-        local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
+        local cur_frame = (self.config.mode == 'shop_classifier' and self.frame_counts.shop)
+            or (self.config.mode == 'hud_ocr' and self.frame_counts.hud_ocr)
+            or self.frame_counts.card
         local max_frames = self.config.max_frames or 10000
 
         if cur_frame >= max_frames then
@@ -1579,6 +1642,12 @@ function G.DATASET_MOD:update(dt)
                 self:randomize_background()
             elseif self.config.mode == 'shop_classifier' then
                 self:generate_shop_step()
+            elseif self.config.mode == 'hud_ocr' then
+                local ok = self:generate_hud_step()
+                if not ok then
+                    self.config.calibration_mode = 'setup'
+                    return
+                end
             end
 
             self.state = 'waiting'

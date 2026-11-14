@@ -3,7 +3,7 @@
 local Config = {}
 
 local DEFAULT_CONFIG = {
-    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier'
+    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr'
     calibration_mode = 'setup', -- 'setup' or 'generation'
     max_frames = 20000,
     max_clips = 1000, -- Target clip count cap for end_round_classifier
@@ -22,6 +22,14 @@ local DEFAULT_CONFIG = {
         booster      = {x = 1071.358597, y = 724.761198, w = 427.707911,  h = 300.000000},
         pack         = {x = 565.612571,  y = 588.005101, w = 960.654887,  h = 307.239491},
         consumeables = {x = 1369.783812, y = 30.836806,  w = 425.206356,  h = 270.406328},
+        hud_round_score  = {x = 184.125227, y = 389.166317, w = 310.609893, h = 91.386205},
+        hud_money        = {x = 235.579213, y = 810.532096, w = 258.355712, h = 109.781902},
+        hud_hands        = {x = 245.551355, y = 721.540544, w = 103.609385, h = 84.604535},
+        hud_discards     = {x = 376.543146, y = 722.718153, w = 104.654328, h = 79.453563},
+        hud_ante         = {x = 237.682514, y = 955.549886, w = 118.302089, h = 75.922924},
+        hud_round        = {x = 376.753403, y = 955.475887, w = 105.791305, h = 74.350088},
+        hud_reroll_cost  = {x = 652.927185, y = 575.954539, w = 89.693143,  h = 65.191462},
+        hud_blind_target = {x = 238.315153, y = 223.162116, w = 243.768598, h = 70.880588},
     },
     boxes = {
         card             = {w = 0.465890, h = 1.040970, ox = -0.240265, oy = 0.020829},
@@ -57,7 +65,7 @@ function Config.init(mod)
     end
 
     mod.selected_target = 'roi_joker_bar'
-    mod.frame_counts = {card = 0, shop = 0, end_round = 0}
+    mod.frame_counts = {card = 0, shop = 0, end_round = 0, hud_ocr = 0}
 
     Config.init_directories()
     mod:load_config()
@@ -77,6 +85,9 @@ function Config.init_directories()
         "Mods/gamestate_dataset_cv/dataset_card_crops/images",
         "Mods/gamestate_dataset_cv/dataset_card_crops/labels",
         "Mods/gamestate_dataset_cv/dataset_end_round",
+        "Mods/gamestate_dataset_cv/dataset_hud_ocr",
+        "Mods/gamestate_dataset_cv/dataset_hud_ocr/images",
+        "Mods/gamestate_dataset_cv/dataset_hud_ocr/labels",
     }
     for _, dir in ipairs(dirs) do
         love.filesystem.createDirectory(dir)
@@ -137,14 +148,30 @@ function Config.init_frame_counts(mod)
     end
     mod.frame_counts.end_round = max_er_idx + 1
 
+    -- 4. HUD OCR dataset frame counter
+    local max_hud_idx = -1
+    local hud_dir = "Mods/gamestate_dataset_cv/dataset_hud_ocr/labels"
+    if love.filesystem.getInfo(hud_dir) then
+        for _, f in ipairs(love.filesystem.getDirectoryItems(hud_dir)) do
+            local num = f:match("^frame_(%d+)%.json$")
+            if num then
+                local n = tonumber(num)
+                if n and n > max_hud_idx then max_hud_idx = n end
+            end
+        end
+    end
+    mod.frame_counts.hud_ocr = max_hud_idx + 1
+
     if mod.config.mode == 'shop_classifier' then
         mod.frame_count = mod.frame_counts.shop
     elseif mod.config.mode == 'end_round_classifier' then
         mod.frame_count = mod.frame_counts.end_round
+    elseif mod.config.mode == 'hud_ocr' then
+        mod.frame_count = mod.frame_counts.hud_ocr
     else
         mod.frame_count = mod.frame_counts.card
     end
-    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d, EndRound Clips: %d", mod.frame_counts.card, mod.frame_counts.shop, mod.frame_counts.end_round))
+    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d, EndRound Clips: %d, HUD OCR: %d", mod.frame_counts.card, mod.frame_counts.shop, mod.frame_counts.end_round, mod.frame_counts.hud_ocr))
 end
 
 function Config.init_classes(mod)
@@ -160,7 +187,9 @@ function Config.clear_all_dataset_data(mod)
         "Mods/gamestate_dataset_cv/dataset_shop/images",
         "Mods/gamestate_dataset_cv/dataset_shop/labels",
         "Mods/gamestate_dataset_cv/dataset_card_crops/images",
-        "Mods/gamestate_dataset_cv/dataset_card_crops/labels"
+        "Mods/gamestate_dataset_cv/dataset_card_crops/labels",
+        "Mods/gamestate_dataset_cv/dataset_hud_ocr/images",
+        "Mods/gamestate_dataset_cv/dataset_hud_ocr/labels",
     }
     local removed_count = 0
     for _, dir in ipairs(dirs) do
@@ -199,6 +228,7 @@ function Config.clear_all_dataset_data(mod)
     mod.frame_counts.card = 0
     mod.frame_counts.shop = 0
     mod.frame_counts.end_round = 0
+    mod.frame_counts.hud_ocr = 0
     mod.frame_count = 0
     mod.phase_step = 0
     mod.stats_text = string.format("Card: 0  |  Shop: 0  |  EndRound Clips: 0  |  Phase: %s",
@@ -315,7 +345,7 @@ function G.DATASET_MOD:load_config(preserve_mode)
 end
 
 function G.DATASET_MOD:set_mode(mode)
-    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'off' then
+    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'hud_ocr' or mode == 'off' then
         if mode ~= self.config.mode then
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
@@ -339,6 +369,9 @@ function G.DATASET_MOD:set_mode(mode)
         elseif mode == 'end_round_classifier' then
             self.selected_target = 'roi_play_area'
             self.frame_count = self.frame_counts.end_round
+        elseif mode == 'hud_ocr' then
+            self.selected_target = 'roi_hud_round_score'
+            self.frame_count = self.frame_counts.hud_ocr
         end
         print("DATASET: Mode set to " .. tostring(mode))
     end

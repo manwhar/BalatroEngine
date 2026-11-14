@@ -2772,6 +2772,165 @@ class TestNewEngineFeatures(unittest.TestCase):
         pillar, _ = gs.step_simulation(pillar, bm.Action(type=bm.ActionType.END_ROUND))
         self.assertEqual(pillar.played_cards_this_ante, [])
 
+    def test_hermit_temperance_and_matador_deterministic_money(self):
+        """Tests deterministic money resolution for Hermit, Temperance, and Matador."""
+        # 1. The Hermit: doubles money up to +$20; +$0 if negative
+        s_neg = gs.GameState(
+            location=bm.Location.SHOP,
+            money=-5,
+            inventory=bm.Inventory(consumables=[bm.Tarot(name=bm.TarotName.HERMIT)]),
+        )
+        s_neg, _ = gs.step_simulation(
+            s_neg, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0)
+        )
+        self.assertEqual(s_neg.money, -5)
+        self.assertNotIn("money", s_neg.pending_cv_checks)
+
+        s_mid = gs.GameState(
+            location=bm.Location.SHOP,
+            money=12,
+            inventory=bm.Inventory(consumables=[bm.Tarot(name=bm.TarotName.HERMIT)]),
+        )
+        s_mid, _ = gs.step_simulation(
+            s_mid, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0)
+        )
+        self.assertEqual(s_mid.money, 24)
+
+        s_cap = gs.GameState(
+            location=bm.Location.SHOP,
+            money=35,
+            inventory=bm.Inventory(consumables=[bm.Tarot(name=bm.TarotName.HERMIT)]),
+        )
+        s_cap, _ = gs.step_simulation(
+            s_cap, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0)
+        )
+        self.assertEqual(s_cap.money, 55)
+
+        # 2. Temperance: sums Joker sell values (including extra_value), capped at +$50
+        j1 = bm.Joker(name=bm.JokerName.BLUEPRINT, extra_value=4)  # base 10 -> sell 5 + 4 = 9
+        j2 = bm.Joker(name=bm.JokerName.MATADOR)  # base 7 -> sell 3
+        s_temp = gs.GameState(
+            location=bm.Location.SHOP,
+            money=10,
+            inventory=bm.Inventory(
+                jokers=[j1, j2],
+                consumables=[bm.Tarot(name=bm.TarotName.TEMPERANCE)],
+            ),
+        )
+        s_temp, _ = gs.step_simulation(
+            s_temp, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0)
+        )
+        self.assertEqual(s_temp.money, 22)
+        self.assertNotIn("money", s_temp.pending_cv_checks)
+
+        big_jokers = [
+            bm.Joker(name=bm.JokerName.BLUEPRINT, extra_value=20),  # sell 25
+            bm.Joker(name=bm.JokerName.BRAINSTORM, extra_value=20),  # sell 25
+            bm.Joker(name=bm.JokerName.JOKER, extra_value=10),       # sell 11 -> sum 61 -> capped 50
+        ]
+        s_temp_cap = gs.GameState(
+            location=bm.Location.SHOP,
+            money=5,
+            inventory=bm.Inventory(
+                jokers=big_jokers,
+                consumables=[bm.Tarot(name=bm.TarotName.TEMPERANCE)],
+            ),
+        )
+        s_temp_cap, _ = gs.step_simulation(
+            s_temp_cap, bm.Action(type=bm.ActionType.USE_CONSUMABLE, target_idx=0)
+        )
+        self.assertEqual(s_temp_cap.money, 55)
+
+        # 3. Matador (+$8 when Boss Blind triggers, Blueprint-compatible)
+        def _hc(rank, suit, selected=True):
+            return bm.HandCard(
+                card=bm.PlayingCard(rank=rank, suit=suit),
+                selected=selected,
+            )
+
+        # 3a. Debuffed hand (The Psychic < 5 cards) + Blueprint copying Matador -> +$16
+        s_psy = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_PSYCHIC,
+            money=10,
+            inventory=bm.Inventory(
+                jokers=[
+                    bm.Joker(name=bm.JokerName.BLUEPRINT),
+                    bm.Joker(name=bm.JokerName.MATADOR),
+                ]
+            ),
+        )
+        s_psy.hand.cards = [_hc(bm.Rank.ACE, bm.Suit.SPADES, selected=True)]
+        s_psy, _ = gs.step_simulation(s_psy, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_psy.money, 26)
+        self.assertNotIn("money", s_psy.pending_cv_checks)
+
+        # 3b. The Psychic with 5 cards (not debuffed, blind does NOT trigger) -> +$0
+        s_psy_ok = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_PSYCHIC,
+            money=10,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.MATADOR)]),
+        )
+        s_psy_ok.hand.cards = [
+            _hc(bm.Rank.TWO, bm.Suit.SPADES, selected=True),
+            _hc(bm.Rank.FOUR, bm.Suit.HEARTS, selected=True),
+            _hc(bm.Rank.SIX, bm.Suit.CLUBS, selected=True),
+            _hc(bm.Rank.EIGHT, bm.Suit.DIAMONDS, selected=True),
+            _hc(bm.Rank.TEN, bm.Suit.SPADES, selected=True),
+        ]
+        s_psy_ok, _ = gs.step_simulation(s_psy_ok, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_psy_ok.money, 10)
+
+        # 3c. The Flint (unconditional modify_hand trigger) -> +$8
+        s_flint = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_FLINT,
+            money=4,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.MATADOR)]),
+        )
+        s_flint.hand.cards = [_hc(bm.Rank.ACE, bm.Suit.SPADES, selected=True)]
+        s_flint, _ = gs.step_simulation(s_flint, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_flint.money, 12)
+
+        # 3d. The Club with debuffed scoring Clubs card -> +$8; without Clubs -> +$0
+        s_club_hit = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_CLUB,
+            money=5,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.MATADOR)]),
+        )
+        s_club_hit.hand.cards = [_hc(bm.Rank.KING, bm.Suit.CLUBS, selected=True)]
+        s_club_hit.refresh_debuffs()
+        s_club_hit, _ = gs.step_simulation(s_club_hit, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_club_hit.money, 13)
+
+        s_club_miss = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_CLUB,
+            money=5,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.MATADOR)]),
+        )
+        s_club_miss.hand.cards = [_hc(bm.Rank.KING, bm.Suit.HEARTS, selected=True)]
+        s_club_miss.refresh_debuffs()
+        s_club_miss, _ = gs.step_simulation(s_club_miss, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_club_miss.money, 5)
+
+        # 3e. The Ox resets dollars to $0 BEFORE Matador awards +$8
+        s_ox = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.THE_OX,
+            ox_target_hand=bm.PokerHand.PAIR,
+            money=30,
+            inventory=bm.Inventory(jokers=[bm.Joker(name=bm.JokerName.MATADOR)]),
+        )
+        s_ox.hand.cards = [
+            _hc(bm.Rank.SEVEN, bm.Suit.SPADES, selected=True),
+            _hc(bm.Rank.SEVEN, bm.Suit.HEARTS, selected=True),
+        ]
+        s_ox, _ = gs.step_simulation(s_ox, bm.Action(type=bm.ActionType.PLAY_HAND))
+        self.assertEqual(s_ox.money, 8)
+
 
 def run_synthetic_test() -> None:
     """Convenience function running the synthetic test directly."""
