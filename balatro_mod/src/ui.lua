@@ -390,7 +390,7 @@ function UI.init_callbacks(mod)
     end
 
     G.FUNCS.gdcv_load_config = function(e)
-        mod:load_config()
+        mod:load_config(true)
         mod.capture_flash = 1.5
         mod.capture_flash_text = "CONFIG LOADED FROM BOXES.LUA!"
     end
@@ -1018,7 +1018,7 @@ function UI.build_page_definition(mod)
         n = G.UIT.ROOT,
         config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
         nodes = {
-            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier'}, current_mode_idx, 'gdcv_change_mode'),
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier'}, current_mode_idx, 'gdcv_change_mode', 3.6),
             make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
             make_cycle_row("End-Round Clip Cap", 'gdcv_mc_cycle', max_clips_options, current_mc_idx, 'gdcv_change_max_clips'),
             make_cycle_row("End-Round Sim Batch", 'gdcv_er_cycle', er_batch_options, current_er_idx, 'gdcv_change_er_batch'),
@@ -1324,7 +1324,7 @@ function G.DATASET_MOD:draw_debug()
 
     love.graphics.setColor(0.9, 0.9, 0.9, 1)
     love.graphics.print("W, A, S, D: Move / Shift Offset  |  Arrow Keys: Adjust Size (Hold Shift: Fast)", 18, 80)
-    love.graphics.print("TAB: Toggle Gen/Setup  |  R: Randomize  |  P: Switch Shop/Pack View  |  C: Capture Test", 18, 102)
+    love.graphics.print("F1/F2: Switch Mode  |  TAB: Toggle Gen/Setup  |  R: Randomize  |  P: Shop/Pack  |  C: Capture", 18, 102)
     love.graphics.print("[, ]: Save / Load Config (dataset/boxes.lua)", 18, 124)
 
     love.graphics.setColor(1, 1, 0.4, 1)
@@ -1368,7 +1368,38 @@ end
 -- ==========================================
 -- KEYPRESS HANDLER
 -- ==========================================
+local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier' }
+local MODE_DISPLAY_NAMES = {
+    off = 'OFF',
+    card_classifier = 'CARD CLASSIFIER',
+    shop_classifier = 'SHOP CLASSIFIER',
+    end_round_classifier = 'END ROUND CLASSIFIER',
+}
+
+local function cycle_classifier_mode(mod, step)
+    local cur_idx = 1
+    for i, m in ipairs(MODE_ORDER) do
+        if m == (mod.config and mod.config.mode) then
+            cur_idx = i
+            break
+        end
+    end
+    local next_idx = ((cur_idx - 1 + step) % #MODE_ORDER) + 1
+    local next_mode = MODE_ORDER[next_idx]
+    mod:set_mode(next_mode)
+    mod.capture_flash = 2.0
+    mod.capture_flash_text = "MODE: " .. (MODE_DISPLAY_NAMES[next_mode] or string.upper(next_mode))
+end
+
 function G.DATASET_MOD:on_keypressed(key)
+    if key == 'f1' then
+        cycle_classifier_mode(self, -1)
+        return
+    elseif key == 'f2' then
+        cycle_classifier_mode(self, 1)
+        return
+    end
+
     if self.config.mode == 'off' then return end
 
     if key == 'tab' then
@@ -1423,12 +1454,12 @@ function G.DATASET_MOD:on_keypressed(key)
             if self.config.mode == 'card_classifier' then
                 self:generate_random_hand()
             elseif self.config.mode == 'end_round_classifier' then
-                if self.EndRoundGen and G and G.STAGE == G.STAGES.RUN then
+                if self.EndRoundGen and G and G.STAGE == G.STAGES.RUN and G.STATE == G.STATES.SELECTING_HAND then
                     self.EndRoundGen.setup_clip_scenario(self)
                     self.EndRoundGen.restore_user_state(self)
                 else
                     self.capture_flash = 2.0
-                    self.capture_flash_text = "ENTER A RUN FIRST TO PREVIEW END_ROUND SCENARIO!"
+                    self.capture_flash_text = "ENTER AN ACTIVE BLIND HAND (SELECTING_HAND) FIRST!"
                 end
             else
                 if (self.shop_phase or 'shop') == 'shop' then
@@ -1458,7 +1489,7 @@ function G.DATASET_MOD:on_keypressed(key)
             self.capture_flash = 1.0
             self.capture_flash_text = "CONFIG SAVED!"
         elseif key == '.' or key == ']' then
-            self:load_config()
+            self:load_config(true)
             self.capture_flash = 1.0
             self.capture_flash_text = "CONFIG LOADED!"
         end

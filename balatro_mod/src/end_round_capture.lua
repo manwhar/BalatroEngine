@@ -49,7 +49,7 @@ local function encode_json_value(val, indent)
         if val ~= val or val == math.huge or val == -math.huge then
             return "null"
         elseif math.floor(val) == val and math.abs(val) < 1e15 then
-            return string.format("%d", val)
+            return string.format("%.0f", val)
         end
         return string.format("%.6f", val)
     elseif t == "string" then
@@ -140,7 +140,7 @@ local function capture_play_area_rgba(mod)
     ensure_gpu_canvases()
     local src = G.AA_CANVAS
     if not src then
-        -- Apply G.SHADERS['CRT'] onto crt_canvas so contrast/crt/bloom match final screen output.
+        -- Match Balatro's final screen output (applying G.SHADERS['CRT'] with the user's Graphics settings).
         src = gpu_state.crt_canvas
         if not src then return nil end
         love.graphics.push('all')
@@ -243,6 +243,14 @@ function EndRoundCapture.install_hooks(mod)
         end
     end
 
+    if SMODS and SMODS.calculate_context and not orig.smods_calculate_context then
+        orig.smods_calculate_context = SMODS.calculate_context
+        function SMODS.calculate_context(context, return_table, no_resolve)
+            dispatch('on_smods_calculate_context', context)
+            return orig.smods_calculate_context(context, return_table, no_resolve)
+        end
+    end
+
     if Card and Card.get_end_of_round_effect and not orig.get_end_of_round_effect then
         orig.get_end_of_round_effect = Card.get_end_of_round_effect
         function Card:get_end_of_round_effect(context)
@@ -267,20 +275,39 @@ function EndRoundCapture.install_hooks(mod)
         end
     end
 
+    --- Return the currently scheduled Joker card to hover at `clip.current_frame_idx`, or nil.
+    local function resolve_clip_hover_target(clip)
+        if not (clip and clip.hover_schedule) then return nil end
+        local idx = clip.current_frame_idx or 0
+        for _, seg in ipairs(clip.hover_schedule) do
+            if idx >= seg.start_frame and idx < seg.end_frame then
+                local card = seg.card
+                if card and not card.REMOVED and card.area == G.jokers and card.put_focused_cursor then
+                    return card
+                end
+                return nil
+            end
+        end
+        return nil
+    end
+
     if Controller and Controller.set_cursor_position and not orig.set_cursor_position then
         orig.set_cursor_position = Controller.set_cursor_position
         function Controller:set_cursor_position()
             local mod_ref = G and G.DATASET_MOD
             local clip = mod_ref and mod_ref._active_end_round_clip
-            if clip and (self.HID.mouse or self.HID.touch) then
+            if clip then
                 self.interrupt.focus = false
-                if self.focused.target then
-                    self.focused.target.states.focus.is = false
+                if self.focused and self.focused.target then
+                    if self.focused.target.states and self.focused.target.states.focus then
+                        self.focused.target.states.focus.is = false
+                    end
                     self.focused.target = nil
                 end
                 local cx, cy = -100, -100
-                if clip.hover_target and not clip.hover_target.REMOVED and clip.hover_target.put_focused_cursor then
-                    local ok, tx, ty = pcall(function() return clip.hover_target:put_focused_cursor() end)
+                local hover_card = resolve_clip_hover_target(clip)
+                if hover_card then
+                    local ok, tx, ty = pcall(function() return hover_card:put_focused_cursor() end)
                     if ok and tx and ty then
                         cx, cy = tx, ty
                     end
@@ -338,8 +365,15 @@ function EndRoundCapture.on_end_round_scheduled(mod)
     end
 end
 
+function EndRoundCapture.on_smods_calculate_context(mod, context)
+    if context and context.end_of_round and context.main_eval and not context.individual and not context.repetition and not context.other_card then
+        record_end_round_once(mod, 'joker_end_of_round')
+    end
+end
+
 function EndRoundCapture.on_card_calculate_joker(mod, context)
-    if context and context.end_of_round and not context.individual and not context.repetition and context.cardarea == nil then
+    if context and context.end_of_round and not context.individual and not context.repetition and not context.other_card
+        and (context.cardarea == nil or context.cardarea == G.jokers) then
         record_end_round_once(mod, 'joker_end_of_round')
     end
 end
@@ -359,6 +393,20 @@ end
 -- ==========================================================================
 -- Visual Boundary Tracking & Serialization
 -- ==========================================================================
+
+--- Return true once `add_round_eval_row({name='bottom'})` has spawned the Cash Out button.
+local function has_cash_out_button()
+    if not (G and G.I and G.I.UIBOX and G.round_eval) then return false end
+    for _, uib in ipairs(G.I.UIBOX) do
+        if uib and not uib.REMOVED and uib.get_UIE_by_ID then
+            local maj = (uib.role and uib.role.major) or (uib.config and uib.config.major)
+            if maj == G.round_eval and uib:get_UIE_by_ID('cash_out_button') then
+                return true
+            end
+        end
+    end
+    return false
+end
 
 local function update_visual_boundaries(mod, clip, idx)
     local roi = mod.config.rois.play_area
@@ -404,14 +452,18 @@ local function update_visual_boundaries(mod, clip, idx)
             if ev.round_eval_enter_frame ~= nil and ev.round_eval_settled_frame == nil then
                 local ty = G.round_eval.T and G.round_eval.T.y or 0
                 local vy = G.round_eval.VT and G.round_eval.VT.y or 999
-                if math.abs(ty - vy) < 0.05 and (idx - ev.round_eval_enter_frame) >= 2 then
+                local panel_aligned = math.abs(ty - vy) < 0.05 and (idx - ev.round_eval_enter_frame) >= 2
+                local cash_out_ready = panel_aligned and has_cash_out_button()
+                local gs = (clip.scenario and clip.scenario.gamespeed) or 1
+                local settle_timeout = (gs < 1) and 220 or 140
+                if cash_out_ready then
                     ev.round_eval_settled_frame = idx
                     clip.settle_hold_remaining = math.random(
                         EndRoundCapture.SETTLE_HOLD_MIN,
                         EndRoundCapture.SETTLE_HOLD_MAX
                     )
-                elseif (idx - ev.round_eval_enter_frame) >= 18 then
-                    -- Safety settle threshold in case reduced motion or animation jitter delays <0.05 convergence.
+                elseif (idx - ev.round_eval_enter_frame) >= settle_timeout then
+                    -- Safety settle threshold in case reduced motion, slow gamespeed, or UI changes delay Cash Out spawning.
                     ev.round_eval_settled_frame = idx
                     clip.settle_hold_remaining = math.random(
                         EndRoundCapture.SETTLE_HOLD_MIN,
@@ -496,8 +548,12 @@ local function finalize_and_write_clip(mod, clip)
             reduced_motion = clip.scenario.reduced_motion,
             joker_display_enabled = clip.scenario.joker_display_enabled,
             simulate_hover = clip.scenario.simulate_hover,
+            num_jokers_hovered = clip.scenario.num_jokers_hovered or 0,
+            hover_frames_total = clip.scenario.hover_frames_total or 0,
             blind_key = clip.scenario.blind_key,
             blind_name = clip.scenario.blind_name,
+            blind_chips = clip.scenario.blind_chips,
+            initial_chips = clip.scenario.initial_chips,
             num_jokers = clip.scenario.num_jokers,
             num_played_cards = clip.scenario.num_played_cards,
             num_held_cards = clip.scenario.num_held_cards,
@@ -519,7 +575,7 @@ local function finalize_and_write_clip(mod, clip)
 
     mod.frame_counts.end_round = (mod.frame_counts.end_round or 0) + 1
     mod.frame_count = mod.frame_counts.end_round
-    mod.capture_flash = 0.8
+    mod.capture_flash = 2.0
     mod.capture_flash_text = string.format(
         "CLIP %s SAVED (%d frames, END_ROUND@%d, %s)",
         clip.id, num_frames, ev.end_round_frame, clip.scenario.archetype
@@ -531,14 +587,18 @@ end
 -- Public Clip Lifecycle & Main Loop Stepping
 -- ==========================================================================
 
---- Start a single randomized clip recording right away.
+--- Start a randomized clip recording right away (requiring SELECTING_HAND on initial entry).
 function EndRoundCapture.begin_next_clip(mod)
-    if not (G and G.STAGE == G.STAGES.RUN and G.hand and G.play and G.GAME) then
-        mod._er_stop_after_one = nil
+    -- Only the initial clip must enter from SELECTING_HAND; continuous Tab batch clips naturally transition
+    -- from the previous clip's ROUND_EVAL once user state has already been backed up.
+    local continuing_batch = (mod._end_round_backup ~= nil) and (not mod._er_stop_after_one)
+    local valid_run = G and G.STAGE == G.STAGES.RUN and G.hand and G.play and G.GAME
+    local valid_state = continuing_batch or (G and G.STATE == G.STATES.SELECTING_HAND)
+    if not (valid_run and valid_state) then
+        EndRoundCapture.stop(mod)
         mod.config.calibration_mode = 'setup'
-        mod.state = 'idle'
         mod.capture_flash = 3.0
-        mod.capture_flash_text = "START A RUN FIRST BEFORE ENABLING END_ROUND GENERATION!"
+        mod.capture_flash_text = "ENTER AN ACTIVE BLIND HAND (SELECTING_HAND) BEFORE GENERATING!"
         return false
     end
 
@@ -558,7 +618,7 @@ function EndRoundCapture.begin_next_clip(mod)
         current_frame_idx = 0,
         frame_bytes = {},
         scenario = scenario,
-        hover_target = scenario.hover_target,
+        hover_schedule = scenario.hover_schedule or {},
         tracked_play_cards = tracked,
         events = {
             play_hand_frame = 0,
@@ -571,6 +631,11 @@ function EndRoundCapture.begin_next_clip(mod)
     mod._active_end_round_clip = clip
     mod.state = 'recording'
 
+    -- Move cursor to frame-0 position (-100, -100) before playing hand so no residual hover persists.
+    if G.CONTROLLER and G.CONTROLLER.set_cursor_position then
+        pcall(function() G.CONTROLLER:set_cursor_position() end)
+    end
+
     -- Trigger Play Hand synchronously on clip frame 0.
     if G.FUNCS and G.FUNCS.play_cards_from_highlighted then
         G.FUNCS.play_cards_from_highlighted()
@@ -578,13 +643,24 @@ function EndRoundCapture.begin_next_clip(mod)
     return true
 end
 
---- Abort any active clip cleanly and restore user settings + board.
+--- Abort any active clip cleanly, leave a playable board in RUN, and restore user settings.
 function EndRoundCapture.stop(mod)
+    local had_session = (mod._active_end_round_clip ~= nil)
+        or (mod._er_stop_after_one ~= nil)
+        or (mod._end_round_backup ~= nil)
     mod._active_end_round_clip = nil
     mod._er_stop_after_one = nil
     mod.state = 'idle'
     if mod.EndRoundGen then
-        mod.EndRoundGen.cleanup_clip_state(mod)
+        if had_session then
+            if G and G.STAGE == G.STAGES.RUN then
+                -- Repopulate a playable hand/deck before restoring settings; an empty board in
+                -- SELECTING_HAND triggers game.lua:3056 end_round() on the next frame and softlocks ROUND_EVAL.
+                mod.EndRoundGen.setup_clip_scenario(mod, { keep_blind_cycle = true })
+            else
+                mod.EndRoundGen.cleanup_clip_state(mod)
+            end
+        end
         mod.EndRoundGen.restore_user_state(mod)
     end
 end

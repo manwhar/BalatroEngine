@@ -10,9 +10,9 @@ except ImportError:
 
 
 # Edit these values before running this script.
-VIDEO_URL = "https://www.youtube.com/watch?v=yX3KKycukKE"
+VIDEO_URL = "https://www.youtube.com/watch?v=_ZuzKjGVRPs"
 DOWNLOAD_VIDEO = True
-VIDEO_FILENAME = "downloaded_video.mp4"
+VIDEO_FILENAME = r"assets\sample_inputs\videos\bu_magic_deck_11-13-26"
 DOWNLOAD_FRAME = False
 FRAME_TIMESTAMP = "00:01:23.500"
 FRAME_FILENAME = "scraped_frame.jpg"

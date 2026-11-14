@@ -242,7 +242,7 @@ function G.DATASET_MOD:save_config()
     print("DATASET: Config saved to boxes.lua!")
 end
 
-function G.DATASET_MOD:load_config()
+function G.DATASET_MOD:load_config(preserve_mode)
     local path = "Mods/gamestate_dataset_cv/dataset/boxes.lua"
     if love.filesystem.getInfo(path) then
         local content = love.filesystem.read(path)
@@ -250,8 +250,10 @@ function G.DATASET_MOD:load_config()
         if chunk then
             local t = chunk()
             if type(t) == "table" then
-                if t.mode then self.config.mode = t.mode end
-                if t.calibration_mode then self.config.calibration_mode = t.calibration_mode end
+                if not preserve_mode then
+                    if t.mode then self.config.mode = t.mode end
+                    if t.calibration_mode then self.config.calibration_mode = t.calibration_mode end
+                end
                 if t.max_frames then self.config.max_frames = tonumber(t.max_frames) or 20000 end
                 if t.max_clips then self.config.max_clips = tonumber(t.max_clips) or 1000 end
                 if t.end_round_frames_per_tick then self.config.end_round_frames_per_tick = tonumber(t.end_round_frames_per_tick) or 2 end
@@ -314,6 +316,10 @@ end
 
 function G.DATASET_MOD:set_mode(mode)
     if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'off' then
+        if mode ~= self.config.mode then
+            self.config.calibration_mode = 'setup'
+            self.state = 'idle'
+        end
         if mode ~= 'shop_classifier' and self.restore_joker_display_config then
             self:restore_joker_display_config()
         end
