@@ -191,6 +191,106 @@ def _resolve_action(raw_label: str) -> ActionType | None:
     return ActionType(raw_label)
 
 
+def find_missing_end_round_segments(d: dict[str, Any]) -> list[tuple[int, int]]:
+    """Finds `[PLAY_HAND, CASH_OUT]` frame windows lacking an intervening `END_ROUND`."""
+    key = d.get("key") or {}
+    frames = d.get("frames") or {}
+    inv_key = {v: k for k, v in key.items()}
+
+    ordered = sorted(frames.items(), key=lambda kv: int(kv[0]))
+    segments: list[tuple[int, int]] = []
+    pending_play_hand: int | None = None
+
+    for frame_str, frame_entry in ordered:
+        frame_idx = int(frame_str)
+        raw_label = inv_key.get(_extract_action_id(frame_entry))
+        if raw_label is None:
+            continue
+        action = _resolve_action(raw_label)
+        if action is None:
+            continue
+
+        if action == ActionType.PLAY_HAND:
+            pending_play_hand = frame_idx
+        elif action in (
+            ActionType.END_ROUND,
+            ActionType.SELECT_BLIND,
+            ActionType.SKIP_BLIND,
+            ActionType.NEXT_ROUND,
+        ):
+            pending_play_hand = None
+        elif action == ActionType.CASH_OUT:
+            if pending_play_hand is not None and frame_idx > pending_play_hand + 1:
+                segments.append((pending_play_hand, frame_idx))
+            pending_play_hand = None
+
+    return segments
+
+
+def inject_end_round_actions(
+    d: dict[str, Any],
+    *,
+    video_path: str | Path | None = None,
+    preloaded_frames: dict[int, Any] | None = None,
+    fps: float = 60.0,
+    batch_size: int = 8,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Predicts and injects missing `ActionType.END_ROUND` events using the temporal model."""
+    segments = find_missing_end_round_segments(d)
+    if not segments or (video_path is None and preloaded_frames is None):
+        return d
+
+    from classifiers.inference import batch_recognize_end_rounds
+
+    results = batch_recognize_end_rounds(
+        segments,
+        video_path=video_path,
+        preloaded_frames=preloaded_frames,
+        fps=fps,
+        batch_size=batch_size,
+        device=device,
+    )
+    if not results:
+        return d
+
+    key = dict(d["key"])
+    frames = dict(d["frames"])
+    end_round_label = ActionType.END_ROUND.value
+    end_round_id = key.setdefault(end_round_label, max(key.values(), default=-1) + 1)
+
+    for (play_f, cash_f), res in zip(segments, results):
+        pred_f = max(play_f + 1, min(cash_f - 1, int(res.end_round_frame)))
+        if str(pred_f) in frames:
+            chosen: int | None = None
+            max_offset = max(pred_f - (play_f + 1), (cash_f - 1) - pred_f)
+            for delta in range(1, max_offset + 1):
+                for cand in (pred_f + delta, pred_f - delta):
+                    if play_f < cand < cash_f and str(cand) not in frames:
+                        chosen = cand
+                        break
+                if chosen is not None:
+                    break
+            if chosen is None:
+                continue
+            pred_f = chosen
+
+        frames[str(pred_f)] = {
+            "action": end_round_id,
+            "box": None,
+            "metadata": {
+                "source": "end_round_classifier",
+                "confidence": float(res.confidence),
+                "end_round_timestamp": float(res.end_round_timestamp),
+                "play_hand_frame": play_f,
+                "cash_out_frame": cash_f,
+            },
+        }
+
+    ordered_frames = dict(sorted(frames.items(), key=lambda kv: int(kv[0])))
+    return {"key": key, "frames": ordered_frames}
+
+
 def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
     """Parses cleaned action frames into location-aware CV queues and scheduled steps."""
     A = ActionType
@@ -770,7 +870,21 @@ def _sync_hand_into_state(
     return first_selected.slot_uid if first_selected is not None else None
 
 
-def build_run_trajectory(
+def _resolve_video_fps(video_path: str | Path | None, fps: float | None) -> float:
+    resolved_fps = fps
+    if resolved_fps is None and video_path is not None:
+        import cv2
+
+        cap = cv2.VideoCapture(str(video_path))
+        cap_fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0.0
+        cap.release()
+        resolved_fps = float(cap_fps) if cap_fps and cap_fps > 0 else 60.0
+    if not resolved_fps or resolved_fps <= 0:
+        resolved_fps = 60.0
+    return resolved_fps
+
+
+def _build_run_trajectory_with_plan(
     d: dict[str, Any],
     video_path: str | Path | None = None,
     *,
@@ -784,30 +898,24 @@ def build_run_trajectory(
     batch_size: int = 32,
     device: str | None = None,
     deduplicate: bool = True,
-) -> tuple[GameState, RunTrajectory]:
-    """Reconstructs a complete `(GameState, RunTrajectory)` from action JSON + video frames.
-
-    Note: Starting mid-run is out of scope; always initializes from Ante 1 / Round 1.
-    """
+) -> tuple[GameState, RunTrajectory, dict[str, Any]]:
     from classifiers.common.video_utils import extract_video_frames
 
+    resolved_fps = _resolve_video_fps(video_path, fps)
     cleaned_input = {
         "key": d["key"],
         "frames": remove_duplicates(d["frames"]) if deduplicate else d["frames"],
     }
+    cleaned_input = inject_end_round_actions(
+        cleaned_input,
+        video_path=video_path,
+        preloaded_frames=preloaded_frames,
+        fps=resolved_fps,
+        batch_size=max(1, batch_size // 4),
+        device=device,
+    )
     plan = plan_action_pipeline(cleaned_input)
     scheduled_actions: list[ScheduledAction] = plan["scheduled_actions"]
-
-    resolved_fps = fps
-    if resolved_fps is None and video_path is not None:
-        import cv2
-
-        cap = cv2.VideoCapture(str(video_path))
-        cap_fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0.0
-        cap.release()
-        resolved_fps = float(cap_fps) if cap_fps and cap_fps > 0 else 60.0
-    if not resolved_fps or resolved_fps <= 0:
-        resolved_fps = 60.0
 
     needed_frames = sorted(
         set(plan["playing_card_cv_queue"])
@@ -986,6 +1094,42 @@ def build_run_trajectory(
         trajectory.record_step(state, action)
 
     trajectory.impute_retroactive_boss_blinds()
+    return state, trajectory, plan
+
+
+def build_run_trajectory(
+    d: dict[str, Any],
+    video_path: str | Path | None = None,
+    *,
+    preloaded_frames: dict[int, Any] | None = None,
+    seed: str = "",
+    deck: Deck = Deck.RED_DECK,
+    stake: Stake = Stake.WHITE,
+    fps: float | None = None,
+    conf_threshold_hand: float = 0.50,
+    conf_threshold_shop: float = 0.80,
+    batch_size: int = 32,
+    device: str | None = None,
+    deduplicate: bool = True,
+) -> tuple[GameState, RunTrajectory]:
+    """Reconstructs a complete `(GameState, RunTrajectory)` from action JSON + video frames.
+
+    Note: Starting mid-run is out of scope; always initializes from Ante 1 / Round 1.
+    """
+    state, trajectory, _ = _build_run_trajectory_with_plan(
+        d,
+        video_path=video_path,
+        preloaded_frames=preloaded_frames,
+        seed=seed,
+        deck=deck,
+        stake=stake,
+        fps=fps,
+        conf_threshold_hand=conf_threshold_hand,
+        conf_threshold_shop=conf_threshold_shop,
+        batch_size=batch_size,
+        device=device,
+        deduplicate=deduplicate,
+    )
     return state, trajectory
 
 
@@ -997,23 +1141,28 @@ def process_actions(
     """Schedules CV queues for action frames and optionally reconstructs full GameState trajectory.
 
     When `video_path` and `preloaded_frames` are omitted, returns the 4 CV queue dicts.
-    When either is provided, runs batched CV and returns the queues alongside `state` and `trajectory`.
+    When either is provided, automatically detects missing `END_ROUND` transitions, runs batched
+    CV, and returns the scheduled queues alongside `state` and `trajectory`.
     """
+    if video_path is not None or kwargs.get("preloaded_frames") is not None:
+        state, trajectory, plan = _build_run_trajectory_with_plan(
+            d, video_path=video_path, **kwargs
+        )
+        return {
+            "playing_card_cv_queue": plan["playing_card_cv_queue"],
+            "joker_cv_queue": plan["joker_cv_queue"],
+            "shop_cv_queue": plan["shop_cv_queue"],
+            "pack_cv_queue": plan["pack_cv_queue"],
+            "state": state,
+            "trajectory": trajectory,
+        }
     plan = plan_action_pipeline(d)
-    queues = {
+    return {
         "playing_card_cv_queue": plan["playing_card_cv_queue"],
         "joker_cv_queue": plan["joker_cv_queue"],
         "shop_cv_queue": plan["shop_cv_queue"],
         "pack_cv_queue": plan["pack_cv_queue"],
     }
-    if video_path is not None or kwargs.get("preloaded_frames") is not None:
-        state, trajectory = build_run_trajectory(d, video_path=video_path, **kwargs)
-        return {
-            **queues,
-            "state": state,
-            "trajectory": trajectory,
-        }
-    return queues
 
 
 if __name__ == "__main__":

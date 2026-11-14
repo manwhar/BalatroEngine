@@ -151,6 +151,96 @@ def read_video_segment_rgb(
         cap.release()
 
 
+def read_video_segments_rgb_batch(
+    video_path: Path | str,
+    segments: Sequence[tuple[int, int]],
+    *,
+    target_fps: float = TARGET_FPS,
+    already_cropped: bool = False,
+    roi_base_1080p: dict[str, float] | None = None,
+    out_width: int = INPUT_WIDTH,
+    out_height: int = INPUT_HEIGHT,
+) -> tuple[list[torch.Tensor], float, list[list[int]]]:
+    """Decode multiple `[start_frame, end_frame)` segments from one `VideoCapture` handle."""
+    if not segments:
+        return [], 60.0, []
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    try:
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 60.0)
+        if src_fps <= 0:
+            src_fps = 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        tensors_out: list[torch.Tensor | None] = [None] * len(segments)
+        indices_out: list[list[int]] = [[] for _ in segments]
+
+        ordered_segs = sorted(enumerate(segments), key=lambda item: (int(item[1][0]), int(item[1][1])))
+        cur_pos = 0
+        has_started = False
+
+        for orig_idx, (raw_start, raw_end) in ordered_segs:
+            s_frame = max(0, int(raw_start))
+            e_frame = int(raw_end)
+            if total_frames > 0:
+                e_frame = min(total_frames, e_frame)
+            if e_frame <= s_frame:
+                raise ValueError(f"Empty video segment [{s_frame}, {e_frame}) for {video_path}")
+
+            sampled = resample_frame_indices(s_frame, e_frame, src_fps, target_fps)
+            if not sampled:
+                raise ValueError(f"No frames sampled from [{s_frame}, {e_frame}) in {video_path}")
+
+            out_frames: list[np.ndarray] = []
+            actual_indices: list[int] = []
+            for target_idx in sampled:
+                if not has_started and target_idx > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+                    cur_pos = target_idx
+                    has_started = True
+                elif target_idx < cur_pos or (target_idx - cur_pos) > 64:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+                    cur_pos = target_idx
+                    has_started = True
+                else:
+                    has_started = True
+                    while cur_pos < target_idx:
+                        if not cap.grab():
+                            break
+                        cur_pos += 1
+
+                if cur_pos != target_idx:
+                    break
+                ret, bgr = cap.read()
+                cur_pos += 1
+                if not ret or bgr is None:
+                    break
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                cropped = crop_and_resize_rgb(
+                    rgb,
+                    already_cropped=already_cropped,
+                    roi_base_1080p=roi_base_1080p,
+                    out_width=out_width,
+                    out_height=out_height,
+                )
+                out_frames.append(cropped)
+                actual_indices.append(target_idx)
+
+            if not out_frames:
+                raise RuntimeError(f"Failed to decode any frames from {video_path} [{s_frame}, {e_frame})")
+
+            arr = np.stack(out_frames, axis=0)
+            tensors_out[orig_idx] = torch.from_numpy(np.ascontiguousarray(arr.transpose(0, 3, 1, 2)))
+            indices_out[orig_idx] = actual_indices
+
+        return [t for t in tensors_out if t is not None], src_fps, indices_out
+    finally:
+        cap.release()
+
+
 def frames_sequence_to_tensor(
     frames: Sequence[np.ndarray],
     *,

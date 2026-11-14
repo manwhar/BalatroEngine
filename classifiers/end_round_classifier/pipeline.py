@@ -60,8 +60,8 @@ except ImportError:
 
 CURRENT_DIR = Path(__file__).resolve().parent
 DEFAULT_WEIGHT_CANDIDATES = (
-    CURRENT_DIR / "weights" / "end_round_best.pt",
     CURRENT_DIR.parent / "prod_weights" / "end_round_classifier.pt",
+    CURRENT_DIR / "weights" / "end_round_best.pt",
 )
 
 

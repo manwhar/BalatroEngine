@@ -219,14 +219,16 @@ class TemporalCursorOverlay:
 
         bsz, max_t, _, height, width = frames.shape
         out = frames.clone()
+        lengths_list = lengths.tolist()
+        apply_flags = (torch.rand(bsz) < prob).tolist()
 
         for b in range(bsz):
-            if float(torch.rand((), device=frames.device)) >= prob:
+            if not apply_flags[b]:
                 continue
-            valid_len = max(1, int(lengths[b].item()))
+            valid_len = max(1, int(lengths_list[b]))
 
             # Scale cursor proportionally to the 72px-tall cropped G.play ROI (~12-22 px)
-            cur_h = max(8, int(round(height * float(torch.empty((), device=frames.device).uniform_(0.16, 0.30)))))
+            cur_h = max(8, int(round(height * float(torch.empty(()).uniform_(0.16, 0.30).item()))))
             cur_w = max(8, int(round(cur_h * self.aspect)))
             if cur_h >= height or cur_w >= width:
                 continue
@@ -236,30 +238,31 @@ class TemporalCursorOverlay:
             cur_rgb = cur_rgb.to(dtype=out.dtype)
             cur_alpha = cur_alpha.to(dtype=out.dtype)
 
-            # Quadratic Bezier control points across the clip ROI
-            p0x = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, width - cur_w)))
-            p0y = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, height - cur_h)))
-            p1x = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, width - cur_w)))
-            p1y = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, height - cur_h)))
-            p2x = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, width - cur_w)))
-            p2y = float(torch.empty((), device=frames.device).uniform_(0.0, max(1, height - cur_h)))
+            # Compute Bezier trajectory on CPU to avoid per-frame CUDA syncs (.item()).
+            pts = torch.rand(6)
+            max_x = float(max(1, width - cur_w))
+            max_y = float(max(1, height - cur_h))
+            p0x, p1x, p2x = (pts[0] * max_x), (pts[1] * max_x), (pts[2] * max_x)
+            p0y, p1y, p2y = (pts[3] * max_y), (pts[4] * max_y), (pts[5] * max_y)
 
             # Optional mid-clip hover pause (mimics user moving to hover Cash Out / Jokers)
-            t_param = torch.linspace(0.0, 1.0, valid_len, device=frames.device)
-            if float(torch.rand((), device=frames.device)) < 0.35:
+            t_param = torch.linspace(0.0, 1.0, valid_len)
+            if float(torch.rand(()).item()) < 0.35:
                 t_param = torch.clamp((t_param - 0.15) * 1.35, 0.0, 1.0)
 
             omt = 1.0 - t_param
             xs = (omt * omt * p0x + 2.0 * omt * t_param * p1x + t_param * t_param * p2x).round().long()
             ys = (omt * omt * p0y + 2.0 * omt * t_param * p1y + t_param * t_param * p2y).round().long()
-            xs = xs.clamp(0, width - cur_w)
-            ys = ys.clamp(0, height - cur_h)
+            xs_list = xs.clamp(0, width - cur_w).tolist()
+            ys_list = ys.clamp(0, height - cur_h).tolist()
 
+            inv_alpha = 1.0 - cur_alpha
+            weighted_rgb = cur_rgb * cur_alpha
             for t in range(valid_len):
-                x = int(xs[t].item())
-                y = int(ys[t].item())
+                x = xs_list[t]
+                y = ys_list[t]
                 patch = out[b, t, :, y : y + cur_h, x : x + cur_w]
-                out[b, t, :, y : y + cur_h, x : x + cur_w] = patch * (1.0 - cur_alpha) + cur_rgb * cur_alpha
+                out[b, t, :, y : y + cur_h, x : x + cur_w] = patch * inv_alpha + weighted_rgb
 
         return out
 
@@ -350,19 +353,21 @@ def apply_temporal_clip_augmentations(
     # 4. Clip-consistent stream compression (resolution downsample + slight quantization)
     if p_compression > 0.0:
         out = out.clone()
+        lengths_list = lengths.tolist()
+        comp_apply = (torch.rand(bsz) < p_compression).tolist()
         for b in range(bsz):
-            if float(torch.rand((), device=device)) >= p_compression:
+            if not comp_apply[b]:
                 continue
-            valid_len = max(1, int(lengths[b].item()))
-            ratio = float(torch.empty((), device=device).uniform_(0.50, 0.92))
+            valid_len = max(1, int(lengths_list[b]))
+            ratio = float(torch.empty(()).uniform_(0.50, 0.92).item())
             low_h = max(24, int(round(height * ratio)))
             low_w = max(64, int(round(width * ratio)))
             clip = out[b, :valid_len]
             down = F.interpolate(clip, size=(low_h, low_w), mode="bilinear", align_corners=False)
             up = F.interpolate(down, size=(height, width), mode="bilinear", align_corners=False)
-            if float(torch.rand((), device=device)) < 0.5:
+            if float(torch.rand(()).item()) < 0.5:
                 # Mild 5-bit/6-bit chroma quantization typical of aggressive H.264 presets
-                levels = float(torch.empty((), device=device).uniform_(28.0, 64.0))
+                levels = float(torch.empty(()).uniform_(28.0, 64.0).item())
                 up = torch.round(up * levels) / levels
             out[b, :valid_len] = up
 

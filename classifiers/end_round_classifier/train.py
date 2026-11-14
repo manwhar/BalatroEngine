@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 try:
     from .config import (
@@ -346,8 +347,15 @@ def run_epoch(
     ms_errors: list[float] = []
 
     context = torch.enable_grad() if is_train else torch.no_grad()
+    pbar = tqdm(
+        loader,
+        desc="train" if is_train else "val",
+        leave=False,
+        unit="batch",
+        dynamic_ncols=True,
+    )
     with context:
-        for batch in loader:
+        for batch in pbar:
             frames_u8 = batch["frames"].to(device, non_blocking=True)
             frames = frames_u8.float() / 255.0
             state_labels = batch["state_labels"].to(device, non_blocking=True)
@@ -397,6 +405,7 @@ def run_epoch(
             state_loss_sum += loss_parts["state"]
             boundary_loss_sum += loss_parts["boundary"]
             n_batches += 1
+            pbar.set_postfix(loss=f"{total_loss_sum / n_batches:.4f}", refresh=False)
 
             # Evaluate frame state accuracy & confusion matrix
             s_logits = outputs["state_logits"].detach().float().cpu()
@@ -488,7 +497,9 @@ def train(args: argparse.Namespace) -> Path:
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        # Sequences have variable sum(lengths) per batch; cudnn.benchmark=True
+        # re-autotunes convolutions on every new shape (~9s/batch penalty).
+        torch.backends.cudnn.benchmark = False
 
     train_ds = EndRoundClipDataset(
         train_records,
@@ -567,7 +578,8 @@ def train(args: argparse.Namespace) -> Path:
     print(
         f"[train] device={device.type} amp={amp_dtype if use_amp else 'off'} "
         f"backbone={args.backbone} train_clips={len(train_ds)} val_clips={len(val_ds)} "
-        f"batch_size={batch_size} run_dir={run_dir}"
+        f"batch_size={batch_size} run_dir={run_dir}",
+        flush=True,
     )
 
     history: list[dict[str, Any]] = []
@@ -654,7 +666,8 @@ def train(args: argparse.Namespace) -> Path:
                 f"train loss={row['train_loss']:.4f} acc={row['train_frame_acc']:.3f} | "
                 f"val loss={row['val_loss']:.4f} acc={row['val_frame_acc']:.3f} "
                 f"MAE={row['val_mae_frames']:.2f}f ({row['val_mae_ms']:.0f}ms) "
-                f"<=2f={row['val_tol_2_acc']:.3f}"
+                f"<=2f={row['val_tol_2_acc']:.3f}",
+                flush=True,
             )
 
             payload = build_checkpoint_payload(model, epoch=epoch, metrics=row, args=args)

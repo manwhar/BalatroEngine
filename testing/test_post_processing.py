@@ -402,6 +402,138 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         cleaned = pp.remove_duplicates(raw)
         self.assertEqual(list(cleaned.keys()), ["103", "163"])
 
+    def test_automatic_end_round_injection_and_joker_order_at_end_round(self):
+        from classifiers.end_round_classifier.pipeline import EndRoundResult
+
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "Cash Out": 2,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},  # target 98
+                "400": {"action": 1, "box": [780, 900, 880, 950]},  # target 400
+                "600": {"action": 2, "box": [400, 300, 600, 370]},  # target 598
+            },
+        }
+        # Sparse preloaded frames (no video): fake_end_rounds is patched to supply 500
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 400, 498, 598)}
+
+        def fake_end_rounds(segments, **kwargs):
+            self.assertEqual(list(segments), [(400, 600)])
+            return [
+                EndRoundResult(
+                    end_round_frame=500,
+                    end_round_timestamp=500 / 60.0,
+                    confidence=0.97,
+                    model_step_index=25,
+                    model_step_float=25.0,
+                    viterbi_transition_step=25,
+                    boundary_peak_step=25,
+                    src_fps=60.0,
+                    num_sampled_frames=50,
+                )
+            ]
+
+        def fake_batch_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx in (98, 400):
+                    # Mime on left, Blueprint on right (Blueprint copies nothing)
+                    out.joker_bar = [
+                        _make_shop_item("j_mime", "Joker", [520, 40, 660, 220]),
+                        _make_shop_item("j_blueprint", "Joker", [680, 40, 820, 220]),
+                    ]
+                elif f_idx in (498, 598):
+                    # Reordered before END_ROUND so Blueprint copies Mime (+$9 held Gold Card)
+                    out.joker_bar = [
+                        _make_shop_item("j_blueprint", "Joker", [520, 40, 660, 220]),
+                        _make_shop_item("j_mime", "Joker", [680, 40, 820, 220]),
+                    ]
+                outs.append(out)
+            return outs
+
+        def fake_batch_hands(frames, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                cards = []
+                if f_idx == 400:
+                    cards = [
+                        _make_card_res("Ace", "Spades", selected=True),
+                        _make_card_res("2", "Clubs", selected=False, enhancement="Gold"),
+                    ]
+                outs.append(HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=cards))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_end_rounds", side_effect=fake_end_rounds),
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_batch_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_batch_hands),
+        ):
+            res = pp.process_actions(
+                d,
+                preloaded_frames=dummy_frames,
+                seed="ENDROUND1",
+                fps=60.0,
+            )
+
+        self.assertIn(498, res["joker_cv_queue"])
+        self.assertEqual(res["joker_cv_queue"][498], bm.ActionType.END_ROUND)
+
+        traj: gs.RunTrajectory = res["trajectory"]
+        self.assertEqual(len(traj.deltas), 5)  # init, SelectBlind, PlayHand, EndRound, CashOut
+
+        er_delta = traj.deltas[3]
+        self.assertEqual(er_delta.action.type, bm.ActionType.END_ROUND)
+        self.assertEqual(er_delta.action.frame_idx, 500)
+        self.assertEqual(er_delta.action.metadata.get("source"), "end_round_classifier")
+
+        er_state = traj.get_state(3)
+        self.assertEqual(er_state.location, bm.Location.BLIND)
+        self.assertTrue(er_state.round_won)
+        self.assertEqual([j.name for j in er_state.inventory.jokers], [bm.JokerName.BLUEPRINT, bm.JokerName.MIME])
+        # $4 start + $9 from 3x triggered Gold card (card + Mime + Blueprint)
+        self.assertEqual(er_state.money, 13)
+
+        cash_out_state = traj.get_state(4)
+        self.assertEqual(cash_out_state.location, bm.Location.SHOP)
+        self.assertFalse(cash_out_state.round_won)
+        # No double-trigger of end_round Gold card; +$3 Small Blind + $2 interest + $3 hands_left
+        self.assertEqual(cash_out_state.money, 21)
+
+    def test_end_round_prod_weights_and_video_segment_batch(self):
+        import classifiers.inference as inf
+
+        prod_weights = Path(__file__).resolve().parent.parent / "classifiers" / "prod_weights" / "end_round_classifier.pt"
+        self.assertTrue(prod_weights.exists(), f"Missing production weights at {prod_weights}")
+
+        inf._END_ROUND_PIPELINE = None
+        pipe = inf.get_end_round_pipeline()
+        self.assertEqual(pipe.weights_path.resolve(), prod_weights.resolve())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "end_round_seg.avi"
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            writer = cv2.VideoWriter(str(video_path), fourcc, 30.0, (320, 180))
+            self.assertTrue(writer.isOpened())
+            try:
+                for i in range(60):
+                    # Draw simple varying frames across the segment
+                    frame = np.full((180, 320, 3), 25 if i < 25 else 80, dtype=np.uint8)
+                    writer.write(frame)
+            finally:
+                writer.release()
+
+            results = inf.batch_recognize_end_rounds([(10, 40)], video_path=video_path)
+
+        self.assertEqual(len(results), 1)
+        self.assertGreaterEqual(results[0].end_round_frame, 10)
+        self.assertLess(results[0].end_round_frame, 40)
+        self.assertGreaterEqual(results[0].confidence, 0.0)
+        self.assertLessEqual(results[0].confidence, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

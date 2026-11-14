@@ -7,6 +7,7 @@ import and execution in `post_processing.py` (or live bot loops).
 Uses the production models stored in `classifiers/prod_weights/`:
   - card_detector.pt + card_classifier.pt
   - shop_detector.pt + shop_classifier.pt
+  - end_round_classifier.pt
 
 Supports:
   1. Single-frame immediate inference (`recognize_hand_cards`, `recognize_shop`)
@@ -32,6 +33,16 @@ from classifiers.card_classifier.pipeline import CardRecognitionPipeline, CardRe
 # pyrefly: ignore [missing-import]
 from classifiers.shop_classifier.pipeline import ShopRecognitionPipeline, ShopItemResult
 # pyrefly: ignore [missing-import]
+from classifiers.end_round_classifier.config import PLAY_AREA_ROI
+# pyrefly: ignore [missing-import]
+from classifiers.end_round_classifier.pipeline import EndRoundRecognitionPipeline, EndRoundResult
+# pyrefly: ignore [missing-import]
+from classifiers.end_round_classifier.video_io import (
+    frames_sequence_to_tensor,
+    read_video_segments_rgb_batch,
+    resample_frame_indices,
+)
+# pyrefly: ignore [missing-import]
 from classifiers.common.video_utils import scale_roi_pixels
 
 BASE_WIDTH = 1920.0
@@ -46,6 +57,7 @@ ROIS = {
     "voucher": {"x": 656.059547, "y": 714.459732, "w": 360.743773, "h": 284.420985},
     "booster": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
     "pack": {"x": 565.612571, "y": 588.005101, "w": 960.654887, "h": 307.239491},
+    "play_area": dict(PLAY_AREA_ROI),
 }
 
 
@@ -94,6 +106,7 @@ class ShopRecognitionOutput:
 
 _CARD_PIPELINE: CardRecognitionPipeline | None = None
 _SHOP_PIPELINE: ShopRecognitionPipeline | None = None
+_END_ROUND_PIPELINE: EndRoundRecognitionPipeline | None = None
 
 
 def get_card_pipeline(device: str | None = None) -> CardRecognitionPipeline:
@@ -132,6 +145,20 @@ def get_shop_pipeline(device: str | None = None) -> ShopRecognitionPipeline:
             device=device
         )
     return _SHOP_PIPELINE
+
+
+def get_end_round_pipeline(device: str | None = None) -> EndRoundRecognitionPipeline:
+    """Returns singleton EndRoundRecognitionPipeline loaded from classifiers/prod_weights/."""
+    global _END_ROUND_PIPELINE
+    if _END_ROUND_PIPELINE is None:
+        ckpt_path = PROD_WEIGHTS_DIR / "end_round_classifier.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Missing production END_ROUND classifier weights at {ckpt_path}")
+        _END_ROUND_PIPELINE = EndRoundRecognitionPipeline(
+            weights_path=ckpt_path,
+            device=device,
+        )
+    return _END_ROUND_PIPELINE
 
 
 def _extract_frame_image_and_meta(video_frame: Any) -> tuple[np.ndarray, int, float]:
@@ -548,3 +575,103 @@ def process_frames_iterator(
             yield recognize_shop(f, mode=mode, conf_threshold=thresh)
     else:
         raise ValueError(f"Unknown target '{target}'. Must be 'hand' or 'shop'.")
+
+
+def recognize_end_round_segment(
+    video_path: str | Path,
+    start_frame: int,
+    end_frame: int,
+    *,
+    device: str | None = None,
+) -> EndRoundResult:
+    """Runs temporal END_ROUND detection over one `[start_frame, end_frame)` video window."""
+    pipeline = get_end_round_pipeline(device=device)
+    return pipeline.predict_video_segment(
+        video_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
+
+
+def batch_recognize_end_rounds(
+    segments: Sequence[tuple[int, int]],
+    *,
+    video_path: str | Path | None = None,
+    preloaded_frames: dict[int, Any] | None = None,
+    fps: float = 60.0,
+    batch_size: int = 8,
+    device: str | None = None,
+) -> list[EndRoundResult]:
+    """Batches temporal END_ROUND detection across multiple `[PLAY_HAND, CASH_OUT]` segments."""
+    if not segments:
+        return []
+    if video_path is None and preloaded_frames is None:
+        return []
+
+    if video_path is not None:
+        pipeline = get_end_round_pipeline(device=device)
+        clip_tensors, src_fps, sampled_indices_list = read_video_segments_rgb_batch(
+            video_path,
+            segments,
+            target_fps=pipeline.target_fps,
+            roi_base_1080p=pipeline.roi_base_1080p,
+            out_width=pipeline.input_width,
+            out_height=pipeline.input_height,
+        )
+    else:
+        assert preloaded_frames is not None
+        sorted_avail = sorted(preloaded_frames.keys())
+        avail_per_seg: list[list[int]] = []
+        for s_frame, e_frame in segments:
+            s_i, e_i = int(s_frame), int(e_frame)
+            in_range = [fid for fid in sorted_avail if s_i <= fid < e_i]
+            if len(in_range) < 2:
+                # Sparse button-frame test fixtures do not hold contiguous segment frames.
+                return []
+            avail_per_seg.append(in_range)
+
+        pipeline = get_end_round_pipeline(device=device)
+        src_fps = float(fps) if fps > 0 else 60.0
+        clip_tensors = []
+        sampled_indices_list = []
+        for (s_frame, e_frame), in_range in zip(segments, avail_per_seg):
+            desired = resample_frame_indices(int(s_frame), int(e_frame), src_fps, pipeline.target_fps)
+            if len(desired) >= 2 and all(idx in preloaded_frames for idx in desired):
+                chosen_ids = desired
+            else:
+                chosen_ids = in_range
+            bgr_seq = [_extract_frame_image_and_meta(preloaded_frames[fid])[0] for fid in chosen_ids]
+            clip_tchw = frames_sequence_to_tensor(
+                bgr_seq,
+                is_bgr=True,
+                already_cropped=False,
+                roi_base_1080p=pipeline.roi_base_1080p,
+                out_width=pipeline.input_width,
+                out_height=pipeline.input_height,
+            )
+            clip_tensors.append(clip_tchw)
+            sampled_indices_list.append(chosen_ids)
+
+    chunk_size = max(1, int(batch_size))
+    results: list[EndRoundResult] = []
+    for chunk_start in range(0, len(clip_tensors), chunk_size):
+        chunk_clips = clip_tensors[chunk_start : chunk_start + chunk_size]
+        chunk_indices = sampled_indices_list[chunk_start : chunk_start + chunk_size]
+        bsz = len(chunk_clips)
+        max_t = max(int(t.shape[0]) for t in chunk_clips)
+        _, c, h, w = chunk_clips[0].shape
+        padded = torch.zeros((bsz, max_t, c, h, w), dtype=chunk_clips[0].dtype)
+        lengths = torch.tensor([int(t.shape[0]) for t in chunk_clips], dtype=torch.long)
+        for i, clip_t in enumerate(chunk_clips):
+            padded[i, : int(clip_t.shape[0])] = clip_t
+
+        results.extend(
+            pipeline.predict_batch(
+                padded,
+                lengths=lengths,
+                fps_list=[src_fps] * bsz,
+                sampled_video_frames_list=chunk_indices,
+            )
+        )
+
+    return results
