@@ -16,6 +16,10 @@ from .poker_hands import evaluate_poker_hand, get_scoring_cards
 try:
     from game.engine.rng_sim.events import (
         evaluate_lucky_hit,
+        get_ancient_joker_suit,
+        get_castle_suit,
+        get_idol_card,
+        get_mail_in_rebate_target,
         get_next_voucher,
         poll_edition,
         poll_joker_pool,
@@ -31,9 +35,14 @@ try:
         predict_purple_seal_tarot,
         predict_random_destroy,
     )
+    from game.engine.rng_sim.state import SimDeck
 except ImportError:
     from engine.rng_sim.events import (
         evaluate_lucky_hit,
+        get_ancient_joker_suit,
+        get_castle_suit,
+        get_idol_card,
+        get_mail_in_rebate_target,
         get_next_voucher,
         poll_edition,
         poll_joker_pool,
@@ -49,6 +58,7 @@ except ImportError:
         predict_purple_seal_tarot,
         predict_random_destroy,
     )
+    from engine.rng_sim.state import SimDeck
 
 try:
     from game.balatro_models import (
@@ -242,11 +252,23 @@ def trigger_end_of_round_effects(state, action: Action | None = None) -> None:
             if j.perish_tally == 0:
                 j.debuffed = True
 
+    if getattr(state, "rng", None):
+        sdeck = SimDeck(state.full_deck)
+        state.ancient_suit = get_ancient_joker_suit(
+            state.rng, ante=state.ante, current_suit=state.ancient_suit
+        )
+        idol_target = get_idol_card(state.rng, sdeck, ante=state.ante)
+        state.idol_card = (idol_target.rank, idol_target.suit)
+        state.castle_suit = get_castle_suit(state.rng, sdeck, ante=state.ante)
+        state.mail_card_rank = get_mail_in_rebate_target(
+            state.rng, sdeck, ante=state.ante
+        )
+
     ctx = TriggerContext(
         event=TriggerEvent.END_OF_ROUND,
         state=state,
         action=action,
-        extra={"phase": "end_of_round"},
+        extra={"phase": "end_of_round", "round_targets_rolled": True},
     )
     dispatch_jokers(ctx)
 
@@ -256,9 +278,11 @@ def trigger_end_of_round_effects(state, action: Action | None = None) -> None:
         state.temp_hand_size_bonus = 0
 
     # Anaglyph Deck grants a Double Tag after defeating a Boss Blind
-    if (
-        getattr(state, "deck", None) == Deck.ANAGLYPH_DECK
-        and state.current_blind not in (BlindName.SMALL, BlindName.BIG)
+    if getattr(
+        state, "deck", None
+    ) == Deck.ANAGLYPH_DECK and state.current_blind not in (
+        BlindName.SMALL,
+        BlindName.BIG,
     ):
         _grant_skip_tag(state, SkipTag.DOUBLE_TAG, action=action)
 
@@ -296,8 +320,7 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
         and poker_hand != state.locked_hand_type
     )
     is_small_psychic = (
-        state.current_blind == BlindName.THE_PSYCHIC
-        and len(played_cards) < 5
+        state.current_blind == BlindName.THE_PSYCHIC and len(played_cards) < 5
     )
     hand_debuffed = (not state.boss_disabled) and (
         is_repeat_eye or is_wrong_mouth or is_small_psychic
@@ -333,7 +356,9 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
                     boss_triggered = True
                     state.hand_levels[poker_hand] = cur_lvl - 1
             elif state.current_blind == BlindName.THE_OX:
-                ox_target = getattr(state, "ox_target_hand", None) or PokerHand.HIGH_CARD
+                ox_target = (
+                    getattr(state, "ox_target_hand", None) or PokerHand.HIGH_CARD
+                )
                 if poker_hand == ox_target:
                     boss_triggered = True
                     state.money = 0
@@ -342,7 +367,10 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
 
             if any(
                 getattr(card, "debuffed", False)
-                or (hasattr(state, "card_is_debuffed_by_boss") and state.card_is_debuffed_by_boss(card))
+                or (
+                    hasattr(state, "card_is_debuffed_by_boss")
+                    and state.card_is_debuffed_by_boss(card)
+                )
                 for card in scoring_cards
             ):
                 boss_triggered = True
@@ -492,7 +520,7 @@ def _spawn_joker_to_inventory(
         return None
     j = poll_joker_pool(
         state.rng,
-        ante=state.ante,
+        ante=_effective_ante(state),
         rarity_tier=rarity_tier,
         legendary=legendary,
         key_append=key_append,
@@ -540,7 +568,9 @@ def _close_pack_or_advance_queue(state, action: Action | None) -> None:
         state.pack_cards.clear()
         state.pack_choices_remaining = next_pack.choose
         state.location = Location.PACK
-        ctx = TriggerContext(event=TriggerEvent.OPEN_BOOSTER, state=state, action=action)
+        ctx = TriggerContext(
+            event=TriggerEvent.OPEN_BOOSTER, state=state, action=action
+        )
         dispatch_jokers(ctx)
         return
     state.active_pack = None
@@ -581,7 +611,9 @@ def _apply_discard_cards(
     dispatch_jokers(ctx)
 
     discarded_ids = {id(c) for c in discarded_cards}
-    state.hand.cards = [hc for hc in state.hand.cards if id(hc.card) not in discarded_ids]
+    state.hand.cards = [
+        hc for hc in state.hand.cards if id(hc.card) not in discarded_ids
+    ]
     for card in discarded_cards:
         if not getattr(card, "destroyed", False):
             state.discard_pile.append(card)
@@ -595,6 +627,16 @@ def _advance_round_if_needed(state) -> None:
     if not getattr(state, "round_advanced", False):
         state.round += 1
         state.round_advanced = True
+
+
+def _effective_ante(state) -> int:
+    """Returns the live Balatro ante for PRNG pool keys, accounting for post-Boss shop advance."""
+    if getattr(state, "pending_blind_advance", False) and state.current_blind not in (
+        BlindName.SMALL,
+        BlindName.BIG,
+    ):
+        return state.ante + 1
+    return state.ante
 
 
 def _advance_blind_and_ante_if_pending(state, force: bool = False) -> None:
@@ -676,7 +718,10 @@ def _trigger_single_skip_tag(
     elif tag == SkipTag.BOSS_TAG:
         if hasattr(state, "roll_boss_blind"):
             state.roll_boss_blind(is_reroll=True)
-            if state.current_blind not in (BlindName.SMALL, BlindName.BIG) and state.boss_blind:
+            if (
+                state.current_blind not in (BlindName.SMALL, BlindName.BIG)
+                and state.boss_blind
+            ):
                 state.current_blind = state.boss_blind
     else:
         state.active_tags.append(tag)
@@ -826,7 +871,7 @@ def _apply_consumable_state(state, card) -> None:
                         }
                         planet = poll_planet_pool(
                             state.rng,
-                            ante=state.ante,
+                            ante=_effective_ante(state),
                             key_append="pri",
                             hand_play_counts=state.hand_play_counts,
                             active_planets=active_planets,
@@ -861,11 +906,24 @@ def _apply_consumable_state(state, card) -> None:
         elif c_name == TarotName.STRENGTH:
             selected = [hc for hc in state.hand.cards if hc.selected][:2]
             rank_order = [
-                Rank.TWO, Rank.THREE, Rank.FOUR, Rank.FIVE, Rank.SIX,
-                Rank.SEVEN, Rank.EIGHT, Rank.NINE, Rank.TEN,
-                Rank.JACK, Rank.QUEEN, Rank.KING, Rank.ACE
+                Rank.TWO,
+                Rank.THREE,
+                Rank.FOUR,
+                Rank.FIVE,
+                Rank.SIX,
+                Rank.SEVEN,
+                Rank.EIGHT,
+                Rank.NINE,
+                Rank.TEN,
+                Rank.JACK,
+                Rank.QUEEN,
+                Rank.KING,
+                Rank.ACE,
             ]
-            next_rank = {rank_order[i]: rank_order[(i + 1) % len(rank_order)] for i in range(len(rank_order))}
+            next_rank = {
+                rank_order[i]: rank_order[(i + 1) % len(rank_order)]
+                for i in range(len(rank_order))
+            }
             for hc in selected:
                 if hc.facing_back:
                     if hc._real_card and hc._real_card.rank in next_rank:
@@ -978,7 +1036,9 @@ def _apply_consumable_state(state, card) -> None:
             state.last_tarot_planet = c_name
             target_hand = PLANET_TO_POKER_HAND.get(c_name)
             if target_hand is not None:
-                state.hand_levels[target_hand] = state.hand_levels.get(target_hand, 1) + 1
+                state.hand_levels[target_hand] = (
+                    state.hand_levels.get(target_hand, 1) + 1
+                )
         state.unique_planets_used.add(str(c_name))
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.BLACK_HOLE:
         for h in PokerHand:
@@ -1021,9 +1081,7 @@ def _apply_consumable_state(state, card) -> None:
         state.hand.max_size = max(0, state.hand.max_size - state.ectoplasm_minus)
         state.ectoplasm_minus += 1
         if state.inventory:
-            eligible = [
-                j for j in state.inventory.jokers if j.edition == Edition.NONE
-            ]
+            eligible = [j for j in state.inventory.jokers if j.edition == Edition.NONE]
             if eligible:
                 if state.rng:
                     eligible_sorted = sorted(
@@ -1035,9 +1093,7 @@ def _apply_consumable_state(state, card) -> None:
                     state.pending_cv_checks.add("jokers")
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.HEX:
         if state.inventory:
-            eligible = [
-                j for j in state.inventory.jokers if j.edition == Edition.NONE
-            ]
+            eligible = [j for j in state.inventory.jokers if j.edition == Edition.NONE]
             if eligible:
                 if state.rng:
                     eligible_sorted = sorted(
@@ -1081,7 +1137,9 @@ def _apply_consumable_state(state, card) -> None:
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.SIGIL:
         suit = Suit.SPADES
         if state.rng:
-            suit = state.rng.choice("sigil", [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS])[0]
+            suit = state.rng.choice(
+                "sigil", [Suit.SPADES, Suit.HEARTS, Suit.CLUBS, Suit.DIAMONDS]
+            )[0]
         for hc in state.hand.cards:
             hc.card.suit = suit
             if hc._real_card:
@@ -1178,12 +1236,13 @@ def _apply_consumable_state(state, card) -> None:
 
 
 def _leave_shop(state, action: Action, *, force_advance: bool = False) -> None:
-    """Dispatches `LEAVE_SHOP` hooks, advances pending blind/ante, and enters `Location.SELECT`."""
+    """Dispatches `LEAVE_SHOP` hooks, clears shop shelves, advances blind/ante, and enters `Location.SELECT`."""
     state.coupon_shop_active = False
-    ctx = TriggerContext(
-        event=TriggerEvent.LEAVE_SHOP, state=state, action=action
-    )
+    ctx = TriggerContext(event=TriggerEvent.LEAVE_SHOP, state=state, action=action)
     dispatch_jokers(ctx)
+    state.shop_cards.clear()
+    state.shop_vouchers.clear()
+    state.shop_packs.clear()
     _advance_blind_and_ante_if_pending(
         state,
         force=(
@@ -1198,7 +1257,9 @@ def _leave_shop(state, action: Action, *, force_advance: bool = False) -> None:
 def on_action(state, action: Action):
     """Executes deterministic game engine state transitions and triggers."""
     # Implicit joker reordering: if the action specifies a joker order, apply it before evaluating the action!
-    j_order = action.joker_order or (action.metadata and action.metadata.get("joker_order"))
+    j_order = action.joker_order or (
+        action.metadata and action.metadata.get("joker_order")
+    )
     if j_order and state.inventory and state.inventory.jokers:
         if hasattr(state, "ensure_joker_ids"):
             state.ensure_joker_ids()
@@ -1213,13 +1274,17 @@ def on_action(state, action: Action):
         elif (
             len(j_order) == len(current_jokers)
             and len(set(j_order)) == len(j_order)
-            and all(isinstance(x, int) and 0 <= x < len(current_jokers) for x in j_order)
+            and all(
+                isinstance(x, int) and 0 <= x < len(current_jokers) for x in j_order
+            )
         ):
             state.inventory.jokers = [current_jokers[i] for i in j_order]
         sync_dynamic_joker_states(state)
 
     # Implicit hand reordering: if the action specifies a hand order, apply it before evaluating the action!
-    h_order = action.hand_order or (action.metadata and action.metadata.get("hand_order"))
+    h_order = action.hand_order or (
+        action.metadata and action.metadata.get("hand_order")
+    )
     if h_order and state.hand and state.hand.cards:
         current_hand = state.hand.cards
         if len(h_order) == len(current_hand) and all(
@@ -1231,6 +1296,32 @@ def on_action(state, action: Action):
             if all(cid in by_id for cid in h_order):
                 state.hand.cards = [by_id[cid] for cid in h_order]
         state.reconcile_face_down_adjacencies()
+
+    if state.location == Location.PACK and action.type in (
+        ActionType.BUY_CARD,
+        ActionType.BUY_AND_USE,
+        ActionType.REROLL_SHOP,
+        ActionType.REDEEM_VOUCHER,
+        ActionType.OPEN_PACK,
+        ActionType.NEXT_ROUND,
+        ActionType.SELECT_BLIND,
+        ActionType.SKIP_BLIND,
+        ActionType.REROLL_BOSS,
+    ):
+        state.active_pack = None
+        state.pack_cards.clear()
+        state.pack_choices_remaining = 0
+        if hasattr(state, "pending_packs") and state.pending_packs is not None:
+            state.pending_packs.clear()
+        if action.type in (
+            ActionType.SELECT_BLIND,
+            ActionType.SKIP_BLIND,
+            ActionType.REROLL_BOSS,
+        ):
+            state.location = getattr(state, "pre_pack_location", None) or Location.SHOP
+        else:
+            state.location = Location.SHOP
+        state.pre_pack_location = None
 
     match action.type:
         case ActionType.SORT_RANK:
@@ -1521,7 +1612,10 @@ def on_action(state, action: Action):
         case ActionType.CASH_OUT:
             # Note: Location.CASH_OUT is internal to post_processing.py; GameState
             # models the cash-out phase as Location.BLIND with round_won=True.
-            if getattr(state, "pending_blind_advance", False) and state.location == Location.SHOP:
+            if (
+                getattr(state, "pending_blind_advance", False)
+                and state.location == Location.SHOP
+            ):
                 _advance_blind_and_ante_if_pending(state)
                 state.round_advanced = False
 
@@ -1558,7 +1652,10 @@ def on_action(state, action: Action):
             state.coupon_shop_active = False
             state.location = Location.SHOP
             base_reroll = getattr(state, "base_reroll_cost", 5)
-            if VoucherName.REROLL_SURPLUS in state.vouchers_redeemed and base_reroll == 5:
+            if (
+                VoucherName.REROLL_SURPLUS in state.vouchers_redeemed
+                and base_reroll == 5
+            ):
                 base_reroll = max(0, base_reroll - 2)
             if VoucherName.REROLL_GLUT in state.vouchers_redeemed and base_reroll >= 3:
                 base_reroll = max(0, base_reroll - 2)
@@ -1736,7 +1833,10 @@ def on_action(state, action: Action):
         case ActionType.END_ROUND:
             # Note: Location.CASH_OUT is post_processing-internal only; after END_ROUND,
             # GameState remains in Location.BLIND with round_won=True until CASH_OUT.
-            if getattr(state, "pending_blind_advance", False) and state.location == Location.SHOP:
+            if (
+                getattr(state, "pending_blind_advance", False)
+                and state.location == Location.SHOP
+            ):
                 _advance_blind_and_ante_if_pending(state)
                 state.round_advanced = False
             trigger_end_of_round_effects(state, action)

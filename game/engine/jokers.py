@@ -191,7 +191,17 @@ def init_joker_default_state(state, joker: Joker) -> None:
         case JokerName.ANCIENT_JOKER:
             joker.state.setdefault("target_suit", state.ancient_suit)
         case JokerName.TO_DO_LIST:
-            joker.state.setdefault("target_hand", state.to_do_poker_hand)
+            if "target_hand" not in joker.state:
+                if getattr(state, "rng", None):
+                    hand = get_to_do_list_hand(
+                        state.rng,
+                        current_hand=state.to_do_poker_hand,
+                        is_initial_spawn=True,
+                    )
+                    state.to_do_poker_hand = hand
+                else:
+                    hand = state.to_do_poker_hand
+                joker.state["target_hand"] = hand
         case JokerName.THE_IDOL:
             joker.state.setdefault("target_rank", state.idol_card[0])
             joker.state.setdefault("target_suit", state.idol_card[1])
@@ -386,8 +396,10 @@ def _is_cash_out_dollars_phase(ctx: TriggerContext) -> bool:
 def handle_ancient_joker(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.SETTING_BLIND or _is_end_of_round_phase(ctx):
-        if ctx.state.rng:
+    if _is_end_of_round_phase(ctx):
+        if ctx.extra and ctx.extra.get("round_targets_rolled"):
+            suit = ctx.state.ancient_suit
+        elif ctx.state.rng:
             suit = get_ancient_joker_suit(
                 ctx.state.rng,
                 ante=ctx.state.ante,
@@ -401,19 +413,7 @@ def handle_ancient_joker(joker: Joker, ctx: TriggerContext):
 
 @joker_hook(JokerName.TO_DO_LIST)
 def handle_to_do_list(joker: Joker, ctx: TriggerContext):
-    if ctx.event == TriggerEvent.SETTING_BLIND and not ctx.is_blueprint:
-        if "target_hand" not in joker.state:
-            if ctx.state.rng:
-                hand = get_to_do_list_hand(
-                    ctx.state.rng,
-                    current_hand=ctx.state.to_do_poker_hand,
-                    is_initial_spawn=True,
-                )
-            else:
-                hand = ctx.state.to_do_poker_hand
-            ctx.state.to_do_poker_hand = hand
-            joker.state["target_hand"] = hand
-    elif ctx.event == TriggerEvent.BEFORE_PLAY:
+    if ctx.event == TriggerEvent.BEFORE_PLAY:
         target = joker.state.get("target_hand", ctx.state.to_do_poker_hand)
         played_hand = ctx.poker_hand or evaluate_poker_hand(
             ctx.full_hand or ctx.state.hand.selected_cards,
@@ -437,8 +437,10 @@ def handle_to_do_list(joker: Joker, ctx: TriggerContext):
 def handle_the_idol(joker: Joker, ctx: TriggerContext):
     if ctx.is_blueprint:
         return
-    if ctx.event == TriggerEvent.SETTING_BLIND or _is_end_of_round_phase(ctx):
-        if ctx.state.rng:
+    if _is_end_of_round_phase(ctx):
+        if ctx.extra and ctx.extra.get("round_targets_rolled"):
+            rank, suit = ctx.state.idol_card
+        elif ctx.state.rng:
             sdeck = SimDeck(ctx.state.full_deck)
             target = get_idol_card(ctx.state.rng, sdeck, ante=ctx.state.ante)
             rank, suit = target.rank, target.suit
@@ -461,7 +463,9 @@ def handle_castle(joker: Joker, ctx: TriggerContext):
         if matching > 0:
             joker.state["chips"] = joker.state.get("chips", 0) + (matching * 3)
     elif _is_end_of_round_phase(ctx):
-        if ctx.state.rng:
+        if ctx.extra and ctx.extra.get("round_targets_rolled"):
+            suit = ctx.state.castle_suit
+        elif ctx.state.rng:
             sdeck = SimDeck(ctx.state.full_deck)
             suit = get_castle_suit(ctx.state.rng, sdeck, ante=ctx.state.ante)
         else:
@@ -485,7 +489,9 @@ def handle_mail_in_rebate(joker: Joker, ctx: TriggerContext):
         if matches > 0:
             ctx.state.money += matches * 5
     elif _is_end_of_round_phase(ctx) and not ctx.is_blueprint:
-        if ctx.state.rng:
+        if ctx.extra and ctx.extra.get("round_targets_rolled"):
+            rank = ctx.state.mail_card_rank
+        elif ctx.state.rng:
             sdeck = SimDeck(ctx.state.full_deck)
             rank = get_mail_in_rebate_target(ctx.state.rng, sdeck, ante=ctx.state.ante)
         else:

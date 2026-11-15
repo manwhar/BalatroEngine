@@ -37,21 +37,26 @@ from game.balatro_models import (
     Card,
     CardBounds,
     Deck,
+    Enhancement,
     HandCard,
     Joker,
+    JokerName,
     Location,
     Planet,
     PlayingCard,
     Rank,
     Spectral,
     Stake,
+    Suit,
     Tarot,
+    TarotName,
     Voucher,
 )
 from game.engine.cv_stubs import (
     _convert_card_result_to_hand_card,
     _convert_items_of_type,
 )
+from game.engine.jokers import on_joker_added
 from game.engine.rules import on_action, trigger_end_of_round_effects
 from game.gamestate import GameState, RunTrajectory, _cards_match
 
@@ -70,18 +75,18 @@ NON_GAMEPLAY_ACTIONS: set[str] = {
 # Negative offsets sample just before the click so dissolving/flying animations have not started.
 # Positive offsets sample after animations (like sort) have settled.
 FRAME_OFFSETS: dict[str | ActionType, int] = {
-    "post_sort": 15,
+    "post_sort": 50,
     "pre_sort": -15,
     ActionType.PLAY_HAND: 0,
     ActionType.DISCARD: 0,
     ActionType.BUY_CARD: 0,
+    ActionType.REROLL_SHOP: -10,
     # HUMAN TODO: manually verify remaining offsets below (above verified empirically)
     ActionType.BUY_AND_USE: -2,
     ActionType.OPEN_PACK: -2,
     ActionType.USE_IN_PACK: -2,
     ActionType.SKIP_PACK: -2,
     ActionType.REDEEM_VOUCHER: -2,
-    ActionType.REROLL_SHOP: -2,
     ActionType.NEXT_ROUND: -2,
     ActionType.SELECT_BLIND: -2,
     ActionType.SKIP_BLIND: -2,
@@ -338,6 +343,16 @@ def inject_end_round_actions(
     return {"key": key, "frames": ordered_frames}
 
 
+FACE_DOWN_BOSS_BLINDS: frozenset[BlindName] = frozenset(
+    {
+        BlindName.THE_HOUSE,
+        BlindName.THE_WHEEL,
+        BlindName.THE_FISH,
+        BlindName.THE_MARK,
+    }
+)
+
+
 def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
     """Parses cleaned action frames into location-aware CV queues and scheduled steps."""
     A = ActionType
@@ -393,6 +408,7 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
     hud_ocr_queue: dict[int, ActionType] = {}
     scheduled_actions: list[ScheduledAction] = []
     pre_pack_loc: Location | None = None
+    blind_idx_in_ante = 0  # 0=Small, 1=Big, 2=Boss
 
     for idx, (frame_id, frame_entry, action) in enumerate(parsed_frames):
         button_box = _extract_box(frame_entry)
@@ -410,10 +426,11 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
                 playing_card_cv_queue[target_frame] = action
 
             case A.SORT_RANK | A.SORT_SUIT:
-                pre_sort_frame = max(0, frame_id + FRAME_OFFSETS["pre_sort"])
-                post_sort_frame = max(0, frame_id + FRAME_OFFSETS["post_sort"])
-                playing_card_cv_queue[pre_sort_frame] = action
-                playing_card_cv_queue[post_sort_frame] = action
+                if blind_idx_in_ante == 2:
+                    pre_sort_frame = max(0, frame_id + FRAME_OFFSETS["pre_sort"])
+                    post_sort_frame = max(0, frame_id + FRAME_OFFSETS["post_sort"])
+                    playing_card_cv_queue[pre_sort_frame] = action
+                    playing_card_cv_queue[post_sort_frame] = action
 
             case (
                 A.BUY_CARD
@@ -481,6 +498,9 @@ def plan_action_pipeline(d: dict[str, Any]) -> dict[str, Any]:
             elif new_loc != Location.PACK:
                 pre_pack_loc = None
             location = new_loc
+
+        if action in (A.END_ROUND, A.SKIP_BLIND):
+            blind_idx_in_ante = (blind_idx_in_ante + 1) % 3
 
     return {
         "scheduled_actions": scheduled_actions,
@@ -557,19 +577,38 @@ def match_button_to_item_index(
 
     best_idx: int | None = None
     best_dist = float("inf")
+    median_y1: float | None = None
+    if attach == "center_right" and len(items) > 1:
+        y1s = sorted(
+            float(b[1])
+            for it in items
+            if (b := getattr(it, "box", None)) and len(b) == 4 and b != [0, 0, 0, 0]
+        )
+        if y1s:
+            median_y1 = y1s[len(y1s) // 2]
+
     for idx, item in enumerate(items):
         box = getattr(item, "box", None)
         if not box or len(box) != 4 or box == [0, 0, 0, 0]:
             continue
         if attach == "center_right":
             item_w = max(1.0, float(box[2] - box[0]))
-            anchor_x = float(box[2]) + 0.1 * item_w
+            anchor_x = float(box[2]) + 0.55 * item_w
             anchor_y = (box[1] + box[3]) / 2.0
         else:
             anchor_x = (box[0] + box[2]) / 2.0
             anchor_y = (box[1] + box[3]) / 2.0
 
         dist = abs(btn_cx - anchor_x) + 0.25 * abs(btn_cy - anchor_y)
+        if attach == "center_right" and len(items) > 1:
+            if btn_cx < float(box[0]):
+                dist += 1000.0
+            if (
+                median_y1 is not None
+                and float(box[1]) <= median_y1 - 10.0
+                and btn_cx >= float(box[0])
+            ):
+                dist -= 40.0
         if dist < best_dist:
             best_dist = dist
             best_idx = idx
@@ -966,6 +1005,24 @@ def _sync_hud_into_state(
                 diag["cashout_without_round_won"].append(sa.frame_id)
             trigger_end_of_round_effects(state, action)
         new_money = int(money_val)
+        if (
+            sa.ambient_location == Location.BLIND
+            and sa.action_type != ActionType.SELECT_BLIND
+            and state.hands_played_this_round > 0
+            and state.last_hand_played is not None
+            and state.inventory is not None
+            and new_money - state.money == 4
+        ):
+            for j in state.inventory.jokers:
+                if (
+                    j.name == JokerName.TO_DO_LIST
+                    and not j.debuffed
+                    and j.state.get("target_hand") != state.last_hand_played
+                ):
+                    j.state["target_hand"] = state.last_hand_played
+                    state.to_do_poker_hand = state.last_hand_played
+                    state.money += 4
+                    break
         _record_ocr_override(
             diag,
             frame_id=sa.frame_id,
@@ -1092,7 +1149,14 @@ def _sync_hud_into_state(
         and int(reroll_val) >= 0
     ):
         reroll_cost = int(reroll_val)
-        if reroll_cost == 0 and state.free_rerolls > 0:
+        if sa.action_type == ActionType.REROLL_SHOP and (
+            (state.free_rerolls == 0 and reroll_cost == state.reroll_cost + 1)
+            or (state.free_rerolls > 0 and reroll_cost == state.reroll_cost)
+        ):
+            # At frame_id - 2 on Reroll Shop, the depressed button already shows
+            # the post-reroll cost that on_action(REROLL_SHOP) is about to set.
+            pass
+        elif reroll_cost == 0 and state.free_rerolls > 0:
             pass
         elif reroll_cost > 0 and state.free_rerolls > 0:
             _record_ocr_override(
@@ -1164,63 +1228,89 @@ def _sync_bars_into_state(
     shop_out: Any,
     action: Action,
     diag: dict[str, Any] | None = None,
+    *,
+    next_obs_cons_counts: Counter[tuple[Any, Any]] | None = None,
+    suppress_consumable_loss_diag: bool = False,
+    sync_jokers: bool = True,
+    sync_consumables: bool = True,
 ) -> tuple[list[Any], list[Any]]:
     """Syncs Joker and Consumable bars from CV into `state` & records non-identity `joker_order`."""
     raw_jokers = list(getattr(shop_out, "joker_bar", None) or [])
-    obs_jokers = _convert_items_of_type(raw_jokers, Joker)
-    prev_jokers = list(state.inventory.jokers) if state.inventory else []
-    prev_joker_ids = [j.id for j in prev_jokers]
+    if sync_jokers:
+        obs_jokers = _convert_items_of_type(raw_jokers, Joker)
+        prev_jokers = list(state.inventory.jokers) if state.inventory else []
+        prev_joker_ids = [j.id for j in prev_jokers]
 
-    if state.inventory and state.inventory.jokers:
-        matched_ids = state.match_cv_joker_order(obs_jokers)
-        if matched_ids:
-            if matched_ids != prev_joker_ids:
-                action.joker_order = matched_ids
-        elif (
-            not obs_jokers
-            and state.current_blind == BlindName.AMBER_ACORN
-            and any(j.facing_back for j in state.inventory.jokers)
-        ):
-            # Amber Acorn flips owned jokers face-down, hiding their faces from CV;
-            # state.inventory.jokers is already in order so omit redundant identity joker_order.
-            pass
-        else:
+        if state.inventory and state.inventory.jokers:
+            matched_ids = state.match_cv_joker_order(obs_jokers)
+            if matched_ids:
+                if matched_ids != prev_joker_ids:
+                    action.joker_order = matched_ids
+            elif (
+                not obs_jokers
+                and state.current_blind == BlindName.AMBER_ACORN
+                and any(j.facing_back for j in state.inventory.jokers)
+            ):
+                # Amber Acorn flips owned jokers face-down, hiding their faces from CV;
+                # state.inventory.jokers is already in order so omit redundant identity joker_order.
+                pass
+            else:
+                state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
+        elif obs_jokers:
             state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
-    elif obs_jokers:
-        state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
 
-    if diag is not None and state.inventory is not None:
-        lost_jokers, gained_jokers = _counter_diff_names(
-            prev_jokers, state.inventory.jokers
-        )
-        if lost_jokers or gained_jokers:
-            diag["unexplained_joker_changes"].append(
-                (action.frame_idx, action.type.value, lost_jokers, gained_jokers)
+        if diag is not None and state.inventory is not None:
+            lost_jokers, gained_jokers = _counter_diff_names(
+                prev_jokers, state.inventory.jokers
             )
+            if lost_jokers or gained_jokers:
+                diag["unexplained_joker_changes"].append(
+                    (action.frame_idx, action.type.value, lost_jokers, gained_jokers)
+                )
 
-    prev_cons = list(state.inventory.consumables) if state.inventory else []
     raw_cons = list(getattr(shop_out, "consumeables", None) or [])
-    obs_cons = _convert_items_of_type(raw_cons, (Tarot, Planet, Spectral))
-    if state.inventory and (obs_cons or state.inventory.consumables):
-        if len(obs_cons) == len(
-            state.inventory.consumables
-        ) and _consumable_multiset_matches(state.inventory.consumables, obs_cons):
-            state.inventory.consumables = _reorder_existing_consumables(
-                state.inventory.consumables, obs_cons
-            )
-        elif obs_cons:
-            state.inventory.consumables = _reconcile_existing_consumables(
-                state.inventory.consumables, obs_cons
-            )
+    if sync_consumables:
+        prev_cons = list(state.inventory.consumables) if state.inventory else []
+        obs_cons = _convert_items_of_type(raw_cons, (Tarot, Planet, Spectral))
+        if state.inventory and (obs_cons or state.inventory.consumables):
+            effective_obs_cons = list(obs_cons)
+            if next_obs_cons_counts is not None:
+                obs_counts = Counter(_consumable_sig(c) for c in effective_obs_cons)
+                prev_counts = Counter(
+                    _consumable_sig(c) for c in state.inventory.consumables
+                )
+                for prev_c in state.inventory.consumables:
+                    sig = _consumable_sig(prev_c)
+                    expected_keep = min(prev_counts[sig], next_obs_cons_counts[sig])
+                    if obs_counts[sig] < expected_keep:
+                        effective_obs_cons.append(copy.deepcopy(prev_c))
+                        obs_counts[sig] += 1
 
-    if diag is not None and state.inventory is not None:
-        lost_cons, gained_cons = _counter_diff_names(
-            prev_cons, state.inventory.consumables
-        )
-        if lost_cons or gained_cons:
-            diag["unexplained_consumable_changes"].append(
-                (action.frame_idx, action.type.value, lost_cons, gained_cons)
+            if len(effective_obs_cons) == len(
+                state.inventory.consumables
+            ) and _consumable_multiset_matches(
+                state.inventory.consumables, effective_obs_cons
+            ):
+                state.inventory.consumables = _reorder_existing_consumables(
+                    state.inventory.consumables, effective_obs_cons
+                )
+            elif effective_obs_cons:
+                state.inventory.consumables = _reconcile_existing_consumables(
+                    state.inventory.consumables, effective_obs_cons
+                )
+            elif next_obs_cons_counts is None or not next_obs_cons_counts:
+                state.inventory.consumables = []
+
+        if diag is not None and state.inventory is not None:
+            lost_cons, gained_cons = _counter_diff_names(
+                prev_cons, state.inventory.consumables
             )
+            if suppress_consumable_loss_diag:
+                lost_cons = []
+            if lost_cons or gained_cons:
+                diag["unexplained_consumable_changes"].append(
+                    (action.frame_idx, action.type.value, lost_cons, gained_cons)
+                )
 
     return raw_jokers, raw_cons
 
@@ -1395,7 +1485,30 @@ def _sync_hand_into_state(
                 ):
                     rem_match = deck_card
                     break
+            if (
+                rem_match is None
+                and not obs.facing_back
+                and obs.card.enhancement != Enhancement.NONE
+            ):
+                for deck_card in state.remaining_deck:
+                    if (
+                        deck_card.id not in claimed_deck_ids
+                        and deck_card.rank == obs.card.rank
+                        and deck_card.suit == obs.card.suit
+                        and deck_card.seal == obs.card.seal
+                        and deck_card.edition == obs.card.edition
+                        and deck_card.enhancement != Enhancement.NONE
+                    ):
+                        rem_match = deck_card
+                        break
             if rem_match is None:
+                is_corrupt_crop = (
+                    not obs.facing_back
+                    and obs.card.enhancement != Enhancement.STONE
+                    and (obs.card.rank == Rank.NONE or obs.card.suit == Suit.NONE)
+                )
+                if is_corrupt_crop:
+                    continue
                 rem_match = copy.deepcopy(obs.card)
                 rem_match.id = next_deck_id
                 next_deck_id += 1
@@ -1489,6 +1602,21 @@ def _resolve_target_card_name(state: GameState, action: Action) -> str | None:
     return None
 
 
+def _serialize_shop_shelves(state: GameState) -> dict[str, list[dict[str, Any]]]:
+    """Serializes `state`'s visible shop shelves for pre-action metadata snapshots."""
+    from game.trajectory_codec import (
+        _serialize_booster_pack,
+        _serialize_card,
+        _serialize_voucher,
+    )
+
+    return {
+        "cards": [_serialize_card(c) for c in state.shop_cards],
+        "vouchers": [_serialize_voucher(v) for v in state.shop_vouchers],
+        "packs": [_serialize_booster_pack(bp) for bp in state.shop_packs],
+    }
+
+
 def _build_run_trajectory_with_plan(
     d: dict[str, Any],
     video_path: str | Path | None = None,
@@ -1499,7 +1627,7 @@ def _build_run_trajectory_with_plan(
     stake: Stake = Stake.WHITE,
     fps: float | None = None,
     conf_threshold_hand: float = 0.50,
-    conf_threshold_shop: float = 0.80,
+    conf_threshold_shop: float = 0.15,
     conf_threshold_ocr: float = 0.90,
     batch_size: int = 32,
     device: str | None = None,
@@ -1614,6 +1742,20 @@ def _build_run_trajectory_with_plan(
         A.USE_CONSUMABLE,
         A.SELL_CARD,
     }
+    obs_cons_counts_by_sa_idx: dict[int, Counter[tuple[Any, Any]]] = {}
+    for i, s_act in enumerate(scheduled_actions):
+        s_out = shop_res_by_frame.get(s_act.target_frame)
+        if s_out is not None:
+            raw_c = list(getattr(s_out, "consumeables", None) or [])
+            obs_c = _convert_items_of_type(raw_c, (Tarot, Planet, Spectral))
+            obs_cons_counts_by_sa_idx[i] = Counter(_consumable_sig(c) for c in obs_c)
+
+    def _next_obs_cons_counts(cur_idx: int) -> Counter[tuple[Any, Any]] | None:
+        for j in range(cur_idx + 1, len(scheduled_actions)):
+            if j in obs_cons_counts_by_sa_idx:
+                return obs_cons_counts_by_sa_idx[j]
+        return None
+
     action_iter = (
         tqdm(
             enumerate(scheduled_actions),
@@ -1625,6 +1767,12 @@ def _build_run_trajectory_with_plan(
         else enumerate(scheduled_actions)
     )
     for sa_idx, sa in action_iter:
+        is_face_down_boss = (
+            state.current_blind in FACE_DOWN_BOSS_BLINDS and not state.boss_disabled
+        )
+        if sa.action_type in (A.SORT_RANK, A.SORT_SUIT) and not is_face_down_boss:
+            continue
+
         action = Action(
             type=sa.action_type,
             frame_idx=sa.frame_id,
@@ -1643,15 +1791,128 @@ def _build_run_trajectory_with_plan(
             state.hand.cards.clear()
 
         shop_out = shop_res_by_frame.get(sa.target_frame)
+        if state.location == Location.PACK and sa.ambient_location in (
+            Location.SHOP,
+            Location.SELECT,
+        ):
+            if (
+                state.active_pack is not None
+                and state.active_pack.booster_type == BoosterType.BUFFOON
+                and shop_out is not None
+                and state.inventory is not None
+            ):
+                obs_j_list = _convert_items_of_type(
+                    list(getattr(shop_out, "joker_bar", None) or []), Joker
+                )
+                prev_counts = Counter(
+                    (j.name, j.edition, j.eternal, j.perishable, j.rental)
+                    for j in state.inventory.jokers
+                )
+                gained_from_pack: list[Joker] = []
+                for oj in obs_j_list:
+                    sig = (oj.name, oj.edition, oj.eternal, oj.perishable, oj.rental)
+                    if prev_counts[sig] > 0:
+                        prev_counts[sig] -= 1
+                    else:
+                        gained_from_pack.append(oj)
+                if 1 <= len(gained_from_pack) <= max(1, state.active_pack.choose):
+                    for gj in gained_from_pack:
+                        new_j = copy.deepcopy(gj)
+                        state.inventory.jokers.append(new_j)
+                        on_joker_added(state, new_j)
+                    state.ensure_joker_ids()
+            state.active_pack = None
+            state.pack_cards.clear()
+            state.pack_choices_remaining = 0
+            if getattr(state, "pending_packs", None):
+                state.pending_packs.clear()
+            state.location = sa.ambient_location
+            state.pre_pack_location = None
+
         raw_jokers: list[Any] = []
         raw_cons: list[Any] = []
+        next_cons_counts = _next_obs_cons_counts(sa_idx)
         if shop_out is not None:
+            # Retroactively infer missed USE_CONSUMABLE actions when a held consumable
+            # disappears in both the current and next observed CV frame.
+            if state.inventory and state.inventory.consumables:
+                cur_cons_counts = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())
+                prev_frame_id = (
+                    scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+                )
+                inferred_frame = max(prev_frame_id + 1, sa.frame_id - 1)
+                hud_for_infer = hud_res_by_frame.get(sa.target_frame)
+                hud_money_val = (
+                    getattr(hud_for_infer, "hud_money", None)
+                    if hud_for_infer is not None
+                    else None
+                )
+                idx_cursor = 0
+                while idx_cursor < len(state.inventory.consumables):
+                    held_c = state.inventory.consumables[idx_cursor]
+                    sig = _consumable_sig(held_c)
+                    held_sig_total = sum(
+                        1
+                        for c in state.inventory.consumables
+                        if _consumable_sig(c) == sig
+                    )
+                    next_count = (
+                        next_cons_counts[sig] if next_cons_counts is not None else 0
+                    )
+                    if (
+                        cur_cons_counts[sig] < held_sig_total
+                        and next_count < held_sig_total
+                    ):
+                        sell_val = max(1, int(getattr(held_c, "sell_value", 1)))
+                        c_name = getattr(held_c, "name", None)
+                        is_sell = (
+                            hud_money_val is not None
+                            and hud_money_val >= state.money + sell_val
+                            and c_name not in (TarotName.HERMIT, TarotName.TEMPERANCE)
+                        )
+                        if is_sell:
+                            joker_offset = len(state.inventory.jokers)
+                            inferred_action = Action(
+                                type=A.SELL_CARD,
+                                frame_idx=inferred_frame,
+                                timestamp=inferred_frame / resolved_fps,
+                                target_idx=joker_offset + idx_cursor,
+                                metadata={
+                                    "inferred": True,
+                                    "target_card": str(c_name or ""),
+                                },
+                            )
+                        else:
+                            inferred_action = Action(
+                                type=A.USE_CONSUMABLE,
+                                frame_idx=inferred_frame,
+                                timestamp=inferred_frame / resolved_fps,
+                                target_idx=idx_cursor,
+                                metadata={
+                                    "inferred": True,
+                                    "target_card": str(c_name or ""),
+                                },
+                            )
+                        state.frame_idx = inferred_action.frame_idx
+                        state.timestamp = inferred_action.timestamp
+                        on_action(state, inferred_action)
+                        trajectory.record_step(state, inferred_action)
+                    else:
+                        idx_cursor += 1
+
             raw_jokers, raw_cons = _sync_bars_into_state(
-                state, shop_out, action, diag=diag
+                state,
+                shop_out,
+                action,
+                diag=diag,
+                next_obs_cons_counts=next_cons_counts,
+                sync_jokers=True,
+                sync_consumables=(sa.action_type != A.END_ROUND),
             )
 
         # Sync main shop shelves before matching/stepping shop actions
         if sa.ambient_location == Location.SHOP and shop_out is not None:
+            pre_cv_shelves = _serialize_shop_shelves(state)
             raw_shop_items = list(getattr(shop_out, "shop_items", None) or [])
             raw_vouchers = list(getattr(shop_out, "vouchers", None) or [])
             raw_boosters = list(getattr(shop_out, "boosters", None) or [])
@@ -1662,6 +1923,12 @@ def _build_run_trajectory_with_plan(
             if getattr(state, "coupon_shop_active", False):
                 for item in state.shop_cards + state.shop_packs:
                     item.couponed = True
+            post_cv_shelves = _serialize_shop_shelves(state)
+            if any(post_cv_shelves.values()) and (
+                post_cv_shelves != pre_cv_shelves
+                or sa.action_type in (A.NEXT_ROUND, A.SELECT_BLIND)
+            ):
+                action.metadata["observed_shop"] = post_cv_shelves
 
             if sa.action_type in (A.BUY_CARD, A.BUY_AND_USE):
                 action.target_idx = match_button_to_item_index(
@@ -1683,6 +1950,12 @@ def _build_run_trajectory_with_plan(
                 raw_pack_items, (Joker, Tarot, Planet, Spectral, PlayingCard)
             )
             state.pack_cards = pack_objs
+            if pack_objs:
+                from game.trajectory_codec import _serialize_card
+
+                action.metadata["observed_pack"] = [
+                    _serialize_card(p) for p in pack_objs
+                ]
             if state.active_pack is None:
                 inferred = _infer_booster_pack_from_items(pack_objs)
                 state.active_pack = inferred
@@ -1720,6 +1993,21 @@ def _build_run_trajectory_with_plan(
                 if pre_selected_uid is not None:
                     action.metadata["selected_slot_uid"] = pre_selected_uid
         else:
+            # If a round transition was missed, return prior round's discard/played cards
+            # to draw_pile before syncing the new round's hand so full_deck doesn't bloat.
+            hud_pre = hud_res_by_frame.get(sa.target_frame)
+            hud_r_val = (
+                getattr(hud_pre, "hud_round", None) if hud_pre is not None else None
+            )
+            if (
+                hud_r_val is not None
+                and hud_r_val > state.round
+                and (state.discard_pile or state.played_cards_this_round)
+            ):
+                state.hand.cards.clear()
+                state.discard_pile.clear()
+                state.played_cards_this_round.clear()
+                state.clear_boss_round_modifiers()
             hand_out = hand_res_by_frame.get(sa.target_frame)
             if hand_out is not None:
                 obs_cards = [
@@ -1778,6 +2066,16 @@ def _build_run_trajectory_with_plan(
         state.timestamp = action.timestamp
         prev_loc = state.location
         on_action(state, action)
+        if sa.action_type == A.END_ROUND and shop_out is not None:
+            _, raw_cons = _sync_bars_into_state(
+                state,
+                shop_out,
+                action,
+                diag=diag,
+                next_obs_cons_counts=next_cons_counts,
+                sync_jokers=False,
+                sync_consumables=True,
+            )
         if deferred_round_score is not None:
             if diag is not None and state.current_chips != deferred_round_score:
                 diag["ocr_score_updates"] += 1
@@ -1785,7 +2083,8 @@ def _build_run_trajectory_with_plan(
 
         # Post-sort reconciliation aligns actual settled positions + tightens face-down CardBounds
         if (
-            sa.action_type in (A.SORT_RANK, A.SORT_SUIT)
+            is_face_down_boss
+            and sa.action_type in (A.SORT_RANK, A.SORT_SUIT)
             and sa.post_sort_frame is not None
             and sa.post_sort_frame in hand_res_by_frame
         ):
@@ -1829,7 +2128,7 @@ def build_run_trajectory(
     stake: Stake = Stake.WHITE,
     fps: float | None = None,
     conf_threshold_hand: float = 0.50,
-    conf_threshold_shop: float = 0.80,
+    conf_threshold_shop: float = 0.15,
     conf_threshold_ocr: float = 0.90,
     batch_size: int = 32,
     device: str | None = None,
@@ -1977,7 +2276,7 @@ def _build_post_processing_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--conf-shop",
         type=float,
-        default=0.80,
+        default=0.15,
         help="Shop detector confidence threshold",
     )
     p.add_argument(

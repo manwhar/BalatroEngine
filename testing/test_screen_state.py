@@ -68,21 +68,16 @@ class TestScreenStateTracker(unittest.TestCase):
         tracker.on_template_clicked("Select Blind")
         tracker.on_template_clicked("Cash Out")
 
-        # Open Pack from Shop -> strict PACK state (no Sort/Play/Buy/Cash Out)
-        self.assertEqual(tracker.on_template_clicked("Open Pack"), CoarseScreenState.PACK)
+        # Open Pack from Shop -> PACK_OR_SHOP hybrid state so missed pack exit clicks don't deadlock SHOP
+        self.assertEqual(tracker.on_template_clicked("Open Pack"), CoarseScreenState.PACK_OR_SHOP)
         pack_allowed = tracker.allowed_template_names()
-        self.assertEqual(
-            pack_allowed,
-            {
-                "Use In Pack",
-                "Select Card",
-                "Skip Pack",
-                "Sell Card",
-                "Use Consumable",
-                "Open Options Menu",
-                "Open Run Info Menu",
-            },
-        )
+        self.assertEqual(pack_allowed, ALLOWED_TEMPLATES_BY_STATE[CoarseScreenState.PACK_OR_SHOP])
+        self.assertIn("Use In Pack", pack_allowed)
+        self.assertIn("Select Card", pack_allowed)
+        self.assertIn("Skip Pack", pack_allowed)
+        self.assertNotIn("Play Hand", pack_allowed)
+        self.assertNotIn("Cash Out", pack_allowed)
+        self.assertNotIn("Select Blind", pack_allowed)
 
         # Choosing a card in pack enters PACK_OR_SHOP (supports both choose=1 exit & choose=2 Mega!)
         self.assertEqual(tracker.on_template_clicked("Use In Pack"), CoarseScreenState.PACK_OR_SHOP)

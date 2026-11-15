@@ -126,6 +126,138 @@ def _deserialize_playing_card(d: dict[str, Any]) -> PlayingCard:
     )
 
 
+def _serialize_playing_card_list_diff(
+    prev_cards: list[PlayingCard] | None,
+    curr_cards: list[PlayingCard],
+) -> Any:
+    """Serializes an incremental diff between `prev_cards` and `curr_cards`.
+
+    Returns `[]` when cleared, a compact dict (`added`, `removed_ids`,
+    `debuffed_ids`, `undebuffed_ids`, `updated`) when an incremental diff
+    applies cleanly, or a full serialized list as fallback.
+    """
+    if len(curr_cards) == 0:
+        return []
+
+    curr_ser = [_serialize_playing_card(c) for c in curr_cards]
+    if prev_cards is None:
+        return curr_ser
+
+    prev_ser = [_serialize_playing_card(c) for c in prev_cards]
+    # Fast path 1: pure prefix append (covers almost all played/discarded pile updates)
+    if len(curr_ser) >= len(prev_ser) and curr_ser[:len(prev_ser)] == prev_ser:
+        return {"added": curr_ser[len(prev_ser):]}
+
+    # Fast path 2: ID-keyed diff when all cards carry unique non-zero IDs
+    if (
+        all(c.id != 0 for c in prev_cards)
+        and all(c.id != 0 for c in curr_cards)
+        and len({c.id for c in prev_cards}) == len(prev_cards)
+        and len({c.id for c in curr_cards}) == len(curr_cards)
+    ):
+        prev_by_id = {c.id: (c, s) for c, s in zip(prev_cards, prev_ser)}
+        curr_by_id = {c.id: (c, s) for c, s in zip(curr_cards, curr_ser)}
+        surviving_prev_ids = [c.id for c in prev_cards if c.id in curr_by_id]
+        curr_existing_ids = [c.id for c in curr_cards if c.id in prev_by_id]
+        curr_new_ids = [c.id for c in curr_cards if c.id not in prev_by_id]
+
+        # Preserve relative order of surviving cards, with new cards appended at the end
+        if (
+            surviving_prev_ids == curr_existing_ids
+            and [c.id for c in curr_cards] == curr_existing_ids + curr_new_ids
+        ):
+            removed_ids = [c.id for c in prev_cards if c.id not in curr_by_id]
+            debuffed_ids: list[int] = []
+            undebuffed_ids: list[int] = []
+            updated: list[dict[str, Any]] = []
+
+            for cid in curr_existing_ids:
+                p_card, p_ser = prev_by_id[cid]
+                c_card, c_ser = curr_by_id[cid]
+                if p_ser == c_ser:
+                    continue
+                p_toggled = dict(p_ser)
+                if c_card.debuffed:
+                    p_toggled["debuffed"] = True
+                else:
+                    p_toggled.pop("debuffed", None)
+                if p_toggled == c_ser:
+                    if c_card.debuffed:
+                        debuffed_ids.append(cid)
+                    else:
+                        undebuffed_ids.append(cid)
+                else:
+                    updated.append(c_ser)
+
+            added = [curr_by_id[cid][1] for cid in curr_new_ids]
+            diff_out: dict[str, Any] = {}
+            if removed_ids:
+                diff_out["removed_ids"] = removed_ids
+            if debuffed_ids:
+                diff_out["debuffed_ids"] = debuffed_ids
+            if undebuffed_ids:
+                diff_out["undebuffed_ids"] = undebuffed_ids
+            if updated:
+                diff_out["updated"] = updated
+            if added:
+                diff_out["added"] = added
+            return diff_out
+
+    return curr_ser
+
+
+def _deserialize_playing_card_list_diff(
+    raw: Any,
+    prev_cards: list[PlayingCard] | None = None,
+) -> list[PlayingCard]:
+    """Reconstructs a `PlayingCard` list from an incremental diff dict or full list."""
+    if isinstance(raw, list):
+        return [_deserialize_playing_card(c) for c in raw]
+    if not isinstance(raw, dict):
+        raise TypeError(f"Expected list or dict for PlayingCard list diff, got {type(raw)!r}")
+
+    cards = [copy.deepcopy(c) for c in (prev_cards or ())]
+    if "removed_ids" in raw:
+        rem = set(raw["removed_ids"])
+        cards = [c for c in cards if c.id not in rem]
+    if "debuffed_ids" in raw:
+        deb = set(raw["debuffed_ids"])
+        for c in cards:
+            if c.id in deb:
+                c.debuffed = True
+    if "undebuffed_ids" in raw:
+        undeb = set(raw["undebuffed_ids"])
+        for c in cards:
+            if c.id in undeb:
+                c.debuffed = False
+    if "updated" in raw:
+        upd_map = {int(u["id"]): _deserialize_playing_card(u) for u in raw["updated"]}
+        cards = [upd_map.get(c.id, c) for c in cards]
+    if "added" in raw:
+        cards.extend(_deserialize_playing_card(a) for a in raw["added"])
+    return cards
+
+
+def _serialize_poker_hand_int_diff(
+    prev_map: dict[PokerHand, int] | None,
+    curr_map: dict[PokerHand, int],
+) -> dict[str, int]:
+    """Serializes only entries in `curr_map` whose value differs from `prev_map`."""
+    if prev_map is None:
+        return {h.value: v for h, v in curr_map.items()}
+    return {h.value: v for h, v in curr_map.items() if prev_map.get(h) != v}
+
+
+def _deserialize_poker_hand_int_diff(
+    raw: dict[str, Any],
+    prev_map: dict[PokerHand, int] | None = None,
+) -> dict[PokerHand, int]:
+    """Reconstructs a `{PokerHand: int}` mapping by merging incremental entries onto `prev_map`."""
+    out = dict(prev_map) if prev_map is not None else {}
+    out.update({PokerHand(k): int(v) for k, v in raw.items()})
+    return out
+
+
 def _serialize_card_bounds(bounds: CardBounds) -> dict[str, Any]:
     out: dict[str, Any] = {"is_face_down": bounds.is_face_down}
     if bounds.possible_ranks != (set(Rank) - {Rank.NONE}):
@@ -380,7 +512,9 @@ def _deserialize_action(
     )
 
 
-def _serialize_field_value(key: str, val: Any) -> Any:
+def _serialize_field_value(
+    key: str, val: Any, prev_state: GameState | None = None
+) -> Any:
     if val is None:
         return None
     if key in ("shop_cards", "pack_cards"):
@@ -392,7 +526,8 @@ def _serialize_field_value(key: str, val: Any) -> Any:
     if key == "active_pack":
         return _serialize_booster_pack(val)
     if key in ("full_deck", "discard_pile", "played_cards_this_round", "played_cards_this_ante"):
-        return [_serialize_playing_card(c) for c in val]
+        prev_cards = getattr(prev_state, key, None) if prev_state is not None else None
+        return _serialize_playing_card_list_diff(prev_cards, val)
     if key == "active_tags":
         return [t.value for t in val]
     if key == "vouchers_redeemed":
@@ -410,7 +545,9 @@ def _serialize_field_value(key: str, val: Any) -> Any:
     return copy.deepcopy(val)
 
 
-def _deserialize_field_value(key: str, val: Any) -> Any:
+def _deserialize_field_value(
+    key: str, val: Any, prev_state: GameState | None = None
+) -> Any:
     if val is None:
         return None
     if key == "location" or key == "pre_pack_location":
@@ -430,7 +567,8 @@ def _deserialize_field_value(key: str, val: Any) -> Any:
     if key == "active_pack":
         return _deserialize_booster_pack(val)
     if key in ("full_deck", "discard_pile", "played_cards_this_round", "played_cards_this_ante"):
-        return [_deserialize_playing_card(c) for c in val]
+        prev_cards = getattr(prev_state, key, None) if prev_state is not None else None
+        return _deserialize_playing_card_list_diff(val, prev_cards)
     if key in ("small_blind_tag", "big_blind_tag"):
         return SkipTag(val)
     if key == "active_tags":
@@ -465,7 +603,9 @@ def _deserialize_field_value(key: str, val: Any) -> Any:
     return copy.deepcopy(val)
 
 
-def serialize_delta(delta: GameStateDelta) -> dict[str, Any]:
+def serialize_delta(
+    delta: GameStateDelta, prev_state: GameState | None = None
+) -> dict[str, Any]:
     """Serializes one `GameStateDelta` into a sparse dict containing only changed fields."""
     out: dict[str, Any] = {
         "step_idx": delta.step_idx,
@@ -492,15 +632,22 @@ def serialize_delta(delta: GameStateDelta) -> dict[str, Any]:
     if delta.deck_cards_count is not None:
         out["deck_cards_count"] = delta.deck_cards_count
     if delta.full_deck_diff is not None:
-        out["full_deck_diff"] = [_serialize_playing_card(c) for c in delta.full_deck_diff]
+        prev_deck = prev_state.full_deck if prev_state is not None else None
+        out["full_deck_diff"] = _serialize_playing_card_list_diff(prev_deck, delta.full_deck_diff)
     if delta.discard_pile_diff is not None:
-        out["discard_pile_diff"] = [_serialize_playing_card(c) for c in delta.discard_pile_diff]
+        prev_discard = prev_state.discard_pile if prev_state is not None else None
+        out["discard_pile_diff"] = _serialize_playing_card_list_diff(
+            prev_discard, delta.discard_pile_diff
+        )
     if delta.played_cards_diff is not None:
-        out["played_cards_diff"] = [_serialize_playing_card(c) for c in delta.played_cards_diff]
+        prev_played = prev_state.played_cards_this_round if prev_state is not None else None
+        out["played_cards_diff"] = _serialize_playing_card_list_diff(
+            prev_played, delta.played_cards_diff
+        )
 
     if delta.field_diffs:
         filtered_diffs = {
-            k: _serialize_field_value(k, v)
+            k: _serialize_field_value(k, v, prev_state=prev_state)
             for k, v in delta.field_diffs.items()
             if k not in _TOP_LEVEL_DELTA_FIELD_ALIASES
         }
@@ -522,16 +669,24 @@ def serialize_delta(delta: GameStateDelta) -> dict[str, Any]:
     if delta.vouchers_diff is not None:
         out["vouchers_diff"] = [v.value for v in delta.vouchers_diff]
     if delta.hand_levels_diff is not None:
-        out["hand_levels_diff"] = {h.value: v for h, v in delta.hand_levels_diff.items()}
+        prev_levels = prev_state.hand_levels if prev_state is not None else None
+        out["hand_levels_diff"] = _serialize_poker_hand_int_diff(
+            prev_levels, delta.hand_levels_diff
+        )
     if delta.hand_play_counts_diff is not None:
-        out["hand_play_counts_diff"] = {h.value: v for h, v in delta.hand_play_counts_diff.items()}
+        prev_counts = prev_state.hand_play_counts if prev_state is not None else None
+        out["hand_play_counts_diff"] = _serialize_poker_hand_int_diff(
+            prev_counts, delta.hand_play_counts_diff
+        )
     if delta.unique_planets_diff is not None:
         out["unique_planets_diff"] = sorted(delta.unique_planets_diff)
 
     return out
 
 
-def deserialize_delta(d: dict[str, Any]) -> GameStateDelta:
+def deserialize_delta(
+    d: dict[str, Any], prev_state: GameState | None = None
+) -> GameStateDelta:
     """Reconstructs a `GameStateDelta` from a serialized step dict."""
     frame_idx = int(d["frame_idx"])
     timestamp = float(d["timestamp"])
@@ -541,10 +696,19 @@ def deserialize_delta(d: dict[str, Any]) -> GameStateDelta:
         else None
     )
     field_diffs = (
-        {k: _deserialize_field_value(k, v) for k, v in d["field_diffs"].items()}
+        {
+            k: _deserialize_field_value(k, v, prev_state=prev_state)
+            for k, v in d["field_diffs"].items()
+        }
         if d.get("field_diffs") is not None
         else None
     )
+    prev_deck = prev_state.full_deck if prev_state is not None else None
+    prev_discard = prev_state.discard_pile if prev_state is not None else None
+    prev_played = prev_state.played_cards_this_round if prev_state is not None else None
+    prev_levels = prev_state.hand_levels if prev_state is not None else None
+    prev_counts = prev_state.hand_play_counts if prev_state is not None else None
+
     return GameStateDelta(
         step_idx=int(d["step_idx"]),
         frame_idx=frame_idx,
@@ -561,17 +725,17 @@ def deserialize_delta(d: dict[str, Any]) -> GameStateDelta:
         current_chips=d.get("current_chips"),
         deck_cards_count=d.get("deck_cards_count"),
         full_deck_diff=(
-            [_deserialize_playing_card(c) for c in d["full_deck_diff"]]
+            _deserialize_playing_card_list_diff(d["full_deck_diff"], prev_deck)
             if d.get("full_deck_diff") is not None
             else None
         ),
         discard_pile_diff=(
-            [_deserialize_playing_card(c) for c in d["discard_pile_diff"]]
+            _deserialize_playing_card_list_diff(d["discard_pile_diff"], prev_discard)
             if d.get("discard_pile_diff") is not None
             else None
         ),
         played_cards_diff=(
-            [_deserialize_playing_card(c) for c in d["played_cards_diff"]]
+            _deserialize_playing_card_list_diff(d["played_cards_diff"], prev_played)
             if d.get("played_cards_diff") is not None
             else None
         ),
@@ -600,12 +764,12 @@ def deserialize_delta(d: dict[str, Any]) -> GameStateDelta:
             else None
         ),
         hand_levels_diff=(
-            {PokerHand(k): int(v) for k, v in d["hand_levels_diff"].items()}
+            _deserialize_poker_hand_int_diff(d["hand_levels_diff"], prev_levels)
             if d.get("hand_levels_diff") is not None
             else None
         ),
         hand_play_counts_diff=(
-            {PokerHand(k): int(v) for k, v in d["hand_play_counts_diff"].items()}
+            _deserialize_poker_hand_int_diff(d["hand_play_counts_diff"], prev_counts)
             if d.get("hand_play_counts_diff") is not None
             else None
         ),
@@ -699,7 +863,10 @@ def _deserialize_initial_state(d: dict[str, Any]) -> GameState:
 def serialize_trajectory(state: GameState, trajectory: RunTrajectory) -> dict[str, Any]:
     """Serializes `(GameState, RunTrajectory)` into a sparse, delta-based JSON dict."""
     state0 = trajectory.get_state(0) if trajectory.deltas else state
-    steps = [serialize_delta(delta) for delta in trajectory.deltas]
+    steps: list[dict[str, Any]] = []
+    for i, delta in enumerate(trajectory.deltas):
+        prev_st = trajectory.get_state(i - 1) if i > 0 else state0
+        steps.append(serialize_delta(delta, prev_state=prev_st))
     return {
         "schema_version": SCHEMA_VERSION,
         "initial_state": _serialize_initial_state(state0),
@@ -740,13 +907,13 @@ def rebuild_trajectory(
         return traj
 
     curr = _deserialize_initial_state(data["initial_state"])
-    delta0 = deserialize_delta(steps[0])
+    delta0 = deserialize_delta(steps[0], prev_state=curr)
     curr = apply_delta(curr, delta0)
     traj.keyframes[0] = curr.copy()
     traj.deltas.append(delta0)
 
     for step_dict in steps[1:]:
-        delta = deserialize_delta(step_dict)
+        delta = deserialize_delta(step_dict, prev_state=curr)
         curr = apply_delta(curr, delta)
         if delta.step_idx % traj.keyframe_interval == 0:
             traj.keyframes[delta.step_idx] = curr.copy()

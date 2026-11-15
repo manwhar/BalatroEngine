@@ -262,15 +262,18 @@ class TestPostProcessingOrchestration(unittest.TestCase):
                 "Use Consumable": 12,
                 "Sell Card": 13,
                 "Next Round": 14,
+                "Skip Blind": 15,
             },
             "frames": {
                 "5": 0,  # filtered
                 "10": 1,  # filtered
-                "100": {"action": 2, "box": [300, 200, 420, 250]},  # Select Blind -> 98
+                "50": {"action": 15, "box": [200, 200, 300, 250]},  # Skip Small -> 48
+                "70": {"action": 15, "box": [200, 200, 300, 250]},  # Skip Big -> 68
+                "100": {"action": 2, "box": [300, 200, 420, 250]},  # Select Boss Blind -> 98
                 "200": {
                     "action": 3,
                     "box": [850, 900, 930, 940],
-                },  # Sort Rank -> pre=185, post=215
+                },  # Sort Rank -> pre=185, post=250
                 "300": {"action": 5, "box": [1000, 900, 1100, 950]},  # Discard -> 300
                 "400": {"action": 4, "box": [780, 900, 880, 950]},  # Play Hand -> 400
                 "500": {"action": 6, "box": [500, 500, 600, 550]},  # End Round -> 498
@@ -311,9 +314,11 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         }
 
         needed_indices = {
+            48,
+            68,
             98,
             185,
-            215,
+            250,
             300,
             400,
             498,
@@ -409,7 +414,7 @@ class TestPostProcessingOrchestration(unittest.TestCase):
                         _make_card_res("5", "Clubs"),
                         _make_card_res("King", "Hearts"),
                     ]
-                elif f_idx == 215:
+                elif f_idx == 250:
                     # Post-sort: King first, selected face-down card settled after 5? Or between King and 5 -> narrows bounds <= King, >= 5!
                     cards = [
                         _make_card_res("King", "Hearts"),
@@ -454,6 +459,23 @@ class TestPostProcessingOrchestration(unittest.TestCase):
                 "classifiers.inference.batch_recognize_hands",
                 side_effect=fake_batch_hands,
             ),
+            patch.object(
+                pp,
+                "FACE_DOWN_BOSS_BLINDS",
+                pp.FACE_DOWN_BOSS_BLINDS
+                | {
+                    bm.BlindName.THE_HOOK,
+                    bm.BlindName.THE_WALL,
+                    bm.BlindName.THE_CLUB,
+                    bm.BlindName.THE_GOAD,
+                    bm.BlindName.THE_OX,
+                    bm.BlindName.THE_PSYCHIC,
+                    bm.BlindName.THE_PILLAR,
+                    bm.BlindName.THE_WINDOW,
+                    bm.BlindName.THE_MANACLE,
+                    bm.BlindName.THE_HEAD,
+                },
+            ),
         ):
             res = pp.process_actions(
                 d,
@@ -465,15 +487,15 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         state: gs.GameState = res["state"]
         traj: gs.RunTrajectory = res["trajectory"]
 
-        # Step 0 initial + 14 gameplay actions (Play Game and Open Options filtered out)
-        self.assertEqual(len(traj.deltas), 15)
+        # Step 0 initial + 16 gameplay actions (Play Game and Open Options filtered out)
+        self.assertEqual(len(traj.deltas), 17)
 
-        # Verify step 2 (Sort by Rank): pre_sort selected_slot_uid recorded & face-down bounds narrowed between 5 and King
-        sort_delta = traj.deltas[2]
+        # Verify step 4 (Sort by Rank on Boss Blind): pre_sort selected_slot_uid recorded & face-down bounds narrowed between 5 and King
+        sort_delta = traj.deltas[4]
         self.assertEqual(sort_delta.action.type, bm.ActionType.SORT_RANK)
         pre_uid = sort_delta.action.metadata.get("selected_slot_uid")
         self.assertIsNotNone(pre_uid)
-        post_sort_state = traj.get_state(2)
+        post_sort_state = traj.get_state(4)
         self.assertEqual(post_sort_state.hand.cards[1].slot_uid, pre_uid)
         self.assertTrue(post_sort_state.hand.cards[1].selected)
         fd_bounds = post_sort_state.hand.cards[1].bounds
@@ -483,34 +505,34 @@ class TestPostProcessingOrchestration(unittest.TestCase):
             all(bm.Rank.FOUR not in {c.rank} for c in fd_bounds.candidate_cards)
         )
 
-        # Verify step 3 (Discard) recorded hand_order permutation [2, 0, 1] & selected 5 of Clubs
-        discard_delta = traj.deltas[3]
+        # Verify step 5 (Discard) recorded hand_order permutation [2, 0, 1] & selected 5 of Clubs
+        discard_delta = traj.deltas[5]
         self.assertEqual(discard_delta.action.type, bm.ActionType.DISCARD)
         self.assertEqual(discard_delta.action.hand_order, [2, 0, 1])
         self.assertEqual(len(discard_delta.action.selected_cards), 1)
         self.assertEqual(discard_delta.action.selected_cards[0].rank, bm.Rank.FIVE)
 
-        # Verify step 5 (End Round -> GameState BLIND + round_won=True) & step 6 (Cash Out -> SHOP + payout)
-        end_round_state = traj.get_state(5)
+        # Verify step 7 (End Round -> GameState BLIND + round_won=True) & step 8 (Cash Out -> SHOP + payout)
+        end_round_state = traj.get_state(7)
         self.assertEqual(end_round_state.location, bm.Location.BLIND)
         self.assertTrue(end_round_state.round_won)
 
-        cash_out_state = traj.get_state(6)
+        cash_out_state = traj.get_state(8)
         self.assertEqual(cash_out_state.location, bm.Location.SHOP)
         self.assertFalse(cash_out_state.round_won)
         self.assertGreater(cash_out_state.money, 4)
 
         # Verify shop & pack steps matched targets spatially
-        self.assertEqual(traj.deltas[7].action.target_idx, 0)  # Blueprint
-        self.assertEqual(traj.deltas[7].action.joker_order, [])
-        self.assertEqual(traj.deltas[8].action.target_idx, 0)  # Hermit
-        self.assertEqual(traj.deltas[8].action.joker_order, [])
-        self.assertEqual(traj.deltas[9].action.target_idx, 0)  # Overstock
-        self.assertIn(bm.VoucherName.OVERSTOCK, traj.get_state(9).vouchers_redeemed)
-        self.assertEqual(traj.deltas[10].action.target_idx, 0)  # Open Arcana Pack
-        self.assertEqual(traj.deltas[11].action.target_idx, 1)  # Select Card (Empress)
+        self.assertEqual(traj.deltas[9].action.target_idx, 0)  # Blueprint
+        self.assertEqual(traj.deltas[9].action.joker_order, [])
+        self.assertEqual(traj.deltas[10].action.target_idx, 0)  # Hermit
+        self.assertEqual(traj.deltas[10].action.joker_order, [])
+        self.assertEqual(traj.deltas[11].action.target_idx, 0)  # Overstock
+        self.assertIn(bm.VoucherName.OVERSTOCK, traj.get_state(11).vouchers_redeemed)
+        self.assertEqual(traj.deltas[12].action.target_idx, 0)  # Open Arcana Pack
+        self.assertEqual(traj.deltas[13].action.target_idx, 1)  # Select Card (Empress)
         # Empress enhanced 2 of Clubs and 3 of Hearts to Mult Cards in full_deck
-        pack_step_state = traj.get_state(11)
+        pack_step_state = traj.get_state(13)
         mult_cards = [
             c for c in pack_step_state.full_deck if c.enhancement == bm.Enhancement.MULT
         ]
@@ -519,12 +541,12 @@ class TestPostProcessingOrchestration(unittest.TestCase):
             pack_step_state.location, bm.Location.SHOP
         )  # Exited back to shop
 
-        # Verify Sell Card sold Blueprint (index 0) and Next Round moved to Ante 1 Big Blind SELECT
-        self.assertEqual(traj.deltas[13].action.type, bm.ActionType.SELL_CARD)
-        self.assertEqual(traj.deltas[13].action.target_idx, 0)
+        # Verify Sell Card sold Blueprint (index 0) and Next Round moved to Ante 2 Small Blind SELECT
+        self.assertEqual(traj.deltas[15].action.type, bm.ActionType.SELL_CARD)
+        self.assertEqual(traj.deltas[15].action.target_idx, 0)
         self.assertEqual(len(state.inventory.jokers), 0)
         self.assertEqual(state.location, bm.Location.SELECT)
-        self.assertEqual(state.current_blind, bm.BlindName.BIG)
+        self.assertEqual(state.current_blind, bm.BlindName.SMALL)
         self.assertEqual(state.last_tarot_planet, bm.TarotName.HERMIT)
 
     def test_remove_duplicates_preserves_distinct_spaced_clicks_and_merges_holds(self):
@@ -1321,6 +1343,14 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         self.assertEqual(sell_act.hand_order, [])
         self.assertEqual(sell_act.selected_cards, [])
         self.assertEqual(state.inventory.jokers, [])
+        # Buy Card recorded pre-buy shop observation and Next Round cleared stale shelves
+        self.assertIn("observed_shop", buy_act.metadata)
+        self.assertEqual(buy_act.metadata["observed_shop"]["cards"][0]["name"], "Ramen")
+        next_round_state = traj.get_state(6)
+        self.assertEqual(next_round_state.location, bm.Location.SELECT)
+        self.assertEqual(next_round_state.shop_cards, [])
+        self.assertEqual(next_round_state.shop_vouchers, [])
+        self.assertEqual(next_round_state.shop_packs, [])
 
     def test_impute_retroactive_boss_blinds_only_records_boss_on_changes(self):
         traj = gs.RunTrajectory()
@@ -1373,6 +1403,98 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
             self.assertEqual(set(extracted.keys()), set(req))
             self.assertEqual(sum(progress_ticks), len(req))
             self.assertAlmostEqual(float(extracted[45].mean()), 180.0, delta=3.0)
+
+    def test_sort_skips_hand_cv_outside_face_down_boss_blinds(self):
+        d = {
+            "key": {"Select Blind": 0, "Sort by Rank": 1, "Sort by Suit": 2},
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [850, 900, 930, 940]},
+                "300": {"action": 2, "box": [940, 900, 1020, 940]},
+            },
+        }
+        plan = pp.plan_action_pipeline(d)
+        self.assertEqual(plan["playing_card_cv_queue"], {})
+
+    def test_consumable_center_right_matches_lifted_slot_over_next_card(self):
+        # Exact geometry from f=85824: lifted Devil (slot 0) + unlifted Strength (slot 1)
+        cons = [
+            _make_shop_item("c_devil", "Tarot", [1370, 36, 1446, 264]),
+            _make_shop_item("c_strength", "Tarot", [1576, 59, 1668, 291]),
+        ]
+        use_btn = [1527, 161, 1600, 227]
+        self.assertEqual(
+            pp.match_button_to_item_index(use_btn, cons, attach="center_right"),
+            0,
+        )
+
+    def test_retroactive_consumable_inference_and_transient_miss_preservation(self):
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "Use Consumable": 2,
+                "End Round": 3,
+                "Cash Out": 4,
+                "Buy Card": 5,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [780, 900, 880, 950]},
+                "300": {"action": 2, "box": [1637, 168, 1710, 234]},
+                "400": {"action": 1, "box": [780, 900, 880, 950]},
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 298, 400)}
+
+        def fake_shops(frames, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts)
+                if f_idx == 98:
+                    out.consumeables = [
+                        _make_shop_item("c_death", "Tarot", [1370, 60, 1447, 287]),
+                        _make_shop_item("c_fool", "Tarot", [1576, 63, 1667, 289]),
+                    ]
+                elif f_idx == 200:
+                    # Transient 1-frame CV miss of c_death (still present at 298? No, here test both: keep at 200 if at 298, or infer if gone at 298 & 400)
+                    out.consumeables = [
+                        _make_shop_item("c_fool", "Tarot", [1576, 63, 1667, 289]),
+                    ]
+                elif f_idx == 298:
+                    # c_death is gone in both 200 and 298 -> Death was used before 200; Fool is at slot 0
+                    out.consumeables = [
+                        _make_shop_item("c_fool", "Tarot", [1468, 40, 1553, 266]),
+                    ]
+                elif f_idx == 400:
+                    out.consumeables = [
+                        _make_shop_item("c_death", "Tarot", [1468, 60, 1553, 286]),
+                    ]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=[])
+                for _, f_idx, ts in frames
+            ]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            res = pp.process_actions(d, preloaded_frames=dummy_frames, fps=60.0)
+
+        traj: gs.RunTrajectory = res["trajectory"]
+        inferred_steps = [
+            dl.action for dl in traj.deltas if dl.action and dl.action.metadata.get("inferred")
+        ]
+        self.assertEqual(len(inferred_steps), 1)
+        self.assertEqual(inferred_steps[0].type, bm.ActionType.USE_CONSUMABLE)
+        self.assertEqual(inferred_steps[0].metadata.get("target_card"), "Death")
+        # Because Death was inferred before Fool, Fool spawned Death back!
+        final_cons = [c.name for c in res["state"].inventory.consumables]
+        self.assertEqual(final_cons, [bm.TarotName.DEATH])
 
 
 if __name__ == "__main__":

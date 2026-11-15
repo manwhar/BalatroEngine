@@ -279,7 +279,7 @@ class ScreenStateTracker:
             self.pre_pack_location = None
         elif template_name == "Open Pack":
             self.pre_pack_location = Location.SHOP
-            self.state = CoarseScreenState.PACK
+            self.state = CoarseScreenState.PACK_OR_SHOP
         elif template_name == "Next Round":
             self.state = CoarseScreenState.SELECT
             self.pre_pack_location = None

@@ -28,7 +28,7 @@ class Config:
     expand_roi_factor: float = 1.1
     shadow_region_height: int = 10  # pixels
     shadow_threshold: float = 52.0
-    skip_frames: int = 2  # skip n frames then use 1
+    skip_frames: int = 1  # skip n frames then use 1
 
     start_timestamp: float | None = 0
     end_timestamp: float | None = 100

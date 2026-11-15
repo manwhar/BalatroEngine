@@ -31,7 +31,7 @@ PROD_WEIGHTS_DIR = PROJECT_ROOT / "classifiers" / "prod_weights"
 # pyrefly: ignore [missing-import]
 from classifiers.card_classifier.pipeline import CardRecognitionPipeline, CardResult, decode_card_prediction, determine_card_selection
 # pyrefly: ignore [missing-import]
-from classifiers.shop_classifier.pipeline import ShopRecognitionPipeline, ShopItemResult
+from classifiers.shop_classifier.pipeline import ShopRecognitionPipeline, ShopItemResult, filter_shop_items
 # pyrefly: ignore [missing-import]
 from classifiers.end_round_classifier.config import PLAY_AREA_ROI
 # pyrefly: ignore [missing-import]
@@ -55,12 +55,12 @@ BASE_HEIGHT = 1080.0
 # 1920x1080 Balatro UI ROI coordinates (calibrated in balatro_mod/dataset/boxes.lua)
 ROIS = {
     "card_hand": {"x": 508.319934, "y": 567.839093, "w": 1071.056521, "h": 322.734447},
-    "joker_bar": {"x": 512.701385, "y": 20.409878, "w": 868.473724, "h": 259.967609},
+    "joker_bar": {"x": 512.701385, "y": 20.409878, "w": 857.0, "h": 259.967609},
     "consumeables": {"x": 1369.783812, "y": 30.836806, "w": 425.206356, "h": 270.406328},
     "shop": {"x": 818.386186, "y": 369.181989, "w": 720.772049, "h": 280.979925},
     "voucher": {"x": 656.059547, "y": 714.459732, "w": 360.743773, "h": 284.420985},
     "booster": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
-    "pack": {"x": 565.612571, "y": 588.005101, "w": 960.654887, "h": 307.239491},
+    "pack": {"x": 510.0, "y": 575.0, "w": 1070.0, "h": 330.0},
     "play_area": dict(PLAY_AREA_ROI),
     **{k: dict(v) for k, v in HUD_ROIS.items()},
 }
@@ -302,8 +302,9 @@ def _get_shelves_for_mode(mode: str) -> list[str]:
 def recognize_shop(
     video_frame: Any,
     mode: str = "shop",
-    conf_threshold: float = 0.80,
-    device: str | None = None
+    conf_threshold: float = 0.15,
+    device: str | None = None,
+    key_threshold: float = 0.70,
 ) -> ShopRecognitionOutput:
     """Evaluates all relevant shelves on a shop, pack, or HUD frame (boxes returned in full-frame pixels)."""
     img_bgr, f_idx, ts = _extract_frame_image_and_meta(video_frame)
@@ -326,11 +327,10 @@ def recognize_shop(
     }
     for shelf_key in shelves:
         crop_pil, roi = _crop_roi_to_pil(img_bgr, shelf_key)
-        items = _translate_item_boxes(
-            pipeline.predict(crop_pil, conf_threshold=conf_threshold),
-            roi[0],
-            roi[1],
-        )
+        raw_items = pipeline.predict(crop_pil, conf_threshold=conf_threshold)
+        if key_threshold != 0.70:
+            raw_items = filter_shop_items(raw_items, key_threshold=key_threshold)
+        items = _translate_item_boxes(raw_items, roi[0], roi[1])
         setattr(output, shelf_attr_map[shelf_key], items)
 
     return output
@@ -449,9 +449,10 @@ def batch_recognize_hands(
 def batch_recognize_shops(
     frames: Sequence[Any],
     mode: str = "shop",
-    conf_threshold: float = 0.80,
+    conf_threshold: float = 0.15,
     batch_size: int = 32,
-    device: str | None = None
+    device: str | None = None,
+    key_threshold: float = 0.70,
 ) -> list[ShopRecognitionOutput]:
     """
     Group-batches shop detection across collected frames (boxes returned in full-frame pixels).
@@ -615,12 +616,26 @@ def batch_recognize_shops(
                 else:
                     out_obj.shop_items.append(item_res)
 
-        # Sort items in each shelf left-to-right
+        # Filter slivers/low-key/split-half duplicates and sort left-to-right
+        attr_name = (
+            "pack_items"
+            if shelf_key == "pack"
+            else (
+                "shop_items"
+                if shelf_key == "shop"
+                else (
+                    "vouchers"
+                    if shelf_key == "voucher"
+                    else ("boosters" if shelf_key == "booster" else shelf_key)
+                )
+            )
+        )
         for out_obj in outputs:
-            target_list = getattr(out_obj, "pack_items" if shelf_key == "pack" else ("shop_items" if shelf_key == "shop" else ("vouchers" if shelf_key == "voucher" else ("boosters" if shelf_key == "booster" else shelf_key))))
-            target_list.sort(key=lambda item: item.box[0])
-            for i, it in enumerate(target_list):
-                it.index = i
+            filtered_list = filter_shop_items(
+                getattr(out_obj, attr_name),
+                key_threshold=key_threshold,
+            )
+            setattr(out_obj, attr_name, filtered_list)
 
     return outputs
 
@@ -637,7 +652,7 @@ def process_frames_iterator(
         for f in frames_iterator:
             yield recognize_hand_cards(f, conf_threshold=thresh)
     elif target == "shop":
-        thresh = conf_threshold if conf_threshold is not None else 0.80
+        thresh = conf_threshold if conf_threshold is not None else 0.15
         for f in frames_iterator:
             yield recognize_shop(f, mode=mode, conf_threshold=thresh)
     else:

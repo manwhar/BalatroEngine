@@ -1588,7 +1588,11 @@ def diff_states(prev: GameState, curr: GameState, action: Action | None = None) 
 
     if prev.deck_cards_count != curr.deck_cards_count:
         delta.deck_cards_count = curr.deck_cards_count
-    if prev.full_deck != curr.full_deck:
+    if prev.full_deck != curr.full_deck or (
+        prev.full_deck is not None
+        and curr.full_deck is not None
+        and any(p.debuffed != c.debuffed for p, c in zip(prev.full_deck, curr.full_deck))
+    ):
         delta.full_deck_diff = copy.deepcopy(curr.full_deck)
     if prev.discard_pile != curr.discard_pile:
         delta.discard_pile_diff = copy.deepcopy(curr.discard_pile)

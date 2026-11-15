@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 
@@ -314,6 +315,179 @@ class TestTrajectoryCodec(unittest.TestCase):
         # Check step_idx selection on rebuild_gamestate
         _assert_states_equivalent(self, traj.get_state(3), rebuild_gamestate(reloaded, step_idx=3))
         _assert_states_equivalent(self, state, rebuild_gamestate(reloaded))
+
+    def test_incremental_collection_and_mapping_diffs_roundtrip(self):
+        state = GameState(
+            seed="INCRDIFF",
+            deck=Deck.RED_DECK,
+            stake=Stake.WHITE,
+            ante=1,
+            round=1,
+            current_blind=BlindName.SMALL,
+            location=Location.SELECT,
+            apply_deck_stake_on_init=True,
+        )
+        traj = RunTrajectory(keyframe_interval=3)
+        traj.record_step(state, action=None)
+
+        # Pick real deck cards with unique IDs from the initialized 52-card deck
+        c0 = copy.deepcopy(state.full_deck[0])
+        c1 = copy.deepcopy(state.full_deck[1])
+        c2 = copy.deepcopy(state.full_deck[2])
+        c3 = copy.deepcopy(state.full_deck[3])
+
+        # Step 1: Select Blind
+        self._step(state, traj, Action(type=ActionType.SELECT_BLIND, frame_idx=30, timestamp=0.5))
+
+        # Step 2: Discard c0 (checks incremental discard_pile_diff)
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.DISCARD, frame_idx=60, timestamp=1.0, selected_cards=[c0]),
+            mutate=lambda st: setattr(
+                st.hand,
+                "cards",
+                [
+                    HandCard(card=copy.deepcopy(c0), selected=True, slot_uid=1),
+                    HandCard(card=copy.deepcopy(c1), slot_uid=2),
+                    HandCard(card=copy.deepcopy(c2), slot_uid=3),
+                    HandCard(card=copy.deepcopy(c3), slot_uid=4),
+                ],
+            ),
+        )
+
+        # Step 3: Play c1 (first append to played_cards_this_round, played_cards_this_ante,
+        # hand_play_counts, discard_pile)
+        def _select_c1_and_score(st: GameState) -> None:
+            for hc in st.hand.cards:
+                hc.selected = hc.slot_uid == 2
+            st.current_chips = 100
+
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.PLAY_HAND, frame_idx=90, timestamp=1.5, selected_cards=[c1]),
+            mutate=_select_c1_and_score,
+        )
+
+        # Step 4: Play c2 (pure append on top of existing played_cards & discard_pile)
+        def _select_c2_and_score(st: GameState) -> None:
+            for hc in st.hand.cards:
+                hc.selected = hc.slot_uid == 3
+            st.current_chips = 200
+
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.PLAY_HAND, frame_idx=120, timestamp=2.0, selected_cards=[c2]),
+            mutate=_select_c2_and_score,
+        )
+
+        # Step 5: End round -> clears discard_pile,
+        # enhances c3, removes one card, adds one card, and levels up a poker hand.
+        c3_enhanced = copy.deepcopy(c3)
+        c3_enhanced.enhancement = Enhancement.GLASS
+        removed_id = state.full_deck[10].id
+        extra_card = PlayingCard(rank=Rank.ACE, suit=Suit.SPADES, enhancement=Enhancement.LUCKY, id=99)
+
+        def _mutate_deck_and_levels(st: GameState) -> None:
+            st.hand_levels[PokerHand.FLUSH] = st.hand_levels.get(PokerHand.FLUSH, 1) + 1
+            for idx, dc in enumerate(st.full_deck):
+                if dc.id == c3_enhanced.id:
+                    st.full_deck[idx] = copy.deepcopy(c3_enhanced)
+            st.full_deck = [dc for dc in st.full_deck if dc.id != removed_id]
+            st.full_deck.append(copy.deepcopy(extra_card))
+
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.END_ROUND, frame_idx=150, timestamp=2.5),
+            mutate=_mutate_deck_and_levels,
+        )
+
+        # Step 6: Cash out to shop
+        self._step(state, traj, Action(type=ActionType.CASH_OUT, frame_idx=180, timestamp=3.0))
+
+        # Step 7: Enter Boss Blind (The Club -> debuffs all Clubs in full_deck and clears played_cards_this_round)
+        expected_club_ids = [dc.id for dc in state.full_deck if dc.suit == Suit.CLUBS]
+        non_club_id = next(dc.id for dc in state.full_deck if dc.suit != Suit.CLUBS)
+
+        def _enter_club_boss(st: GameState) -> None:
+            st.location = Location.SELECT
+            st.pending_blind_advance = False
+            st.current_blind = BlindName.THE_CLUB
+            st.boss_blind = BlindName.THE_CLUB
+            for dc in st.full_deck:
+                if dc.id == non_club_id:
+                    dc.bonus_chips += 5
+
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.SELECT_BLIND, frame_idx=210, timestamp=3.5),
+            mutate=_enter_club_boss,
+        )
+
+        # Step 8: Defeat Boss Blind -> clears debuffs back to False -> undebuffed_ids & played_cards_this_ante=[]
+        def _defeat_club_boss(st: GameState) -> None:
+            st.current_chips = 600
+            for dc in st.full_deck:
+                if dc.id == non_club_id:
+                    dc.bonus_chips += 5
+
+        self._step(
+            state,
+            traj,
+            Action(type=ActionType.END_ROUND, frame_idx=240, timestamp=4.0),
+            mutate=_defeat_club_boss,
+        )
+
+        payload = json.loads(json.dumps(serialize_trajectory(state, traj)))
+        steps = payload["steps"]
+
+        # Step 4 (second Play Hand): played_cards_diff, discard_pile_diff, played_cards_this_ante
+        # should only serialize newly added card(s), NOT full snapshots, and hand_play_counts_diff
+        # should only serialize the changed hand key.
+        step4 = steps[4]
+        self.assertIsInstance(step4["played_cards_diff"], dict)
+        self.assertEqual(len(step4["played_cards_diff"]["added"]), 1)
+        self.assertIsInstance(step4["discard_pile_diff"], dict)
+        self.assertEqual(len(step4["discard_pile_diff"]["added"]), 1)
+        ante_diff = step4["field_diffs"]["played_cards_this_ante"]
+        self.assertIsInstance(ante_diff, dict)
+        self.assertEqual(len(ante_diff["added"]), 1)
+        self.assertIsInstance(step4["hand_play_counts_diff"], dict)
+        self.assertEqual(len(step4["hand_play_counts_diff"]), 1)
+
+        # Step 5 (End Round): full_deck_diff should contain compact incremental diff keys,
+        # hand_levels_diff should only have Flush, and cleared discard_pile should be [].
+        step5 = steps[5]
+        deck_diff5 = step5["full_deck_diff"]
+        self.assertIsInstance(deck_diff5, dict)
+        self.assertEqual(deck_diff5["removed_ids"], [removed_id])
+        self.assertEqual(len(deck_diff5["updated"]), 1)
+        self.assertEqual(deck_diff5["updated"][0]["id"], c3_enhanced.id)
+        self.assertEqual(deck_diff5["updated"][0]["enhancement"], "glass")
+        self.assertEqual(len(deck_diff5["added"]), 1)
+        self.assertEqual(deck_diff5["added"][0]["id"], 99)
+        self.assertEqual(step5["hand_levels_diff"], {PokerHand.FLUSH.value: 2})
+        self.assertEqual(step5["discard_pile_diff"], [])
+
+        # Step 7 & 8: debuffed_ids + cleared played_cards on Boss entry,
+        # undebuffed_ids + cleared played_cards_this_ante on Boss clear
+        self.assertEqual(steps[7]["full_deck_diff"]["debuffed_ids"], expected_club_ids)
+        self.assertEqual(len(steps[7]["full_deck_diff"]["updated"]), 1)
+        self.assertEqual(steps[7]["played_cards_diff"], [])
+        self.assertEqual(steps[8]["full_deck_diff"]["undebuffed_ids"], expected_club_ids)
+        self.assertEqual(len(steps[8]["full_deck_diff"]["updated"]), 1)
+        self.assertEqual(steps[8]["field_diffs"]["played_cards_this_ante"], [])
+
+        # Full round-trip equivalence at every single step
+        rebuilt_traj = rebuild_trajectory(payload, keyframe_interval=3)
+        self.assertEqual(len(rebuilt_traj.deltas), len(traj.deltas))
+        for i in range(len(traj.deltas)):
+            _assert_states_equivalent(self, traj.get_state(i), rebuilt_traj.get_state(i))
+        _assert_states_equivalent(self, state, rebuild_gamestate(payload))
 
 
 if __name__ == "__main__":

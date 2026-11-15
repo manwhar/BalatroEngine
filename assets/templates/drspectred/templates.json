@@ -191,7 +191,7 @@
         "frame_idx": 4206
       }
     ],
-    "shadow_dh": -6,
+    "shadow_dh": -3,
     "adjusted": true
   },
   "Open Pack": {
@@ -242,7 +242,7 @@
       }
     ],
     "adjusted": true,
-    "shadow_dh": -6
+    "shadow_dh": -3
   },
   "Open Options Menu": {
     "label": "Open Options Menu",
@@ -751,8 +751,9 @@
         0.2972
       ]
     ],
-    "shadow_dy": 0,
+    "shadow_dy": 3,
     "shadow_dw": 0,
+    "shadow_dh": 2,
     "test_frames": [
       {
         "path": "assets/testing/use_consumable/frame_108584_pressed_false.jpg",
@@ -779,7 +780,8 @@
         "pressed": true,
         "frame_idx": 20154
       }
-    ]
+    ],
+    "adjusted": true
   },
   "Use In Pack": {
     "label": "Use In Pack",

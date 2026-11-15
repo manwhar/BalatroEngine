@@ -523,19 +523,11 @@ def _convert_shop_item_result(item: Any) -> Any:
         b_size = _BOOSTER_SIZE_MAP.get(
             tokens[2] if len(tokens) > 2 else "", BoosterSize.REGULAR
         )
-        cost = 4
-        if b_type in (BoosterType.BUFFOON, BoosterType.SPECTRAL):
-            cost = (
-                6
-                if b_size == BoosterSize.REGULAR
-                else (8 if b_size == BoosterSize.JUMBO else 10)
-            )
-        else:
-            cost = (
-                4
-                if b_size == BoosterSize.REGULAR
-                else (6 if b_size == BoosterSize.JUMBO else 8)
-            )
+        cost = (
+            4
+            if b_size == BoosterSize.REGULAR
+            else (6 if b_size == BoosterSize.JUMBO else 8)
+        )
         choose = 2 if b_size == BoosterSize.MEGA else 1
         extra = 5 if b_size in (BoosterSize.JUMBO, BoosterSize.MEGA) else 3
         if b_type in (BoosterType.BUFFOON, BoosterType.SPECTRAL):
