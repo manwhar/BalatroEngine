@@ -17,6 +17,7 @@ try:
     from game.engine.rng_sim.events import (
         evaluate_lucky_hit,
         get_ancient_joker_suit,
+        get_blocked_card_names,
         get_castle_suit,
         get_idol_card,
         get_mail_in_rebate_target,
@@ -34,12 +35,14 @@ try:
         predict_ouija_rank,
         predict_purple_seal_tarot,
         predict_random_destroy,
+        state_has_showman,
     )
     from game.engine.rng_sim.state import SimDeck
 except ImportError:
     from engine.rng_sim.events import (
         evaluate_lucky_hit,
         get_ancient_joker_suit,
+        get_blocked_card_names,
         get_castle_suit,
         get_idol_card,
         get_mail_in_rebate_target,
@@ -57,6 +60,7 @@ except ImportError:
         predict_ouija_rank,
         predict_purple_seal_tarot,
         predict_random_destroy,
+        state_has_showman,
     )
     from engine.rng_sim.state import SimDeck
 
@@ -496,6 +500,22 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
         trigger_end_of_round_effects(state, action)
 
 
+def _filter_non_surviving_hand_cards(
+    hand_cards: list[PlayingCard], action: Action | None, *, min_needed: int
+) -> list[PlayingCard]:
+    """Prefers hand cards not witnessed surviving on the next frame when resolving random destroys."""
+    surviving = (
+        action.metadata.get("_surviving_hand_ids")
+        if action and action.metadata
+        else None
+    )
+    if not surviving:
+        return hand_cards
+    surviving_set = set(surviving)
+    pool = [c for c in hand_cards if c.id not in surviving_set]
+    return pool if len(pool) >= min_needed else hand_cards
+
+
 def _has_joker(state, joker_name: JokerName) -> bool:
     """Checks whether state holds an active (undebuffed) copy of joker_name."""
     if hasattr(state, "has_joker"):
@@ -524,9 +544,9 @@ def _spawn_joker_to_inventory(
         rarity_tier=rarity_tier,
         legendary=legendary,
         key_append=key_append,
-        owned_jokers={jk.name for jk in state.inventory.jokers},
+        owned_jokers=get_blocked_card_names(state, CardType.JOKER),
         gros_michel_extinct=getattr(state, "gros_michel_extinct", False),
-        has_showman=_has_joker(state, JokerName.SHOWMAN),
+        has_showman=state_has_showman(state),
         edition_mod=getattr(state, "edition_rate", 1.0),
     )
     state.inventory.jokers.append(j)
@@ -596,7 +616,12 @@ def _apply_discard_cards(
             and state.inventory.can_add_consumable
         ):
             if state.rng:
-                pred = predict_purple_seal_tarot(state.rng, ante=state.ante)
+                pred = predict_purple_seal_tarot(
+                    state.rng,
+                    ante=state.ante,
+                    active_tarots=get_blocked_card_names(state, CardType.TAROT),
+                    has_showman=state_has_showman(state),
+                )
                 state.inventory.consumables.append(pred.to_tarot_card())
             else:
                 state.pending_cv_checks.add("consumables")
@@ -786,9 +811,9 @@ def _apply_shop_entry_tags(state) -> None:
                     ante=state.ante,
                     rarity_tier=tier,
                     key_append=append,
-                    owned_jokers={jk.name for jk in state.inventory.jokers},
+                    owned_jokers=get_blocked_card_names(state, CardType.JOKER),
                     gros_michel_extinct=getattr(state, "gros_michel_extinct", False),
-                    has_showman=_has_joker(state, JokerName.SHOWMAN),
+                    has_showman=state_has_showman(state),
                     edition_mod=getattr(state, "edition_rate", 1.0),
                 )
                 j.couponed = True
@@ -815,7 +840,7 @@ def _apply_shop_entry_tags(state) -> None:
     state.active_tags = remaining_tags
 
 
-def _apply_consumable_state(state, card) -> None:
+def _apply_consumable_state(state, card, action: Action | None = None) -> None:
     """Updates consumable-related GameState memory (tarots_used, last_tarot_planet, unique_planets_used, ectoplasm_minus, deck mutations)."""
     if card is None:
         return
@@ -837,21 +862,16 @@ def _apply_consumable_state(state, card) -> None:
                     state.inventory.consumables.append(Tarot(name=last))
         elif c_name == TarotName.EMPEROR:
             if state.inventory:
-                has_showman = _has_joker(state, JokerName.SHOWMAN)
+                has_showman = state_has_showman(state)
                 for _ in range(2):
                     if not state.inventory.can_add_consumable:
                         break
                     if state.rng:
-                        active_tarots = [
-                            c.name
-                            for c in state.inventory.consumables
-                            if c.type == CardType.TAROT
-                        ]
                         pred = poll_tarot_pool(
                             state.rng,
                             ante=state.ante,
                             key_append="emp",
-                            active_tarots=active_tarots,
+                            active_tarots=get_blocked_card_names(state, CardType.TAROT),
                             has_showman=has_showman,
                         )
                         state.inventory.consumables.append(pred.to_tarot_card())
@@ -859,22 +879,17 @@ def _apply_consumable_state(state, card) -> None:
                         state.pending_cv_checks.add("consumables")
         elif c_name == TarotName.HIGH_PRIESTESS:
             if state.inventory:
-                has_showman = _has_joker(state, JokerName.SHOWMAN)
+                has_showman = state_has_showman(state)
                 for _ in range(2):
                     if not state.inventory.can_add_consumable:
                         break
                     if state.rng:
-                        active_planets = {
-                            c.name
-                            for c in state.inventory.consumables
-                            if c.type == CardType.PLANET
-                        }
                         planet = poll_planet_pool(
                             state.rng,
                             ante=_effective_ante(state),
                             key_append="pri",
                             hand_play_counts=state.hand_play_counts,
-                            active_planets=active_planets,
+                            active_planets=get_blocked_card_names(state, CardType.PLANET),
                             has_showman=has_showman,
                         )
                         state.inventory.consumables.append(planet)
@@ -899,7 +914,7 @@ def _apply_consumable_state(state, card) -> None:
                 left, right = selected[0], selected[1]
                 source_card = right._real_card if right._real_card else right.card
                 if source_card.rank != Rank.NONE:
-                    left.resolve_face_down(source_card)
+                    left.resolve_face_down(source_card, preserve_id=True)
                 if right.facing_back:
                     right.reveal_temporarily()
                 state.update_face_down_candidates()
@@ -1155,7 +1170,9 @@ def _apply_consumable_state(state, card) -> None:
         SpectralName.INCANTATION,
     ):
         if state.rng:
-            hand_cards = [hc.card for hc in state.hand.cards]
+            hand_cards = _filter_non_surviving_hand_cards(
+                [hc.card for hc in state.hand.cards], action, min_needed=1
+            )
             victim = predict_random_destroy(state.rng, hand_cards)
             if victim is not None:
                 state.remove_card_from_deck(victim)
@@ -1195,7 +1212,9 @@ def _apply_consumable_state(state, card) -> None:
                 )
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.IMMOLATE:
         if state.rng:
-            hand_cards = [hc.card for hc in state.hand.cards]
+            hand_cards = _filter_non_surviving_hand_cards(
+                [hc.card for hc in state.hand.cards], action, min_needed=5
+            )
             destroyed = predict_immolate_destructions(state.rng, hand_cards, count=5)
             for dc in destroyed:
                 state.remove_card_from_deck(dc)
@@ -1456,7 +1475,7 @@ def on_action(state, action: Action):
                     astronomer=_has_joker(state, JokerName.ASTRONOMER),
                 )
                 state.money -= cost
-                _apply_consumable_state(state, card)
+                _apply_consumable_state(state, card, action=action)
                 ctx = TriggerContext(
                     event=TriggerEvent.USE_CONSUMABLE,
                     state=state,
@@ -1472,7 +1491,7 @@ def on_action(state, action: Action):
             ):
                 used_card = state.inventory.consumables.pop(action.target_idx)
             if used_card is not None:
-                _apply_consumable_state(state, used_card)
+                _apply_consumable_state(state, used_card, action=action)
                 ctx = TriggerContext(
                     event=TriggerEvent.USE_CONSUMABLE,
                     state=state,
@@ -1527,7 +1546,7 @@ def on_action(state, action: Action):
                     )
                     dispatch_jokers(ctx)
                 else:
-                    _apply_consumable_state(state, chosen_card)
+                    _apply_consumable_state(state, chosen_card, action=action)
                     ctx = TriggerContext(
                         event=TriggerEvent.USE_CONSUMABLE,
                         state=state,

@@ -1496,6 +1496,241 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         final_cons = [c.name for c in res["state"].inventory.consumables]
         self.assertEqual(final_cons, [bm.TarotName.DEATH])
 
+    def test_pack_hand_uses_pack_hand_roi_and_preserves_blind_card_hand(self):
+        blank_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        dummy_frames = {i: blank_frame for i in range(0, 600)}
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "Cash Out": 2,
+                "Open Pack": 3,
+                "Use In Pack": 4,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [10, 10, 50, 50]},
+                "150": {"action": 1, "box": [10, 10, 50, 50]},
+                "200": {"action": 2, "box": [10, 10, 50, 50]},
+                "250": {"action": 3, "box": [10, 10, 50, 50]},
+                "300": {"action": 4, "box": [960, 620, 1040, 670]},
+            },
+        }
+
+        hand_calls: list[tuple[list[int], str | None]] = []
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts)
+                if f_idx == 248:
+                    out.boosters = [_make_shop_item("p_arcana_normal_1", "Booster", [900, 600, 1100, 820])]
+                elif f_idx == 298:
+                    out.pack_items = [_make_shop_item("c_chariot", "Tarot", [920, 420, 1020, 620])]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            hand_calls.append(([f_idx for _, f_idx, _ in frames], kwargs.get("roi_key")))
+            return [
+                HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=[])
+                for _, f_idx, ts in frames
+            ]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            pp.build_run_trajectory(d, preloaded_frames=dummy_frames, fps=60.0)
+
+        self.assertIn(([150], None), hand_calls)
+        self.assertIn(([298], "pack_hand"), hand_calls)
+
+    def test_stacked_sell_above_use_collision_resolves_sell_click(self):
+        import logging
+
+        import main as app_main
+        from config import Config
+        from eval_template import EvaluationResult
+        from frame import VideoFrame
+        from template import Template
+
+        # Build synthetic image with unshadowed Sell (gry=46 in y=150..153) above bright Use top edge (y=154)
+        img_bgr = np.full((300, 300, 3), 46, dtype=np.uint8)
+        img_bgr[154:220, 80:160] = 220  # Bright Use Consumable button directly below Sell Card
+
+        sell_tpl = Template(
+            name="Sell Card",
+            filenames=[],
+            norm_rois=[],
+            px_rois=[],
+            images=[],
+            images_gray=[],
+            masks=[],
+            shadow_dy=0,
+            shadow_dw=0,
+            shadow_dh=0,
+            adjusted=False,
+        )
+        use_tpl = Template(
+            name="Use Consumable",
+            filenames=[],
+            norm_rois=[],
+            px_rois=[],
+            images=[],
+            images_gray=[],
+            masks=[],
+            shadow_dy=3,
+            shadow_dw=0,
+            shadow_dh=0,
+            adjusted=False,
+        )
+
+        def fake_eval(tpl, _frame, _gray, _cfg, **_kw):
+            if tpl.name == "Sell Card":
+                # Simulated full 10px check sees Use button border -> False
+                return EvaluationResult(
+                    template_name="Sell Card",
+                    found=True,
+                    match=None,
+                    clicked=False,
+                    box=(80, 68, 155, 150),
+                    plot_kwargs={},
+                )
+            return EvaluationResult(
+                template_name="Use Consumable",
+                found=True,
+                match=None,
+                clicked=False,
+                box=(82, 154, 155, 220),
+                plot_kwargs={},
+            )
+
+        cfg = Config()
+        logger = logging.getLogger("test_sell_use_collision")
+        vf = VideoFrame(image=img_bgr, index=100, timestamp_seconds=1.0)
+        with patch.object(app_main, "eval", side_effect=fake_eval):
+            _, _, _, clicked, clicked_name = app_main._process_frame(
+                vf,
+                [sell_tpl, use_tpl],
+                {"Sell Card": 0, "Use Consumable": 1},
+                cfg,
+                logger,
+            )
+        self.assertEqual(clicked_name, "Sell Card")
+        self.assertEqual(clicked, {"action": 0, "box": [80, 68, 155, 150]})
+
+    def test_remaining_deck_outside_blind_and_played_discard_dedup(self):
+        c1 = bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.CLUBS, id=1)
+        c2 = bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.CLUBS, id=2)
+        c3 = bm.PlayingCard(rank=bm.Rank.ACE, suit=bm.Suit.SPADES, id=3)
+        state = gs.GameState(
+            location=bm.Location.BLIND,
+            round_won=False,
+            full_deck=[c1, c2, c3],
+            played_cards_this_round=[c1],
+            discard_pile=[c1],
+        )
+        # c1 appears in both played_cards_this_round and discard_pile -> only 1 subtracted, c2 remains.
+        self.assertEqual([c.id for c in state.remaining_deck], [2, 3])
+        # Once round_won=True or inside PACK/SHOP, discard/played cards return to draw pool.
+        state.round_won = True
+        self.assertEqual([c.id for c in state.remaining_deck], [1, 2, 3])
+        state.round_won = False
+        state.location = bm.Location.PACK
+        self.assertEqual([c.id for c in state.remaining_deck], [1, 2, 3])
+        self.assertEqual([c.id for c in state.get_face_down_candidate_pool()], [1, 2, 3])
+
+    def test_amber_acorn_preserves_face_down_jokers_and_dense_joker_bar_dedup(self):
+        from classifiers.inference import _filter_kwargs_for_shelf
+        from classifiers.shop_classifier.pipeline import ShopItemResult, filter_shop_items
+
+        j1 = bm.Joker(name=bm.JokerName.VAMPIRE, id=1, facing_back=True)
+        j2 = bm.Joker(name=bm.JokerName.MIDAS_MASK, id=2, facing_back=True)
+        state = gs.GameState(
+            location=bm.Location.BLIND,
+            current_blind=bm.BlindName.AMBER_ACORN,
+            inventory=bm.Inventory(jokers=[j1, j2]),
+        )
+        bogus_out = ShopRecognitionOutput(
+            frame_index=10,
+            timestamp_seconds=1.0,
+            joker_bar=[
+                _make_shop_item("j_raised_fist", "Joker", [0, 40, 80, 260]),
+                _make_shop_item("j_blueprint", "Joker", [65, 40, 145, 260]),
+            ],
+        )
+        act = bm.Action(type=bm.ActionType.PLAY_HAND, frame_idx=10, timestamp=1.0)
+        pp._sync_bars_into_state(state, bogus_out, act)
+        self.assertEqual([j.name for j in state.inventory.jokers], [bm.JokerName.VAMPIRE, bm.JokerName.MIDAS_MASK])
+
+        # Dense 65px-spaced jokers stay separate while split-half (<38px) & sliver (<50w) drop.
+        items = [
+            ShopItemResult(0, "Joker", "j_vampire", "None", False, False, False, False, [0, 40, 80, 260], {"detection": 0.95, "key": 0.99}),
+            ShopItemResult(1, "Joker", "j_trio", "Negative", False, False, False, False, [65, 40, 145, 260], {"detection": 0.94, "key": 0.98}),
+            ShopItemResult(2, "Joker", "j_trio", "Negative", False, False, False, False, [75, 40, 130, 260], {"detection": 0.55, "key": 0.85}),
+            ShopItemResult(3, "Joker", "j_red_card", "None", False, False, False, False, [815, 1, 857, 250], {"detection": 0.50, "key": 0.55}),
+        ]
+        filtered = filter_shop_items(items, **_filter_kwargs_for_shelf("joker_bar", 0.30))
+        self.assertEqual([it.key for it in filtered], ["j_vampire", "j_trio"])
+
+    def test_destroyed_candidate_not_resurrected_and_immolate_witness(self):
+        from game.engine.rules import on_action
+
+        surv = bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.HEARTS, id=27)
+        victim = bm.PlayingCard(rank=bm.Rank.SEVEN, suit=bm.Suit.CLUBS, id=6)
+        other = bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.DIAMONDS, id=17)
+        fd_slot = bm.HandCard(
+            card=bm.PlayingCard(rank=bm.Rank.NONE, suit=bm.Suit.NONE, id=0),
+            facing_back=True,
+            slot_uid=1,
+            bounds=bm.CardBounds(is_face_down=True),
+        )
+        fd_slot.bounds.set_candidates([victim])
+        state = gs.GameState(
+            location=bm.Location.PACK,
+            full_deck=[surv, victim, other],
+            hand=bm.Hand(cards=[bm.HandCard(card=surv, slot_uid=2), fd_slot, bm.HandCard(card=other, slot_uid=3)]),
+        )
+        state.remove_card_from_deck(victim)
+        self.assertTrue(victim.destroyed)
+        self.assertEqual(fd_slot.bounds.candidate_cards, [])
+        # Observing destroyed card's rank/suit adds new instance rather than reusing destroyed id=6
+        pp._sync_hand_into_state(
+            state,
+            [
+                bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.HEARTS)),
+                bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.SEVEN, suit=bm.Suit.CLUBS)),
+                bm.HandCard(card=bm.PlayingCard(rank=bm.Rank.KING, suit=bm.Suit.DIAMONDS)),
+            ],
+        )
+        hand_ids = [hc.card.id for hc in state.hand.cards]
+        self.assertNotIn(6, hand_ids)
+        self.assertEqual(sorted(hand_ids), [17, 27, 28])
+
+        # With _surviving_hand_ids witnessing `surv` (2H) still present, Immolate spares 2H.
+        deck = [surv] + [
+            bm.PlayingCard(rank=r, suit=bm.Suit.SPADES, id=100 + i)
+            for i, r in enumerate([bm.Rank.THREE, bm.Rank.FOUR, bm.Rank.FIVE, bm.Rank.SIX, bm.Rank.SEVEN])
+        ]
+        imm_state = gs.GameState(
+            seed="XARBTZU7",
+            location=bm.Location.PACK,
+            pack_choices_remaining=2,
+            active_pack=bm.BoosterPack(booster_type=bm.BoosterType.SPECTRAL, size=bm.BoosterSize.MEGA, choose=2, extra=4, cost=8),
+            full_deck=list(deck),
+            hand=bm.Hand(cards=[bm.HandCard(card=c, slot_uid=i + 1) for i, c in enumerate(deck)]),
+            inventory=bm.Inventory(),
+        )
+        imm_state.pack_cards = [bm.Spectral(name=bm.SpectralName.IMMOLATE)]
+        imm_act = bm.Action(
+            type=bm.ActionType.USE_IN_PACK,
+            target_idx=0,
+            metadata={"target_card": "Immolate", "_surviving_hand_ids": [27]},
+        )
+        on_action(imm_state, imm_act)
+        self.assertIn(27, [c.id for c in imm_state.full_deck])
+        self.assertEqual(len(imm_state.full_deck), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -109,6 +109,54 @@ def _process_frame(
             video_timestamp_str=ts_str,
             img_gray_half=img_gray_half,
         )
+        # When "Sell Card" sits directly above "Use Consumable", its 10px shadow box
+        # collides with the top border of "Use"; re-evaluate only within the gap.
+        if (
+            result.found
+            and not result.clicked
+            and result.template_name == "Sell Card"
+            and result.box is not None
+        ):
+            use_tpl = next(
+                (t for t in active_templates if t.name == "Use Consumable"), None
+            )
+            if use_tpl is not None:
+                use_res = eval(
+                    use_tpl,
+                    video_frame.image,
+                    img_gray,
+                    config,
+                    video_timestamp_str=ts_str,
+                    img_gray_half=img_gray_half,
+                )
+                if use_res.found and use_res.box is not None:
+                    sx1, sy1, sx2, sy2 = (int(v) for v in result.box)
+                    ux1, uy1, ux2, _ = (int(v) for v in use_res.box)
+                    horiz_overlap = max(0, min(sx2, ux2) - max(sx1, ux1))
+                    min_w = max(1, min(sx2 - sx1, ux2 - ux1))
+                    if (
+                        horiz_overlap >= 0.5 * min_w
+                        and (sy2 - 2) <= uy1 <= (sy2 + config.shadow_region_height + 2)
+                    ):
+                        y0 = max(0, sy2 + int(getattr(template, "shadow_dy", 0)))
+                        y1 = min(img_gray.shape[0], uy1 - 1)
+                        if y1 - y0 < 2:
+                            sell_clicked = True
+                        else:
+                            from shadow_evaluator import analyze_shadow_presence
+
+                            clipped = img_gray[
+                                y0:y1, max(0, sx1) : min(img_gray.shape[1], sx2)
+                            ]
+                            sell_clicked = not analyze_shadow_presence(
+                                clipped, threshold=config.shadow_threshold
+                            )
+                        from dataclasses import is_dataclass, replace as _dc_replace
+
+                        if is_dataclass(result):
+                            result = _dc_replace(result, clicked=sell_clicked)
+                        else:
+                            result.clicked = sell_clicked
         if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
             matches.append((template, result.plot_kwargs))
         if result.found and result.clicked:
@@ -423,7 +471,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-post-processing", action="store_true", help="Run only Stage 1 template action detection")
     p.add_argument("--fps", type=float, default=None, help="Override source video FPS for post-processing")
     p.add_argument("--conf-hand", type=float, default=0.50, help="Hand card detector confidence threshold")
-    p.add_argument("--conf-shop", type=float, default=0.80, help="Shop/joker detector confidence threshold")
+    p.add_argument("--conf-shop", type=float, default=0.15, help="Shop/joker detector confidence threshold")
     p.add_argument("--conf-ocr", type=float, default=0.90, help="HUD OCR confidence threshold")
     p.add_argument("--batch-size", type=int, default=32, help="CV inference batch size")
     p.add_argument("--device", type=str, default=None, help="Torch device (e.g. cuda, cpu)")

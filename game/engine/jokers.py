@@ -53,10 +53,12 @@ try:
         EventResolver,
         evaluate_lucky_hit,
         get_ancient_joker_suit,
+        get_blocked_card_names,
         get_castle_suit,
         get_idol_card,
         get_mail_in_rebate_target,
         get_to_do_list_hand,
+        poll_tarot_pool,
         predict_cartomancer_tarot,
         predict_certificate,
         predict_eight_ball_tarot,
@@ -66,6 +68,7 @@ try:
         predict_sixth_sense_spectral,
         predict_superposition_tarot,
         predict_vagabond_tarot,
+        state_has_showman,
     )
     from game.engine.rng_sim.state import SimDeck
     from game.balatro_models import Spectral, SpectralName, Tarot
@@ -74,10 +77,12 @@ except ImportError:
         EventResolver,
         evaluate_lucky_hit,
         get_ancient_joker_suit,
+        get_blocked_card_names,
         get_castle_suit,
         get_idol_card,
         get_mail_in_rebate_target,
         get_to_do_list_hand,
+        poll_tarot_pool,
         predict_cartomancer_tarot,
         predict_certificate,
         predict_eight_ball_tarot,
@@ -87,6 +92,7 @@ except ImportError:
         predict_sixth_sense_spectral,
         predict_superposition_tarot,
         predict_vagabond_tarot,
+        state_has_showman,
     )
     from engine.rng_sim.state import SimDeck
     from balatro_models import Spectral, SpectralName, Tarot
@@ -1027,16 +1033,11 @@ def handle_cartomancer(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.SETTING_BLIND:
         if ctx.state.inventory and ctx.state.inventory.can_add_consumable:
             if ctx.state.rng:
-                active = {c.name for c in ctx.state.inventory.consumables if isinstance(c, Tarot)}
-                has_showman = any(
-                    j.name == JokerName.SHOWMAN and not j.debuffed
-                    for j in ctx.state.inventory.jokers
-                )
                 pred = predict_cartomancer_tarot(
                     ctx.state.rng,
                     ante=ctx.state.ante,
-                    active_tarots=active,
-                    has_showman=has_showman,
+                    active_tarots=get_blocked_card_names(ctx.state, CardType.TAROT),
+                    has_showman=state_has_showman(ctx.state),
                 )
                 ctx.state.inventory.consumables.append(pred.to_tarot_card())
             else:
@@ -1062,7 +1063,11 @@ def handle_riff_raff(joker: Joker, ctx: TriggerContext):
                 spawn_count = min(2, space)
                 if spawn_count > 0:
                     spawned = predict_riff_raff_jokers(
-                        ctx.state.rng, ante=ctx.state.ante, count=spawn_count
+                        ctx.state.rng,
+                        ante=ctx.state.ante,
+                        count=spawn_count,
+                        owned_jokers=get_blocked_card_names(ctx.state, CardType.JOKER),
+                        has_showman=state_has_showman(ctx.state),
                     )
                     for sj in spawned:
                         ctx.state.inventory.jokers.append(sj)
@@ -1265,7 +1270,12 @@ def handle_sixth_sense(joker: Joker, ctx: TriggerContext):
                 ctx.state.remove_card_from_deck(c)
                 if ctx.state.inventory and ctx.state.inventory.can_add_consumable:
                     if ctx.state.rng:
-                        sp = predict_sixth_sense_spectral(ctx.state.rng, ante=ctx.state.ante)
+                        sp = predict_sixth_sense_spectral(
+                            ctx.state.rng,
+                            ante=ctx.state.ante,
+                            active_spectrals=get_blocked_card_names(ctx.state, CardType.SPECTRAL),
+                            has_showman=state_has_showman(ctx.state),
+                        )
                         ctx.state.inventory.consumables.append(sp)
                     else:
                         ctx.state.inventory.consumables.append(Spectral(name=SpectralName.ANKH))
@@ -1280,7 +1290,12 @@ def handle_seance(joker: Joker, ctx: TriggerContext):
         )
         if hand == PokerHand.STRAIGHT_FLUSH and ctx.state.inventory.can_add_consumable:
             if ctx.state.rng:
-                sp = predict_seance_spectral(ctx.state.rng, ante=ctx.state.ante)
+                sp = predict_seance_spectral(
+                    ctx.state.rng,
+                    ante=ctx.state.ante,
+                    active_spectrals=get_blocked_card_names(ctx.state, CardType.SPECTRAL),
+                    has_showman=state_has_showman(ctx.state),
+                )
                 ctx.state.inventory.consumables.append(sp)
             else:
                 ctx.state.pending_cv_checks.add("consumables")
@@ -1298,7 +1313,12 @@ def handle_superposition(joker: Joker, ctx: TriggerContext):
         if hand in (PokerHand.STRAIGHT, PokerHand.STRAIGHT_FLUSH) and has_ace:
             if ctx.state.inventory.can_add_consumable:
                 if ctx.state.rng:
-                    pred = predict_superposition_tarot(ctx.state.rng, ante=ctx.state.ante)
+                    pred = predict_superposition_tarot(
+                        ctx.state.rng,
+                        ante=ctx.state.ante,
+                        active_tarots=get_blocked_card_names(ctx.state, CardType.TAROT),
+                        has_showman=state_has_showman(ctx.state),
+                    )
                     ctx.state.inventory.consumables.append(pred.to_tarot_card())
                 else:
                     ctx.state.pending_cv_checks.add("consumables")
@@ -1309,7 +1329,12 @@ def handle_vagabond(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.BEFORE_PLAY:
         if ctx.state.money <= 4 and ctx.state.inventory.can_add_consumable:
             if ctx.state.rng:
-                pred = predict_vagabond_tarot(ctx.state.rng, ante=ctx.state.ante)
+                pred = predict_vagabond_tarot(
+                    ctx.state.rng,
+                    ante=ctx.state.ante,
+                    active_tarots=get_blocked_card_names(ctx.state, CardType.TAROT),
+                    has_showman=state_has_showman(ctx.state),
+                )
                 ctx.state.inventory.consumables.append(pred.to_tarot_card())
             else:
                 ctx.state.pending_cv_checks.add("consumables")
@@ -1322,9 +1347,12 @@ def handle_hallucination(joker: Joker, ctx: TriggerContext):
             if ctx.state.rng and ctx.state.resolver:
                 oops = get_oops_multiplier(ctx.state)
                 if ctx.state.resolver.hallucination(oops_multiplier=oops, ante=ctx.state.ante):
-                    from game.engine.rng_sim.events import poll_tarot_pool
                     pred = poll_tarot_pool(
-                        ctx.state.rng, ante=ctx.state.ante, key_append=f"halu{ctx.state.ante}"
+                        ctx.state.rng,
+                        ante=ctx.state.ante,
+                        key_append=f"halu{ctx.state.ante}",
+                        active_tarots=get_blocked_card_names(ctx.state, CardType.TAROT),
+                        has_showman=state_has_showman(ctx.state),
                     )
                     ctx.state.inventory.consumables.append(pred.to_tarot_card())
             else:
@@ -1344,7 +1372,12 @@ def handle_eight_ball(joker: Joker, ctx: TriggerContext):
             if ctx.state.rng:
                 oops = get_oops_multiplier(ctx.state)
                 if ctx.state.rng.poll_odds("8ball", 1, 4, oops):
-                    pred = predict_eight_ball_tarot(ctx.state.rng, ante=ctx.state.ante)
+                    pred = predict_eight_ball_tarot(
+                        ctx.state.rng,
+                        ante=ctx.state.ante,
+                        active_tarots=get_blocked_card_names(ctx.state, CardType.TAROT),
+                        has_showman=state_has_showman(ctx.state),
+                    )
                     ctx.state.inventory.consumables.append(pred.to_tarot_card())
             else:
                 ctx.state.pending_cv_checks.add("consumables")

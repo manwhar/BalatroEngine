@@ -719,20 +719,25 @@ class HandCard:
                 self.card.id = 0
 
     def resolve_face_down(
-        self, resolved_card: PlayingCard, lift_facing_back: bool = False
+        self,
+        resolved_card: PlayingCard,
+        lift_facing_back: bool = False,
+        preserve_id: bool = False,
     ) -> None:
         """Resolves a face-down card to an exact PlayingCard, lifting hidden-state masks."""
         if lift_facing_back:
             self.facing_back = False
             if self.bounds:
                 self.bounds.is_face_down = False
+        preserved_id = self.card.id if preserve_id else resolved_card.id
         self._real_card = copy.deepcopy(resolved_card)
+        self._real_card.id = preserved_id
         self.card.rank = resolved_card.rank
         self.card.suit = resolved_card.suit
         self.card.enhancement = resolved_card.enhancement
         self.card.edition = resolved_card.edition
         self.card.seal = resolved_card.seal
-        self.card.id = resolved_card.id
+        self.card.id = preserved_id
         self.card.bonus_chips = resolved_card.bonus_chips
         if self.bounds is None:
             self.bounds = CardBounds(is_face_down=self.facing_back)

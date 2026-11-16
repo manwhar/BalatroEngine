@@ -71,34 +71,121 @@ class CardResult:
         return " ".join(parts)
 
 
+def _fit_clamped_arch(
+    design_x: np.ndarray,
+    u: np.ndarray,
+    y_target: np.ndarray,
+    scale: float,
+) -> tuple[float, float, float]:
+    """Fits a gently curved, mostly symmetric upward-convex arch `c0 + c1*u + c2*u^2`."""
+    coef, _, _, _ = np.linalg.lstsq(design_x, y_target, rcond=None)
+    c0, c1, c2 = float(coef[0]), float(coef[1]), float(coef[2])
+    c2 = max(0.0, min(48.0 * scale, c2))
+    c1 = max(-15.0 * scale, min(15.0 * scale, c1))
+    c0 = float(np.median(y_target - c1 * u - c2 * (u ** 2)))
+    return c0, c1, c2
+
+
 def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bool]:
     """
-    Geometrically determines which cards are selected (raised upward) based on
-    bounding box vertical positions.
-    
-    In Balatro, unselected cards sit at y_center ~0.58 (or y1 ~67px in a 322px frame),
-    while selected cards are elevated upward by ~46px (y_center ~0.38, y1 ~21px).
+    Geometrically determines which cards are selected (raised upward) along Balatro's
+    arched hand curve.
+
+    Selected cards shift upward by ~38-56px (at 322px crop height) relative to their
+    resting position on the curved hand arch, whereas outer unselected cards naturally
+    droop ~20-40px below center unselected cards.
     """
-    if not boxes:
+    n = len(boxes)
+    if n == 0:
         return []
 
-    y1s = [b[1] for b in boxes]
-    y_min, y_max = min(y1s), max(y1s)
-
-    # Scale reference threshold by image height (322px standard hand crop)
     scale = (img_height / 322.0) if img_height > 0 else 1.0
-    spread_threshold = 28.0 * scale
-    abs_threshold = 45.0 * scale
+    ys = np.array([b[1] for b in boxes], dtype=np.float64)
+    cxs = np.array([(b[0] + b[2]) / 2.0 for b in boxes], dtype=np.float64)
 
-    if (y_max - y_min) > spread_threshold:
-        # A mix of selected and unselected cards is present in the hand.
-        # Natural arc variance across unselected hand is <= 22px; selected cards are raised >= 36px.
-        midpoint = (y_min + y_max) / 2.0
-        return [y < midpoint for y in y1s]
-    else:
-        # All cards are at approximately the same elevation level.
-        # Fallback to absolute elevation threshold.
-        return [y < abs_threshold for y in y1s]
+    if n == 1:
+        return [bool(ys[0] < 43.0 * scale)]
+    if n == 2:
+        if float(ys.max() - ys.min()) > 28.0 * scale:
+            midpoint = float(ys.min() + ys.max()) / 2.0
+            return [bool(y < midpoint) for y in ys]
+        return [bool(y < 43.0 * scale) for y in ys]
+
+    cx_min, cx_max = float(cxs.min()), float(cxs.max())
+    span = max(1.0, (cx_max - cx_min) / 2.0)
+    u = (cxs - (cx_max + cx_min) / 2.0) / span
+    design_x = np.column_stack([np.ones(n), u, u ** 2])
+    candidate_deltas = (
+        34.0 * scale,
+        40.0 * scale,
+        46.0 * scale,
+        52.0 * scale,
+        58.0 * scale,
+    )
+
+    def _eval_mask(mask: list[bool]) -> tuple[float, tuple[float, float, float, float]]:
+        sel = np.asarray(mask, dtype=np.float64)
+        num_sel = int(sel.sum())
+        if num_sel == 0 or num_sel == n:
+            c0, c1, c2 = _fit_clamped_arch(design_x, u, ys, scale)
+            if num_sel == 0 and c0 < 40.0 * scale:
+                return float("inf"), (c0, c1, c2, 0.0)
+            if num_sel == n and c0 >= 40.0 * scale:
+                return float("inf"), (c0, c1, c2, 0.0)
+            pred = c0 + c1 * u + c2 * (u ** 2)
+            mse = float(np.mean((ys - pred) ** 2))
+            if num_sel == 0 and float(np.max(np.abs(ys - pred))) > 22.0 * scale:
+                mse += 100.0 * (scale ** 2)
+            penalty = 0.0 if num_sel == 0 else 4.0 * (scale ** 2)
+            return mse + penalty, (c0, c1, c2, 0.0)
+
+        best_mse = float("inf")
+        best_params = (0.0, 0.0, 0.0, 46.0 * scale)
+        for delta in candidate_deltas:
+            y_adj = ys + delta * sel
+            c0, c1, c2 = _fit_clamped_arch(design_x, u, y_adj, scale)
+            # An unselected arch baseline in hand/pack crops never sits above 43px*scale.
+            c0 = max(43.0 * scale, c0)
+            pred = c0 + c1 * u + c2 * (u ** 2) - delta * sel
+            mse = float(np.mean((ys - pred) ** 2))
+            if mse < best_mse:
+                best_mse = mse
+                best_params = (c0, c1, c2, delta)
+        return best_mse + 1.5 * (scale ** 2), best_params
+
+    uniq_ys = sorted(set(ys.tolist()))
+    candidates: list[list[bool]] = [[False] * n, [True] * n]
+    for idx in range(len(uniq_ys) - 1):
+        thresh = (uniq_ys[idx] + uniq_ys[idx + 1]) / 2.0
+        candidates.append([bool(y < thresh) for y in ys])
+
+    best_score = float("inf")
+    best_mask = [False] * n
+    best_params = (0.0, 0.0, 0.0, 0.0)
+    for cand in candidates:
+        score, params = _eval_mask(cand)
+        if score < best_score:
+            best_score, best_mask, best_params = score, cand, params
+
+    # Coordinate refinement flips mixed center+edge selections missed by pure 1D splits.
+    for _ in range(3):
+        c0, c1, c2, delta = best_params
+        if delta <= 0.0:
+            break
+        arch = c0 + c1 * u + c2 * (u ** 2)
+        refined = [bool((arch[i] - ys[i]) > delta * 0.5) for i in range(n)]
+        score, params = _eval_mask(refined)
+        if score < best_score:
+            best_score, best_mask, best_params = score, refined, params
+        else:
+            break
+
+    return best_mask
+
+
+def is_valid_hand_card_box(box: list[int] | tuple[int, int, int, int]) -> bool:
+    """Rejects sub-card edge slivers (e.g. adjacent pack tops bleeding into pack_hand ROI)."""
+    return (box[2] - box[0]) >= 35 and (box[3] - box[1]) >= 100
 
 
 def decode_card_prediction(
@@ -245,11 +332,22 @@ class CardRecognitionPipeline:
             y1 = max(0, min(ih - 1, int(b[1])))
             x2 = max(x1 + 1, min(iw, int(b[2])))
             y2 = max(y1 + 1, min(ih, int(b[3])))
+            if not is_valid_hand_card_box([x1, y1, x2, y2]):
+                continue
 
             crop = pil_img.crop((x1, y1, x2, y2))
             crop_tensor = self.crop_transform(crop)
             crop_tensors.append(crop_tensor)
             valid_boxes.append([x1, y1, x2, y2])
+
+        if not crop_tensors:
+            timings = {
+                "stage1_detector_ms": stage1_ms,
+                "stage2_classifier_ms": 0.0,
+                "postprocess_ms": 0.0,
+                "total_inference_ms": stage1_ms,
+            }
+            return ([], timings) if return_timing else []
 
         batched_crops = torch.stack(crop_tensors, dim=0).to(self.device)
 

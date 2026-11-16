@@ -99,6 +99,7 @@ def filter_shop_items(
     key_threshold: float = 0.0,
     dedup_dx: float = 85.0,
     dedup_dy: float = 35.0,
+    max_x_overlap_ratio: float = 1.0,
 ) -> list[ShopItemResult]:
     """Filters sliver detections, low-confidence keys, and split-half card duplicates."""
     candidates = [
@@ -127,9 +128,20 @@ def filter_shop_items(
                 continue
             pcx = 0.5 * (prev.box[0] + prev.box[2])
             pcy = 0.5 * (prev.box[1] + prev.box[3])
-            if abs(cx - pcx) < dedup_dx and abs(cy - pcy) < dedup_dy:
-                is_dup = True
-                break
+            if abs(cy - pcy) < dedup_dy:
+                if abs(cx - pcx) < dedup_dx:
+                    is_dup = True
+                    break
+                if max_x_overlap_ratio < 1.0:
+                    x_ov = max(
+                        0, min(it.box[2], prev.box[2]) - max(it.box[0], prev.box[0])
+                    )
+                    min_w = max(
+                        1, min(it.box[2] - it.box[0], prev.box[2] - prev.box[0])
+                    )
+                    if (x_ov / min_w) >= max_x_overlap_ratio:
+                        is_dup = True
+                        break
         if not is_dup:
             kept.append(it)
 
@@ -232,7 +244,10 @@ class ShopRecognitionPipeline:
         image_input,
         conf_threshold: float = 0.15,
         iou_threshold: float = 0.45,
-        key_threshold: float = 0.70,
+        key_threshold: float = 0.30,
+        dedup_dx: float = 85.0,
+        min_width: int = 45,
+        max_x_overlap_ratio: float = 1.0,
     ) -> list[ShopItemResult]:
         """
         Runs full two-stage inference on an ROI crop or screenshot.
@@ -406,4 +421,10 @@ class ShopRecognitionPipeline:
                     )
                 )
 
-        return filter_shop_items(results, key_threshold=key_threshold)
+        return filter_shop_items(
+            results,
+            min_width=min_width,
+            key_threshold=key_threshold,
+            dedup_dx=dedup_dx,
+            max_x_overlap_ratio=max_x_overlap_ratio,
+        )

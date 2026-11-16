@@ -750,18 +750,39 @@ def _run_batched_cv(
 
     hand_res_by_frame: dict[int, Any] = {}
     if filtered_hand_ids:
-        if pbar is not None:
-            pbar.set_postfix_str("hand")
-        hand_outs = batch_recognize_hands(
-            _pack_frame_inputs(filtered_hand_ids),
-            conf_threshold=conf_threshold_hand,
-            batch_size=batch_size,
-            device=device,
-        )
-        for out in hand_outs:
-            hand_res_by_frame[out.frame_index] = out
-        if pbar is not None:
-            pbar.update(len(filtered_hand_ids))
+        blind_hand_ids = [
+            fid for fid in filtered_hand_ids if fid not in queues["pack_cv_queue"]
+        ]
+        pack_hand_ids = [
+            fid for fid in filtered_hand_ids if fid in queues["pack_cv_queue"]
+        ]
+        if blind_hand_ids:
+            if pbar is not None:
+                pbar.set_postfix_str("hand")
+            hand_outs = batch_recognize_hands(
+                _pack_frame_inputs(blind_hand_ids),
+                conf_threshold=conf_threshold_hand,
+                batch_size=batch_size,
+                device=device,
+            )
+            for out in hand_outs:
+                hand_res_by_frame[out.frame_index] = out
+            if pbar is not None:
+                pbar.update(len(blind_hand_ids))
+        if pack_hand_ids:
+            if pbar is not None:
+                pbar.set_postfix_str("pack_hand")
+            pack_hand_outs = batch_recognize_hands(
+                _pack_frame_inputs(pack_hand_ids),
+                conf_threshold=min(conf_threshold_hand, 0.30),
+                batch_size=batch_size,
+                device=device,
+                roi_key="pack_hand",
+            )
+            for out in pack_hand_outs:
+                hand_res_by_frame[out.frame_index] = out
+            if pbar is not None:
+                pbar.update(len(pack_hand_ids))
 
     hud_res_by_frame: dict[int, Any] = {}
     if hud_ids:
@@ -1242,20 +1263,21 @@ def _sync_bars_into_state(
         prev_joker_ids = [j.id for j in prev_jokers]
 
         if state.inventory and state.inventory.jokers:
-            matched_ids = state.match_cv_joker_order(obs_jokers)
-            if matched_ids:
-                if matched_ids != prev_joker_ids:
-                    action.joker_order = matched_ids
-            elif (
-                not obs_jokers
-                and state.current_blind == BlindName.AMBER_ACORN
+            if (
+                state.current_blind == BlindName.AMBER_ACORN
+                and not state.boss_disabled
                 and any(j.facing_back for j in state.inventory.jokers)
             ):
                 # Amber Acorn flips owned jokers face-down, hiding their faces from CV;
-                # state.inventory.jokers is already in order so omit redundant identity joker_order.
+                # Stage 2 forces red card backs into bogus classes so preserve tracked jokers.
                 pass
             else:
-                state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
+                matched_ids = state.match_cv_joker_order(obs_jokers)
+                if matched_ids:
+                    if matched_ids != prev_joker_ids:
+                        action.joker_order = matched_ids
+                else:
+                    state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
         elif obs_jokers:
             state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
 
@@ -1369,6 +1391,66 @@ _HAND_SELECTION_ACTIONS: frozenset[ActionType] = frozenset(
 )
 
 
+_RANDOM_DESTROY_SPECTRALS = frozenset({"Immolate", "Familiar", "Grim", "Incantation"})
+
+
+def _collect_pack_surviving_hand_ids(
+    state: GameState,
+    scheduled_actions: Sequence[ScheduledAction],
+    sa_idx: int,
+    hand_res_by_frame: dict[int, Any],
+) -> list[int]:
+    """Identifies card IDs in current hand that still appear in the immediate next pack observation."""
+    if not state.hand.cards or sa_idx + 1 >= len(scheduled_actions):
+        return []
+    next_sa = scheduled_actions[sa_idx + 1]
+    cur_sa = scheduled_actions[sa_idx]
+    still_in_same_pack = (
+        state.location == Location.PACK
+        and next_sa.ambient_location == Location.PACK
+        and (
+            cur_sa.action_type == ActionType.USE_CONSUMABLE
+            or state.pack_choices_remaining > 1
+        )
+    )
+    if not still_in_same_pack:
+        return []
+    next_hand = hand_res_by_frame.get(next_sa.target_frame)
+    if next_hand is None or not getattr(next_hand, "cards", None):
+        return []
+    obs_cards = [_convert_card_result_to_hand_card(c) for c in next_hand.cards]
+    matched_ids: list[int] = []
+    used_indices: set[int] = set()
+    for obs in obs_cards:
+        if obs.facing_back:
+            continue
+        hit_idx = next(
+            (
+                j
+                for j, hc in enumerate(state.hand.cards)
+                if j not in used_indices and _cards_match(hc.card, obs.card)
+            ),
+            None,
+        )
+        if hit_idx is None:
+            hit_idx = next(
+                (
+                    j
+                    for j, hc in enumerate(state.hand.cards)
+                    if j not in used_indices
+                    and hc.card.rank == obs.card.rank
+                    and hc.card.suit == obs.card.suit
+                ),
+                None,
+            )
+        if hit_idx is not None:
+            used_indices.add(hit_idx)
+            cid = state.hand.cards[hit_idx].card.id
+            if cid:
+                matched_ids.append(cid)
+    return matched_ids
+
+
 def _sync_hand_into_state(
     state: GameState,
     obs_hand: Sequence[HandCard],
@@ -1411,6 +1493,13 @@ def _sync_hand_into_state(
                 break
 
     # 3. Match face-up observations against previously face-down slots (e.g., after resolve/reveal)
+    live_deck_ids = {dc.id for dc in state.full_deck if dc.id != 0}
+
+    def _is_live_candidate(c: PlayingCard) -> bool:
+        return not getattr(c, "destroyed", False) and (
+            c.id == 0 or c.id in live_deck_ids
+        )
+
     for i, obs in enumerate(obs_hand):
         if matched_slots[i] is not None or obs.facing_back:
             continue
@@ -1418,16 +1507,23 @@ def _sync_hand_into_state(
             if j in used_existing:
                 continue
             cand = ex._real_card or ex.card
-            if cand.rank != Rank.NONE and _cards_match(cand, obs.card):
+            if (
+                cand.rank != Rank.NONE
+                and _is_live_candidate(cand)
+                and _cards_match(cand, obs.card)
+            ):
                 ex.resolve_face_down(copy.deepcopy(obs.card), lift_facing_back=True)
                 matched_slots[i] = ex
                 used_existing.add(j)
                 break
             if ex.bounds and any(
-                _cards_match(c, obs.card) for c in ex.bounds.candidate_cards
+                _is_live_candidate(c) and _cards_match(c, obs.card)
+                for c in ex.bounds.candidate_cards
             ):
                 match_cand = next(
-                    c for c in ex.bounds.candidate_cards if _cards_match(c, obs.card)
+                    c
+                    for c in ex.bounds.candidate_cards
+                    if _is_live_candidate(c) and _cards_match(c, obs.card)
                 )
                 ex.resolve_face_down(match_cand, lift_facing_back=True)
                 matched_slots[i] = ex
@@ -2061,11 +2157,22 @@ def _build_run_trajectory_with_plan(
                 diag=diag,
             )
 
+        if (
+            sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK)
+            and action.metadata.get("target_card") in _RANDOM_DESTROY_SPECTRALS
+        ):
+            survivors = _collect_pack_surviving_hand_ids(
+                state, scheduled_actions, sa_idx, hand_res_by_frame
+            )
+            if survivors:
+                action.metadata["_surviving_hand_ids"] = survivors
+
         # Advance simulation
         state.frame_idx = action.frame_idx
         state.timestamp = action.timestamp
         prev_loc = state.location
         on_action(state, action)
+        action.metadata.pop("_surviving_hand_ids", None)
         if sa.action_type == A.END_ROUND and shop_out is not None:
             _, raw_cons = _sync_bars_into_state(
                 state,

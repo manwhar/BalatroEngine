@@ -102,9 +102,18 @@ def create_standard_deck() -> list[PlayingCard]:
 
 # Base blind score thresholds for Antes 1..8 by Stake scaling tier (misc_functions.lua:919-954)
 ANTE_CHIPS_TABLE: dict[int, tuple[int, ...]] = {
-    1: (300, 800, 2000, 5000, 11000, 20000, 35000, 50000),      # White, Red Stakes
-    2: (300, 900, 2600, 8000, 20000, 36000, 60000, 100000),    # Green, Black, Blue Stakes
-    3: (300, 1000, 3200, 9000, 25000, 60000, 110000, 200000),  # Purple, Orange, Gold Stakes
+    1: (300, 800, 2000, 5000, 11000, 20000, 35000, 50000),  # White, Red Stakes
+    2: (300, 900, 2600, 8000, 20000, 36000, 60000, 100000),  # Green, Black, Blue Stakes
+    3: (
+        300,
+        1000,
+        3200,
+        9000,
+        25000,
+        60000,
+        110000,
+        200000,
+    ),  # Purple, Orange, Gold Stakes
 }
 
 STAKE_SCALING_TIER: dict[Stake, int] = {
@@ -285,6 +294,7 @@ class GameState:
     - Exact chip/mult score calculation is intentionally omitted (`current_chips` / round
       scores are captured externally via OCR).
     """
+
     step_idx: int = 0
     frame_idx: int = 0
     timestamp: float = 0.0
@@ -464,9 +474,7 @@ class GameState:
             case Deck.GHOST_DECK:
                 self.spectral_rate = 2.0
                 if self.apply_deck_stake_on_init and not self.inventory.consumables:
-                    self.inventory.consumables.append(
-                        Spectral(name=SpectralName.HEX)
-                    )
+                    self.inventory.consumables.append(Spectral(name=SpectralName.HEX))
             case Deck.ZODIAC_DECK:
                 if self.apply_deck_stake_on_init:
                     self.apply_voucher(
@@ -481,9 +489,7 @@ class GameState:
             case Deck.PAINTED_DECK:
                 if self.apply_deck_stake_on_init:
                     self.hand.max_size += 2
-                    self.inventory.joker_slots = max(
-                        0, self.inventory.joker_slots - 1
-                    )
+                    self.inventory.joker_slots = max(0, self.inventory.joker_slots - 1)
             case Deck.PLASMA_DECK:
                 self.ante_scaling = 2.0
             case _:
@@ -725,7 +731,9 @@ class GameState:
             return False
         return card.is_face
 
-    def _card_matches_suit_for_blind(self, card: PlayingCard, target_suit: Suit) -> bool:
+    def _card_matches_suit_for_blind(
+        self, card: PlayingCard, target_suit: Suit
+    ) -> bool:
         """Checks suit match ignoring debuff state (matching Balatro `card:is_suit(suit, true)`)."""
         if card.enhancement == Enhancement.STONE or card.rank == Rank.NONE:
             return False
@@ -936,19 +944,23 @@ class GameState:
     def remove_card_from_deck(self, card: PlayingCard, shattered: bool = False) -> bool:
         """Removes a single matching card from full deck, discard pile, and hand when destroyed."""
         removed = False
+        popped_card: PlayingCard | None = None
         for i, c in enumerate(self.full_deck):
             if _cards_match(c, card):
-                self.full_deck.pop(i)
+                popped_card = self.full_deck.pop(i)
+                popped_card.destroyed = True
                 removed = True
                 break
         if not removed:
             for i, c in enumerate(self.full_deck):
                 if c.rank == card.rank and c.suit == card.suit:
-                    self.full_deck.pop(i)
+                    popped_card = self.full_deck.pop(i)
+                    popped_card.destroyed = True
                     removed = True
                     break
         if not removed and self.full_deck:
-            self.full_deck.pop()
+            popped_card = self.full_deck.pop()
+            popped_card.destroyed = True
             removed = True
         for i, c in enumerate(self.discard_pile):
             if _cards_match(c, card):
@@ -959,6 +971,19 @@ class GameState:
                 self.hand.cards.pop(i)
                 break
         card.destroyed = True
+        destroyed_id = (
+            popped_card.id if popped_card and popped_card.id else card.id
+        ) or 0
+        for hc in self.hand.cards:
+            if hc.bounds:
+                hc.bounds.candidate_cards = [
+                    cc
+                    for cc in hc.bounds.candidate_cards
+                    if not getattr(cc, "destroyed", False)
+                    and (destroyed_id == 0 or cc.id != destroyed_id)
+                ]
+                if destroyed_id:
+                    hc.bounds.candidate_card_ids.discard(destroyed_id)
         if removed:
             self.deck_cards_count = len(self.full_deck)
         else:
@@ -989,8 +1014,18 @@ class GameState:
 
     @property
     def remaining_deck(self) -> list[PlayingCard]:
-        """Cards remaining in draw pile: full_deck minus hand, discard_pile, and played_cards_this_round."""
-        drawn_or_used = [hc.card for hc in self.hand.cards] + self.discard_pile + self.played_cards_this_round
+        """Cards remaining in draw pile: full_deck minus hand, and minus discard/played during an active blind."""
+        drawn_or_used = [hc.card for hc in self.hand.cards]
+        if self.location == Location.BLIND and not self.round_won:
+            # Played non-destroyed cards also sit in discard_pile; deduplicate so they are only subtracted once.
+            discard_ids = {c.id for c in self.discard_pile if c.id}
+            discard_ptrs = {id(c) for c in self.discard_pile}
+            extra_played = [
+                c
+                for c in self.played_cards_this_round
+                if id(c) not in discard_ptrs and (not c.id or c.id not in discard_ids)
+            ]
+            drawn_or_used = drawn_or_used + self.discard_pile + extra_played
         remaining = list(self.full_deck)
         for card in drawn_or_used:
             for i, rem_card in enumerate(remaining):
@@ -1032,7 +1067,9 @@ class GameState:
                 self.assign_joker_id(j, force_new=True)
                 seen.add(j.id)
 
-    def _match_observed_jokers(self, observed_jokers: Sequence[Joker]) -> list[Joker | None]:
+    def _match_observed_jokers(
+        self, observed_jokers: Sequence[Joker]
+    ) -> list[Joker | None]:
         """Matches visually observed CV Jokers against tracked inventory Jokers.
 
         Prioritizes exact attribute matches before edition/name fallbacks, and resolves
@@ -1119,7 +1156,9 @@ class GameState:
                     candidates = self.get_face_down_candidate_pool(hc)
                     hc.bounds.set_candidates(candidates)
 
-    def get_face_down_candidate_pool(self, target_hc: HandCard | None = None) -> list[PlayingCard]:
+    def get_face_down_candidate_pool(
+        self, target_hc: HandCard | None = None
+    ) -> list[PlayingCard]:
         """Gathers available candidate PlayingCard objects that could occupy a face-down slot."""
         resolved_in_hand_ids = {
             c.card.id
@@ -1128,11 +1167,10 @@ class GameState:
             and (not c.facing_back or (c.bounds and c.bounds.is_resolved))
             and c.card.id != 0
         }
-        unavailable_ids = (
-            {c.id for c in self.discard_pile if c.id}
-            | {c.id for c in self.played_cards_this_round if c.id}
-            | resolved_in_hand_ids
-        )
+        unavailable_ids = set(resolved_in_hand_ids)
+        if self.location == Location.BLIND and not self.round_won:
+            unavailable_ids |= {c.id for c in self.discard_pile if c.id}
+            unavailable_ids |= {c.id for c in self.played_cards_this_round if c.id}
 
         base_pool = list(self.remaining_deck)
         if not base_pool and self.full_deck:
@@ -1144,12 +1182,16 @@ class GameState:
                 pool.append(c)
 
         if target_hc is not None:
-            if target_hc._real_card and not any(_cards_match(c, target_hc._real_card) for c in pool):
+            if target_hc._real_card and not any(
+                _cards_match(c, target_hc._real_card) for c in pool
+            ):
                 if target_hc._real_card.id not in unavailable_ids:
                     pool.append(target_hc._real_card)
             elif target_hc.bounds and target_hc.bounds.candidate_cards:
                 for c in target_hc.bounds.candidate_cards:
-                    if c.id not in unavailable_ids and not any(_cards_match(p, c) for p in pool):
+                    if c.id not in unavailable_ids and not any(
+                        _cards_match(p, c) for p in pool
+                    ):
                         pool.append(c)
 
         return pool
@@ -1165,7 +1207,11 @@ class GameState:
 
         # 1. Deterministic sort if simulation or cards have true values
         can_simulate_sort = all(
-            (c._real_card is not None or c.card.rank != Rank.NONE or c.card.enhancement == Enhancement.STONE)
+            (
+                c._real_card is not None
+                or c.card.rank != Rank.NONE
+                or c.card.enhancement == Enhancement.STONE
+            )
             for c in self.hand.cards
         )
         if can_simulate_sort:
@@ -1179,7 +1225,9 @@ class GameState:
         while changed:
             changed = False
             for i, hc in enumerate(self.hand.cards):
-                if (hc.bounds and hc.bounds.is_resolved) or (not hc.facing_back and hc.bounds is None):
+                if (hc.bounds and hc.bounds.is_resolved) or (
+                    not hc.facing_back and hc.bounds is None
+                ):
                     continue
 
                 if hc.bounds is None:
@@ -1206,7 +1254,10 @@ class GameState:
                 valid_candidates: list[PlayingCard] = []
                 for cand in pool:
                     cand_nom = nominal_fn(cand)
-                    if cand_nom > upper_nominal + 1e-5 or cand_nom < lower_nominal - 1e-5:
+                    if (
+                        cand_nom > upper_nominal + 1e-5
+                        or cand_nom < lower_nominal - 1e-5
+                    ):
                         continue
                     if cand.rank not in hc.bounds.possible_ranks:
                         continue
@@ -1282,10 +1333,18 @@ class GameState:
             for idx in segment:
                 hc = cards[idx]
                 seal_vis = hc.card.seal
-                if seal_vis == Seal.NONE and hc._real_card and hc._real_card.seal != Seal.NONE:
+                if (
+                    seal_vis == Seal.NONE
+                    and hc._real_card
+                    and hc._real_card.seal != Seal.NONE
+                ):
                     seal_vis = hc._real_card.seal
                 ed_vis = hc.card.edition
-                if ed_vis == Edition.NONE and hc._real_card and hc._real_card.edition != Edition.NONE:
+                if (
+                    ed_vis == Edition.NONE
+                    and hc._real_card
+                    and hc._real_card.edition != Edition.NONE
+                ):
                     ed_vis = hc._real_card.edition
 
                 vis_sig = (hc.selected, seal_vis, ed_vis)
@@ -1332,7 +1391,9 @@ class GameState:
         while changed:
             changed = False
             for hc in self.hand.cards:
-                if (hc.bounds and hc.bounds.is_resolved) or (not hc.facing_back and hc.bounds is None):
+                if (hc.bounds and hc.bounds.is_resolved) or (
+                    not hc.facing_back and hc.bounds is None
+                ):
                     continue
                 if hc.bounds is None:
                     hc.bounds = CardBounds(is_face_down=True)
@@ -1350,7 +1411,9 @@ class GameState:
                     changed = True
                     break
 
-    def draw_cards(self, count: int | None = None, face_down: bool = False) -> list[HandCard]:
+    def draw_cards(
+        self, count: int | None = None, face_down: bool = False
+    ) -> list[HandCard]:
         """Draws cards from remaining deck into hand, appending them strictly to the right."""
         self.ensure_slot_uids()
         needed = (self.hand.max_size - len(self.hand.cards)) if count is None else count
@@ -1380,14 +1443,21 @@ class GameState:
         for c in drawn_playing_cards:
             c.debuffed = self.card_is_debuffed_by_boss(c)
             is_flipped = face_down
-            if not is_flipped and not self.boss_disabled and self.location == Location.BLIND:
+            if (
+                not is_flipped
+                and not self.boss_disabled
+                and self.location == Location.BLIND
+            ):
                 if (
                     self.current_blind == BlindName.THE_HOUSE
                     and self.hands_played_this_round == 0
                     and self.discards_used_this_round == 0
                 ):
                     is_flipped = True
-                elif self.current_blind == BlindName.THE_MARK and self._is_card_face_for_blind(c):
+                elif (
+                    self.current_blind == BlindName.THE_MARK
+                    and self._is_card_face_for_blind(c)
+                ):
                     is_flipped = True
                 elif self.current_blind == BlindName.THE_FISH and self.fish_prepped:
                     is_flipped = True
@@ -1506,6 +1576,7 @@ _TRACKED_STATE_FIELDS: tuple[str, ...] = (
 @dataclass(kw_only=True)
 class GameStateDelta:
     """Sparse delta between two GameStates (P-frame). None fields indicate no change."""
+
     step_idx: int
     frame_idx: int
     timestamp: float
@@ -1536,7 +1607,9 @@ class GameStateDelta:
     unique_planets_diff: set[str] | None = None
 
 
-def diff_states(prev: GameState, curr: GameState, action: Action | None = None) -> GameStateDelta:
+def diff_states(
+    prev: GameState, curr: GameState, action: Action | None = None
+) -> GameStateDelta:
     """Generates the minimal GameStateDelta between prev and curr."""
     delta = GameStateDelta(
         step_idx=curr.step_idx,
@@ -1591,7 +1664,9 @@ def diff_states(prev: GameState, curr: GameState, action: Action | None = None) 
     if prev.full_deck != curr.full_deck or (
         prev.full_deck is not None
         and curr.full_deck is not None
-        and any(p.debuffed != c.debuffed for p, c in zip(prev.full_deck, curr.full_deck))
+        and any(
+            p.debuffed != c.debuffed for p, c in zip(prev.full_deck, curr.full_deck)
+        )
     ):
         delta.full_deck_diff = copy.deepcopy(curr.full_deck)
     if prev.discard_pile != curr.discard_pile:
@@ -1674,11 +1749,14 @@ def apply_delta(base: GameState, delta: GameStateDelta) -> GameState:
 @dataclass(kw_only=True)
 class RunTrajectory:
     """Sequence of (GameState, Action) pairs stored as Keyframes + Deltas."""
+
     keyframe_interval: int = 20
     keyframes: dict[int, GameState] = field(default_factory=dict)
     deltas: list[GameStateDelta] = field(default_factory=list)
 
-    def record_step(self, state: GameState, action: Action | None = None) -> GameStateDelta:
+    def record_step(
+        self, state: GameState, action: Action | None = None
+    ) -> GameStateDelta:
         """Records a new state step into the trajectory."""
         step = len(self.deltas)
         state.step_idx = step
@@ -1694,7 +1772,9 @@ class RunTrajectory:
     def get_state(self, step: int) -> GameState:
         """Reconstructs state at step N by seeking to nearest keyframe and replaying deltas."""
         if step < 0 or step >= len(self.deltas):
-            raise IndexError(f"Step {step} out of range (total steps: {len(self.deltas)})")
+            raise IndexError(
+                f"Step {step} out of range (total steps: {len(self.deltas)})"
+            )
 
         kf_step = max(k for k in self.keyframes if k <= step)
         curr = self.keyframes[kf_step].copy()
@@ -1719,8 +1799,11 @@ class RunTrajectory:
         if seed:
             try:
                 from game.engine.rng_sim.api import BalatroRun
+
                 run = BalatroRun(seed)
-                max_ante = max((self.get_state(s).ante for s in range(len(self.deltas))), default=1)
+                max_ante = max(
+                    (self.get_state(s).ante for s in range(len(self.deltas))), default=1
+                )
                 bosses = run.predict_boss_blinds(max_ante=max(8, max_ante))
                 for a_idx, b_pred in enumerate(bosses, start=1):
                     if a_idx not in ante_bosses:
@@ -1744,7 +1827,9 @@ class RunTrajectory:
                     delta.boss_blind = target_boss
 
 
-def step_simulation(state: GameState, action: Action) -> tuple[GameState, GameStateDelta]:
+def step_simulation(
+    state: GameState, action: Action
+) -> tuple[GameState, GameStateDelta]:
     """Advances state using deterministic rules & trigger dispatcher, returning new state + delta."""
     prev = state.copy()
     on_action(state, action)

@@ -18,20 +18,20 @@ class Config:
     template_json_path: str = "assets/templates/drspectred/templates.json"
     template_img_dir: str = "assets/templates/drspectred"
     input_img_path: str = "assets/sample_inputs/scraped_frames/test_frame_1.jpg"
-    input_video_path: str = "assets/sample_inputs/videos/bu_full.mp4"
+    input_video_path: str = "assets/sample_inputs/videos/bu_anaglyph_deck_10-31-26.mp4"
     output_dir: str = "output"
     resolution_width: int = 1920
     resolution_height: int = 1080
     matching_method: int = cv2.TM_CCORR_NORMED
 
-    elem_conf_thresh: float = 0.946  # found element? confidence threshold
+    elem_conf_thresh: float = 0.92  # found element? confidence threshold
     expand_roi_factor: float = 1.1
     shadow_region_height: int = 10  # pixels
     shadow_threshold: float = 52.0
     skip_frames: int = 1  # skip n frames then use 1
 
-    start_timestamp: float | None = 0
-    end_timestamp: float | None = 100
+    start_timestamp: float | None = 1100
+    end_timestamp: float | None = 1200
 
     use_hwaccel: bool = True
     coarse_to_fine: bool = True

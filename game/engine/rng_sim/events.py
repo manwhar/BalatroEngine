@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from game.balatro_models import Planet, PlanetName
+from game.balatro_models import CardType, Planet, PlanetName
 from game.engine.rng_sim.rng import BalatroRNG, Tw223
 from game.engine.rng_sim.state import (
     DEFAULT_VISIBLE_POKER_HANDS,
@@ -668,6 +668,44 @@ class TarotPrediction:
     def __repr__(self) -> str:
         res = f", resamples={self.resample_count}" if self.resample_count else ""
         return f"TarotPrediction({self.name!r} [{self.key}], ante={self.ante}, stream={self.stream_key!r}{res})"
+
+
+def get_blocked_card_names(state: Any, card_type: CardType) -> set[Any]:
+    """Collects card names currently in inventory, external shop, or open pack.
+
+    Matches Balatro's `G.GAME.used_jokers` blocking across consumables/jokers,
+    `shop_cards`, and `pack_cards` so pools cannot roll duplicates while those
+    cards remain in any active area (unless Showman is owned).
+    """
+    if state is None:
+        return set()
+    blocked: set[Any] = set()
+    inv = getattr(state, "inventory", None)
+    if inv is not None:
+        if card_type == CardType.JOKER:
+            for j in getattr(inv, "jokers", ()) or ():
+                if getattr(j, "name", None) is not None:
+                    blocked.add(j.name)
+        else:
+            for c in getattr(inv, "consumables", ()) or ():
+                if getattr(c, "type", None) == card_type and getattr(c, "name", None) is not None:
+                    blocked.add(c.name)
+    for region_attr in ("shop_cards", "pack_cards"):
+        for item in getattr(state, region_attr, ()) or ():
+            if getattr(item, "type", None) == card_type and getattr(item, "name", None) is not None:
+                blocked.add(item.name)
+    return blocked
+
+
+def state_has_showman(state: Any) -> bool:
+    """Returns True if state holds an active (undebuffed) Showman."""
+    inv = getattr(state, "inventory", None) if state is not None else None
+    if not inv:
+        return False
+    return any(
+        getattr(j, "name", None) == JokerName.SHOWMAN and not getattr(j, "debuffed", False)
+        for j in (getattr(inv, "jokers", ()) or ())
+    )
 
 
 def poll_tarot_pool(
@@ -1447,12 +1485,30 @@ def predict_riff_raff_jokers(
     rng: BalatroRNG,
     ante: int = 1,
     count: int = 2,
+    owned_jokers: set[JokerName] | Sequence[JokerName] | None = None,
+    has_showman: bool = False,
 ) -> list[Joker]:
     """Generates 1 or 2 Common Jokers for Riff-Raff (card.lua:2534-2541)."""
-    pool = [j[1] for j in P_COMMON_JOKERS]
-    jokers = []
+    used = set(owned_jokers or ())
+    jokers: list[Joker] = []
     for _ in range(count):
+        pool: list[JokerName | str] = []
+        pool_size = 0
+        for j in P_COMMON_JOKERS:
+            if has_showman or j[1] not in used:
+                pool.append(j[1])
+                pool_size += 1
+            else:
+                pool.append("UNAVAILABLE")
+        if pool_size == 0:
+            pool = [JokerName.JOKER]
         chosen, _ = rng.choice("Joker1rif", pool)
+        it = 1
+        while chosen == "UNAVAILABLE":
+            it += 1
+            chosen, _ = rng.choice(f"Joker1rif_resample{it}", pool)
+        if not has_showman:
+            used.add(chosen)
         ed = poll_edition(rng, f"edirif{ante}")
         jokers.append(Joker(name=chosen, edition=ed))
     return jokers
@@ -1462,34 +1518,112 @@ def poll_spectral_pool(
     rng: BalatroRNG,
     ante: int = 1,
     key_append: str = "",
+    active_spectrals: set[SpectralName | str] | Sequence[SpectralName | str] | None = None,
+    banned_keys: set[str] | None = None,
+    has_showman: bool = False,
 ) -> Spectral:
     """Polls G.P_CENTER_POOLS['Spectral'] matching `get_current_pool('Spectral', nil, nil, key_append)`."""
-    pool = [s[1] for s in P_SPECTRALS]
-    pool_key = f"Spectral{key_append}{ante}"
+    eff_ante = max(1, ante)
+    pool_key = f"Spectral{key_append}{eff_ante}"
+    used = set(active_spectrals or ())
+    banned = banned_keys or set()
+    pool: list[SpectralName | str] = []
+    pool_size = 0
+    for key, s_name in P_SPECTRALS:
+        is_avail = key not in banned and s_name not in banned
+        if is_avail and not has_showman and (s_name in used or key in used):
+            is_avail = False
+        if is_avail:
+            pool.append(s_name)
+            pool_size += 1
+        else:
+            pool.append("UNAVAILABLE")
+    if pool_size == 0:
+        pool = [SpectralName.INCANTATION]
     chosen, _ = rng.choice(pool_key, pool)
+    it = 1
+    while chosen == "UNAVAILABLE":
+        it += 1
+        chosen, _ = rng.choice(f"{pool_key}_resample{it}", pool)
     return Spectral(name=chosen)
 
 
-def predict_sixth_sense_spectral(rng: BalatroRNG, ante: int = 1) -> Spectral:
-    return poll_spectral_pool(rng, ante=ante, key_append="sixth")
-
-
-def predict_seance_spectral(rng: BalatroRNG, ante: int = 1) -> Spectral:
-    return poll_spectral_pool(rng, ante=ante, key_append="sea")
-
-
-def predict_superposition_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
-    return poll_tarot_pool(
-        rng, ante=ante, key_append="sup", source_label="Superposition"
+def predict_sixth_sense_spectral(
+    rng: BalatroRNG,
+    ante: int = 1,
+    active_spectrals: set[SpectralName | str] | Sequence[SpectralName | str] | None = None,
+    has_showman: bool = False,
+) -> Spectral:
+    return poll_spectral_pool(
+        rng,
+        ante=ante,
+        key_append="sixth",
+        active_spectrals=active_spectrals,
+        has_showman=has_showman,
     )
 
 
-def predict_purple_seal_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
-    return poll_tarot_pool(rng, ante=ante, key_append="pur", source_label="Purple Seal")
+def predict_seance_spectral(
+    rng: BalatroRNG,
+    ante: int = 1,
+    active_spectrals: set[SpectralName | str] | Sequence[SpectralName | str] | None = None,
+    has_showman: bool = False,
+) -> Spectral:
+    return poll_spectral_pool(
+        rng,
+        ante=ante,
+        key_append="sea",
+        active_spectrals=active_spectrals,
+        has_showman=has_showman,
+    )
 
 
-def predict_eight_ball_tarot(rng: BalatroRNG, ante: int = 1) -> TarotPrediction:
-    return poll_tarot_pool(rng, ante=ante, key_append="8ba", source_label="8 Ball")
+def predict_superposition_tarot(
+    rng: BalatroRNG,
+    ante: int = 1,
+    active_tarots: set[TarotName | str] | Sequence[TarotName | str] | None = None,
+    has_showman: bool = False,
+) -> TarotPrediction:
+    return poll_tarot_pool(
+        rng,
+        ante=ante,
+        key_append="sup",
+        active_tarots=active_tarots,
+        has_showman=has_showman,
+        source_label="Superposition",
+    )
+
+
+def predict_purple_seal_tarot(
+    rng: BalatroRNG,
+    ante: int = 1,
+    active_tarots: set[TarotName | str] | Sequence[TarotName | str] | None = None,
+    has_showman: bool = False,
+) -> TarotPrediction:
+    return poll_tarot_pool(
+        rng,
+        ante=ante,
+        key_append="pur",
+        active_tarots=active_tarots,
+        has_showman=has_showman,
+        source_label="Purple Seal",
+    )
+
+
+def predict_eight_ball_tarot(
+    rng: BalatroRNG,
+    ante: int = 1,
+    active_tarots: set[TarotName | str] | Sequence[TarotName | str] | None = None,
+    has_showman: bool = False,
+) -> TarotPrediction:
+    return poll_tarot_pool(
+        rng,
+        ante=ante,
+        key_append="8ba",
+        active_tarots=active_tarots,
+        has_showman=has_showman,
+        source_label="8 Ball",
+    )
 
 
 # ---------------------------------------------------------------------------
