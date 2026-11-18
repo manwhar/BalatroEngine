@@ -5,22 +5,90 @@ local RunTracker = {}
 
 RunTracker.enabled = false
 RunTracker.log_file = nil
+RunTracker.repo_log_file = nil
 RunTracker.action_step = 0
+RunTracker.run_id = nil
+RunTracker._active_pack = nil
+RunTracker.undo_stack = {}
+RunTracker.log_lines = {}
+RunTracker.MAX_UNDO = 25
+
+local function is_revertable_state()
+    if not G or not G.GAME or not G.STATES then return false end
+    if G.booster_pack or (G.pack_cards and G.pack_cards.cards and #G.pack_cards.cards > 0) then
+        return false
+    end
+    return G.STATE == G.STATES.SELECTING_HAND
+        or G.STATE == G.STATES.SHOP
+        or G.STATE == G.STATES.BLIND_SELECT
+        or G.STATE == G.STATES.ROUND_EVAL
+end
+
+local function capture_revert_savetext()
+    if not recursive_table_cull then return nil end
+    local cardAreas = {}
+    for k, v in pairs(G) do
+        if (type(v) == "table") and v.is and v:is(CardArea) then
+            local ser = v:save()
+            if ser then cardAreas[k] = ser end
+        end
+    end
+    local tags = {}
+    if G.GAME and G.GAME.tags then
+        for k, v in ipairs(G.GAME.tags) do
+            if (type(v) == "table") and v.is and v:is(Tag) then
+                local ser = v:save()
+                if ser then tags[k] = ser end
+            end
+        end
+    end
+    return recursive_table_cull{
+        cardAreas = cardAreas,
+        tags = tags,
+        GAME = G.GAME,
+        STATE = G.STATE,
+        ACTION = G.action or nil,
+        BLIND = G.GAME.blind:save(),
+        BACK = G.GAME.selected_back:save(),
+        VERSION = G.VERSION
+    }
+end
+
+local function rewrite_telemetry_logs()
+    local body = (#RunTracker.log_lines > 0) and (table.concat(RunTracker.log_lines, "\n") .. "\n") or ""
+    if RunTracker.log_file then
+        love.filesystem.write(RunTracker.log_file, body)
+    end
+    if RunTracker.repo_log_file and NFS and NFS.write then
+        NFS.write(RunTracker.repo_log_file, body)
+    end
+end
+
+local function make_run_id()
+    local seed = (G and G.GAME and G.GAME.pseudorandom and G.GAME.pseudorandom.seed) or "run"
+    return string.format("%s_%d", tostring(seed), os.time and os.time() or 0)
+end
+
+function RunTracker.reset()
+    RunTracker.action_step = 0
+    RunTracker._active_pack = nil
+    RunTracker.undo_stack = {}
+    RunTracker.log_lines = {}
+    RunTracker.run_id = make_run_id()
+    rewrite_telemetry_logs()
+    print("RUN_TRACKER: Reset telemetry log for run_id=" .. tostring(RunTracker.run_id))
+end
 
 function RunTracker.init()
     RunTracker.enabled = true
-    RunTracker.action_step = 0
-    local log_path = "run_telemetry.jsonl"
-    RunTracker.log_file = log_path
-    love.filesystem.write(log_path, "")
-    print("RUN_TRACKER: Initialized telemetry logger -> " .. tostring(log_path))
-
-    -- Mirror to workspace repo root if NFS is available
+    RunTracker.log_file = "run_telemetry.jsonl"
     if NFS and NFS.write and G.DATASET_MOD and G.DATASET_MOD.mod_path then
-        local repo_log = G.DATASET_MOD.mod_path .. "../run_telemetry.jsonl"
-        NFS.write(repo_log, "")
-        RunTracker.repo_log_file = repo_log
-        print("RUN_TRACKER: Initialized repo mirror -> " .. tostring(repo_log))
+        RunTracker.repo_log_file = G.DATASET_MOD.mod_path .. "../run_telemetry.jsonl"
+    end
+    RunTracker.reset()
+    print("RUN_TRACKER: Initialized telemetry logger -> " .. tostring(RunTracker.log_file))
+    if RunTracker.repo_log_file then
+        print("RUN_TRACKER: Initialized repo mirror -> " .. tostring(RunTracker.repo_log_file))
     end
 end
 
@@ -108,6 +176,8 @@ local function serialize_card(c)
         seal = seal_name,
         enhancement = enhancement_name,
         debuffed = (c.debuff == true) or false,
+        couponed = (c.ability and c.ability.couponed) or false,
+        played_this_ante = (c.ability and c.ability.played_this_ante) or false,
         eternal = (c.ability and c.ability.eternal) or false,
         perishable = (c.ability and c.ability.perishable) or false,
         perish_tally = (c.ability and c.ability.perish_tally) or 5,
@@ -121,6 +191,12 @@ end
 
 function RunTracker.snapshot_gamestate(action_name, action_metadata)
     if not RunTracker.enabled or not G.GAME then return end
+    if G.DATASET_MOD and G.DATASET_MOD.config and G.DATASET_MOD.config.mode and G.DATASET_MOD.config.mode ~= "off" then
+        return
+    end
+    if not RunTracker.run_id then
+        RunTracker.run_id = make_run_id()
+    end
 
     RunTracker.action_step = RunTracker.action_step + 1
 
@@ -277,17 +353,33 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
     end
 
     local cr = G.GAME.current_round or {}
+    local cur_ante = (G.GAME.round_resets and G.GAME.round_resets.ante) or 1
+    local orb_choices = (G.GAME.orbital_choices and G.GAME.orbital_choices[cur_ante]) or {}
+    local mods = G.GAME.modifiers or {}
+    local last_tp_key = G.GAME.last_tarot_planet
+    local last_tp_name = (last_tp_key and G.P_CENTERS and G.P_CENTERS[last_tp_key] and G.P_CENTERS[last_tp_key].name) or nil
+    if loc ~= "pack" then
+        RunTracker._active_pack = nil
+    end
 
     local joker_order_ids = {}
     for _, j in ipairs(jokers) do
         table.insert(joker_order_ids, j.id)
     end
+    local hand_order_ids = {}
+    for _, hc in ipairs(hand_cards) do
+        table.insert(hand_order_ids, hc.id)
+    end
     local meta = action_metadata or {}
     if not meta.joker_order then
         meta.joker_order = joker_order_ids
     end
+    if not meta.hand_order then
+        meta.hand_order = hand_order_ids
+    end
 
     local payload = {
+        run_id = RunTracker.run_id,
         step = RunTracker.action_step,
         timestamp = love.timer.getTime(),
         action = action_name,
@@ -298,9 +390,12 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             stake = G.GAME.stake or 1,
             deck_name = (G.GAME.selected_back and G.GAME.selected_back.name) or "Red Deck",
             location = loc,
+            round_won = (G.STATES and G.STATE == G.STATES.ROUND_EVAL) or false,
+            pre_pack_location = (loc == "pack") and ((G.shop and "shop") or "select") or nil,
+            active_pack = (loc == "pack") and RunTracker._active_pack or nil,
             money = G.GAME.dollars or 0,
             round_dollars = cr.dollars or 0,
-            ante = G.GAME.round_resets and G.GAME.round_resets.ante or 1,
+            ante = cur_ante,
             round = G.GAME.round or 1,
             hands_left = cr.hands_left or 0,
             discards_left = cr.discards_left or 0,
@@ -311,17 +406,29 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
             reroll_cost = cr.reroll_cost or 5,
             free_rerolls = cr.free_rerolls or 0,
             inflation = G.GAME.inflation or 0,
+            edition_rate = G.GAME.edition_rate or 1,
+            ante_scaling = (G.GAME.starting_params and G.GAME.starting_params.ante_scaling) or 1,
+            temp_hand_size_bonus = (G.GAME.round_resets and G.GAME.round_resets.temp_handsize) or 0,
+            gros_michel_extinct = (G.GAME.pool_flags and G.GAME.pool_flags.gros_michel_extinct) or false,
+            enable_eternals_in_shop = mods.enable_eternals_in_shop or false,
+            enable_perishables_in_shop = mods.enable_perishables_in_shop or false,
+            enable_rentals_in_shop = mods.enable_rentals_in_shop or false,
             probability_normal = (G.GAME and G.GAME.probabilities and G.GAME.probabilities.normal) or 1,
             blinds_skipped = G.GAME.skips or 0,
             tarots_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.tarot) or 0,
             planets_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.planet) or 0,
             spectrals_used = (G.GAME.consumeable_usage_total and G.GAME.consumeable_usage_total.spectral) or 0,
             unused_discards = G.GAME.unused_discards or 0,
-            last_tarot_planet = G.GAME.last_tarot_planet or nil,
+            last_tarot_planet = last_tp_key or nil,
+            last_tarot_planet_name = last_tp_name,
             castle_suit = (cr.castle_card and cr.castle_card.suit) or "Spades",
             ancient_suit = (cr.ancient_card and cr.ancient_card.suit) or "Spades",
             mail_card_rank = (cr.mail_card and (cr.mail_card.rank or cr.mail_card.value)) or "Ace",
             idol_card = cr.idol_card and {rank = cr.idol_card.rank or cr.idol_card.value, suit = cr.idol_card.suit} or nil,
+            ox_target_hand = cr.most_played_poker_hand or nil,
+            locked_hand_type = (G.GAME.blind and G.GAME.blind.only_hand) or nil,
+            small_blind_orbital_hand = orb_choices.Small or nil,
+            big_blind_orbital_hand = orb_choices.Big or nil,
             target_chips = G.GAME.blind and G.GAME.blind.chips or 0,
             current_chips = G.GAME.chips or 0,
             blind = blind_name,
@@ -361,6 +468,21 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
     end
 
     if json_str then
+        if is_revertable_state() then
+            local savetext = capture_revert_savetext()
+            if savetext then
+                table.insert(RunTracker.undo_stack, {
+                    savetext = savetext,
+                    prev_line_count = #RunTracker.log_lines,
+                    prev_action_step = RunTracker.action_step - 1,
+                    action_name = action_name,
+                })
+                if #RunTracker.undo_stack > RunTracker.MAX_UNDO then
+                    table.remove(RunTracker.undo_stack, 1)
+                end
+            end
+        end
+        table.insert(RunTracker.log_lines, json_str)
         love.filesystem.append(RunTracker.log_file, json_str .. "\n")
         if RunTracker.repo_log_file and NFS and NFS.append then
             NFS.append(RunTracker.repo_log_file, json_str .. "\n")
@@ -368,11 +490,60 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
     end
 end
 
+function RunTracker.undo_last_action()
+    if not RunTracker.enabled or not G or not G.GAME then
+        return false, "No active run"
+    end
+    if #RunTracker.undo_stack == 0 then
+        return false, "No revertable state in undo history"
+    end
+
+    local snap = table.remove(RunTracker.undo_stack)
+    local actions_reverted = math.max(1, RunTracker.action_step - snap.prev_action_step)
+
+    while #RunTracker.log_lines > snap.prev_line_count do
+        table.remove(RunTracker.log_lines)
+    end
+    rewrite_telemetry_logs()
+
+    RunTracker.action_step = snap.prev_action_step
+    RunTracker._active_pack = nil
+
+    if G.FUNCS and G.FUNCS.start_run then
+        G.FUNCS.start_run(nil, { savetext = snap.savetext })
+    elseif G.start_run then
+        if G.E_MANAGER then G.E_MANAGER:clear_queue() end
+        G:delete_run()
+        G:start_run({ savetext = snap.savetext })
+    end
+
+    return true, actions_reverted, snap.action_name, snap.prev_action_step
+end
+
 -- ========================================================
 -- ACTION HOOKS (Intercept exact actions matching templates)
 -- ========================================================
 
 function RunTracker.hook_actions()
+    -- 0. Reset run telemetry on new run / quick restart (preserve on Continue Run savetext, ignore dataset gen modes)
+    if Game and Game.start_run then
+        local orig_start_run = Game.start_run
+        function Game:start_run(args)
+            local is_cv_off = not (G.DATASET_MOD and G.DATASET_MOD.config and G.DATASET_MOD.config.mode and G.DATASET_MOD.config.mode ~= "off")
+            local is_fresh_run = not (args and args.savetext)
+            local ret = orig_start_run(self, args)
+            if is_cv_off then
+                if is_fresh_run then
+                    RunTracker.reset()
+                else
+                    RunTracker.run_id = RunTracker.run_id or make_run_id()
+                    RunTracker._active_pack = nil
+                end
+            end
+            return ret
+        end
+    end
+
     -- 1. Play Hand
     local orig_play = G.FUNCS.play_cards_from_highlighted
     G.FUNCS.play_cards_from_highlighted = function(e)
@@ -493,6 +664,14 @@ function RunTracker.hook_actions()
                     if set_name == "Booster" then
                         act_name = "Open Pack"
                         idx = find_card_index_0based(G.shop_booster, card)
+                        local c_cfg = card.config and card.config.center and card.config.center.config or {}
+                        RunTracker._active_pack = {
+                            name = (card.ability and card.ability.name) or nil,
+                            key = (card.config and card.config.center and card.config.center.key) or nil,
+                            choose = c_cfg.choose or 1,
+                            extra = (card.ability and card.ability.extra) or c_cfg.extra or 3,
+                            cost = card.cost or 0,
+                        }
                     elseif set_name == "Voucher" then
                         act_name = "Redeem Voucher"
                         idx = find_card_index_0based(G.shop_vouchers, card)

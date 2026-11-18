@@ -6,6 +6,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _to_gray(image: np.ndarray) -> np.ndarray:
+    """Converts a BGR/BGRA/grayscale image slice to 2D grayscale."""
+    if len(image.shape) == 3:
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return image
+
+
 def detect_horizontal_edges(image: np.ndarray) -> np.ndarray:
     """
     Runs a Y-directional Sobel edge detection to find horizontal lines,
@@ -35,14 +44,7 @@ def detect_horizontal_edges(image: np.ndarray) -> np.ndarray:
             f"Image slice might be too small for reliable edge detection: {width}x{height}."
         )
 
-    # Convert to grayscale if not already
-    if len(image.shape) == 3:
-        if image.shape[2] == 4:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-        else:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
+    gray = _to_gray(image)
 
     # Run Sobel in Y direction (dx=0, dy=1) to isolate horizontal edges
     sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -69,15 +71,19 @@ def analyze_shadow_presence(image: np.ndarray, threshold: float = 1000.0) -> boo
     Returns:
         True if a distinct horizontal shadow edge is found (unpressed), False otherwise.
     """
-    row_sums = detect_horizontal_edges(image)
+    if image is None or image.size == 0:
+        return False
+
+    gray = _to_gray(image)
+    row_sums = detect_horizontal_edges(gray)
 
     if len(row_sums) == 0:
         return False
 
     # Check both Sobel edge strength and dark-trough-to-background intensity steps
     # so dark Boss Blind backgrounds and slight motion blur don't mask real shadows.
-    if len(row_sums) >= 8 and image.shape[0] >= 3 and image.shape[1] >= 1:
-        sob_signed = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+    if len(row_sums) >= 8 and gray.shape[0] >= 3 and gray.shape[1] >= 1:
+        sob_signed = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         pos_row_medians = np.median(sob_signed, axis=1)
         # Skip row 1 negative (bright button edge -> flat dark bg) spikes on shadow_dy=0 buttons,
         # while still catching row 1 positive (dark shadow -> bright bg) transitions.
@@ -91,8 +97,8 @@ def analyze_shadow_presence(image: np.ndarray, threshold: float = 1000.0) -> boo
     if max_gradient > threshold:
         return True
 
-    if image.shape[0] >= 3 and image.shape[1] >= 1:
-        row_medians = np.median(image, axis=1)
+    if gray.shape[0] >= 3 and gray.shape[1] >= 1:
+        row_medians = np.median(gray, axis=1)
         min_step = max(10.0, threshold * (10.0 / 52.0))
         for i in range(len(row_medians)):
             dark = float(row_medians[i])

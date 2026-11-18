@@ -15,6 +15,7 @@ local DEFAULT_CONFIG = {
     frame_wait_time = 0.08, -- Seconds to wait between generation and capture
     rois = {
         card_hand    = {x = 508.319934,  y = 567.839093, w = 1071.056521, h = 322.734447},
+        pack_hand    = {x = 490.000000,  y = 300.000000, w = 1100.000000, h = 340.000000},
         play_area    = {x = 518.702717,  y = 421.037276, w = 1034.463019, h = 287.461606},
         joker_bar    = {x = 512.701385,  y = 20.409878,  w = 868.473724,  h = 259.967609},
         shop         = {x = 818.386186,  y = 369.181989, w = 720.772049,  h = 280.979925},

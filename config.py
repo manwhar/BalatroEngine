@@ -30,8 +30,8 @@ class Config:
     shadow_threshold: float = 52.0
     skip_frames: int = 1  # skip n frames then use 1
 
-    start_timestamp: float | None = 1100
-    end_timestamp: float | None = 1200
+    start_timestamp: float | None = None
+    end_timestamp: float | None = None
 
     use_hwaccel: bool = True
     coarse_to_fine: bool = True

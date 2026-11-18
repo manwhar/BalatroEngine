@@ -529,7 +529,7 @@ def _serialize_field_value(
         prev_cards = getattr(prev_state, key, None) if prev_state is not None else None
         return _serialize_playing_card_list_diff(prev_cards, val)
     if key == "active_tags":
-        return [t.value for t in val]
+        return [t.value if hasattr(t, "value") else str(t) for t in val]
     if key == "vouchers_redeemed":
         return [v.value for v in val]
     if key in ("unique_planets_used", "pending_cv_checks"):

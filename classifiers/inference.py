@@ -79,7 +79,7 @@ BASE_HEIGHT = 1080.0
 # 1920x1080 Balatro UI ROI coordinates (calibrated in balatro_mod/dataset/boxes.lua)
 ROIS = {
     "card_hand": {"x": 508.319934, "y": 567.839093, "w": 1071.056521, "h": 322.734447},
-    "pack_hand": {"x": 508.0, "y": 300.0, "w": 1071.0, "h": 340.0},
+    "pack_hand": {"x": 490.0, "y": 300.0, "w": 1100.0, "h": 340.0},
     "joker_bar": {"x": 512.701385, "y": 20.409878, "w": 857.0, "h": 259.967609},
     "consumeables": {
         "x": 1369.783812,

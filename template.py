@@ -48,6 +48,7 @@ class Template:
     shadow_dw: int
     shadow_dh: int
     adjusted: bool
+    shadow_threshold: float | None = None
     _compiled_specs_cache: dict[tuple[int, int, float], tuple[CompiledTemplateSpec, ...]] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -173,6 +174,8 @@ def template_loader(
         shadow_dy = data.get("shadow_dy", 0)
         shadow_dw = data.get("shadow_dw", 0)
         shadow_dh = data.get("shadow_dh", 0)
+        raw_thresh = data.get("shadow_threshold", None)
+        shadow_threshold = float(raw_thresh) if raw_thresh is not None else None
         adjusted = data.get("adjusted", False)
 
         images = [
@@ -188,6 +191,6 @@ def template_loader(
             images_gray.append(cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY))
             masks.append(img[:, :, 3] if img.shape[2] == 4 else None)
 
-        templates.append(Template(name, filenames, norm_rois, px_rois, images, images_gray, masks, shadow_dy, shadow_dw, shadow_dh, adjusted))
+        templates.append(Template(name, filenames, norm_rois, px_rois, images, images_gray, masks, shadow_dy, shadow_dw, shadow_dh, adjusted, shadow_threshold))
 
     return templates

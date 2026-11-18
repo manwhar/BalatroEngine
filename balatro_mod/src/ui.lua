@@ -12,6 +12,7 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'roi_pack' then return self.config.rois.pack, 'roi', "ROI: Booster Opening Screen"
     elseif t == 'roi_consumeables' then return self.config.rois.consumeables, 'roi', "ROI: Consumables (Top Right)"
     elseif t == 'roi_card_hand' then return self.config.rois.card_hand, 'roi', "ROI: Card Hand"
+    elseif t == 'roi_pack_hand' then return self.config.rois.pack_hand, 'roi', "ROI: Pack Playing Card Hand"
     elseif t == 'roi_play_area' then return self.config.rois.play_area, 'roi', "ROI: Play Area (G.play)"
     elseif t == 'roi_hud_round_score' then return self.config.rois.hud_round_score, 'roi', "ROI: HUD Round Score"
     elseif t == 'roi_hud_money' then return self.config.rois.hud_money, 'roi', "ROI: HUD Money ($)"
@@ -1162,7 +1163,18 @@ end
 -- IN-GAME HUD & CALIBRATION OVERLAY
 -- ==========================================
 function G.DATASET_MOD:draw_debug()
-    if self.config.mode == 'off' then return end
+    if self.config.mode == 'off' then
+        if self.capture_flash and self.capture_flash > 0 then
+            love.graphics.push('all')
+            local msg = self.capture_flash_text or ""
+            love.graphics.setColor(0, 0, 0, 0.85 * math.min(1.0, self.capture_flash))
+            love.graphics.rectangle('fill', 14, 14, 720, 34, 6, 6)
+            love.graphics.setColor(0.3, 1.0, 0.4, math.min(1.0, self.capture_flash))
+            love.graphics.print(msg, 24, 24)
+            love.graphics.pop()
+        end
+        return
+    end
     if self.config.calibration_mode ~= 'setup' then return end
 
     love.graphics.push('all')
@@ -1196,6 +1208,7 @@ function G.DATASET_MOD:draw_debug()
         draw_roi_box(self.config.rois.hud_round,        "[6: ROUND]",        sel == 'roi_hud_round',        0.4, 1.0, 0.6)
         draw_roi_box(self.config.rois.hud_reroll_cost,  "[7: REROLL COST]",  sel == 'roi_hud_reroll_cost',  0.2, 1.0, 0.3)
         draw_roi_box(self.config.rois.hud_blind_target, "[8: BLIND TARGET]", sel == 'roi_hud_blind_target', 1.0, 0.6, 0.2)
+        draw_roi_box(self.config.rois.pack_hand,        "[9: PACK HAND (CV)]", sel == 'roi_pack_hand',     1.0, 0.3, 0.85)
     elseif self.config.mode == 'shop_classifier' then
         local sel = self.selected_target
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
@@ -1340,7 +1353,7 @@ function G.DATASET_MOD:draw_debug()
     elseif self.config.mode == 'end_round_classifier' then
         love.graphics.print("Keys: 3: ROI Play Area | R: Preview Scenario | C: Record 1 Test Clip | TAB: Auto-Generate Clips", 18, 58)
     elseif self.config.mode == 'hud_ocr' then
-        love.graphics.print("Keys: 1:Score | 2:Money | 3:Hands | 4:Discards | 5:Ante | 6:Round | 7:Reroll | 8:BlindTarget", 18, 58)
+        love.graphics.print("Keys: 1:Score | 2:Money | 3:Hands | 4:Discards | 5:Ante | 6:Round | 7:Reroll | 8:BlindTarget | 9:PackHand", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card | 3: ROI Play Area", 18, 58)
     end
@@ -1430,7 +1443,28 @@ function G.DATASET_MOD:on_keypressed(key)
         return
     end
 
-    if self.config.mode == 'off' then return end
+    if self.config.mode == 'off' then
+        if G and G.GAME and self.RunTracker and self.RunTracker.undo_last_action then
+            local is_ctrl_z = (key == 'z' and love and love.keyboard and (love.keyboard.isDown('lctrl') or love.keyboard.isDown('rctrl')))
+            if key == 'backspace' or is_ctrl_z then
+                local ok, count_or_err, act_name, new_step = self.RunTracker.undo_last_action()
+                self.capture_flash = 3.5
+                if ok then
+                    self.capture_flash_text = string.format(
+                        "UNDO: Reverted %d action%s back (before %s | step %d)",
+                        count_or_err,
+                        count_or_err == 1 and "" or "s",
+                        tostring(act_name or "?"),
+                        tonumber(new_step) or 0
+                    )
+                else
+                    self.capture_flash_text = "UNDO: " .. tostring(count_or_err)
+                end
+                print(self.capture_flash_text)
+            end
+        end
+        return
+    end
 
     if key == 'tab' then
         if self.config.calibration_mode == 'setup' then
@@ -1473,6 +1507,7 @@ function G.DATASET_MOD:on_keypressed(key)
             elseif key == '6' then self.selected_target = 'roi_hud_round'
             elseif key == '7' then self.selected_target = 'roi_hud_reroll_cost'
             elseif key == '8' then self.selected_target = 'roi_hud_blind_target'
+            elseif key == '9' then self.selected_target = 'roi_pack_hand'
             end
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'

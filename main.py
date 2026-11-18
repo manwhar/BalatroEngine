@@ -312,6 +312,9 @@ def detect_video_actions(
                             template.shadow_dh = data[template.name].get(
                                 "shadow_dh", template.shadow_dh
                             )
+                            if "shadow_threshold" in data[template.name]:
+                                raw_t = data[template.name]["shadow_threshold"]
+                                template.shadow_threshold = float(raw_t) if raw_t is not None else None
                     except Exception as e:
                         logger.error(
                             f"Failed to reload template data for {template.name}: {e}"

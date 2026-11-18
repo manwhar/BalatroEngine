@@ -134,10 +134,15 @@ def plot(
                     data[template_name]["shadow_dy"] = int(shadow_slider.val)
                     data[template_name]["shadow_dw"] = int(dw_slider.val)
                     data[template_name]["shadow_dh"] = int(dh_slider.val)
+                    data[template_name]["shadow_threshold"] = round(float(thresh_slider.val), 2)
                     data[template_name]["adjusted"] = True
                     with open(template_json_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2)
-                    print(f"Saved dy={int(shadow_slider.val)} dw={int(dw_slider.val)} dh={int(dh_slider.val)} and marked adjusted for {template_name}")
+                    print(
+                        f"Saved dy={int(shadow_slider.val)} dw={int(dw_slider.val)} "
+                        f"dh={int(dh_slider.val)} thr={float(thresh_slider.val):.2f} "
+                        f"and marked adjusted for {template_name}"
+                    )
             except Exception as e:
                 print("Failed to save:", e)
         plt.close(fig)
@@ -182,11 +187,12 @@ def plot(
             pass
 
         # Adjust layout for the sliders on the right
-        plt.subplots_adjust(left=0.05, right=0.82)
-        ax_dh_slider = plt.axes([0.86, 0.35, 0.02, 0.3])
-        ax_dw_slider = plt.axes([0.90, 0.35, 0.02, 0.3])
-        ax_dy_slider = plt.axes([0.94, 0.35, 0.02, 0.3])
-        ax_button = plt.axes([0.88, 0.70, 0.06, 0.04])
+        plt.subplots_adjust(left=0.05, right=0.79)
+        ax_dh_slider = plt.axes([0.82, 0.35, 0.02, 0.3])
+        ax_dw_slider = plt.axes([0.86, 0.35, 0.02, 0.3])
+        ax_dy_slider = plt.axes([0.90, 0.35, 0.02, 0.3])
+        ax_thr_slider = plt.axes([0.94, 0.35, 0.02, 0.3])
+        ax_button = plt.axes([0.85, 0.70, 0.08, 0.04])
         
         dh_slider = Slider(
             ax=ax_dh_slider, 
@@ -215,6 +221,16 @@ def plot(
             valfmt='%d',
             orientation='vertical'
         )
+        thresh_max = max(150.0, float(shadow_threshold) + 20.0)
+        thresh_slider = Slider(
+            ax=ax_thr_slider,
+            label='Thr',
+            valmin=5,
+            valmax=thresh_max,
+            valinit=float(shadow_threshold),
+            valfmt='%d',
+            orientation='vertical',
+        )
         save_button = Button(ax_button, 'Save')
         save_button.on_clicked(save_and_continue)
 
@@ -222,6 +238,7 @@ def plot(
             dy = int(shadow_slider.val)
             dw = int(dw_slider.val)
             dh = int(dh_slider.val)
+            cur_thresh = float(thresh_slider.val)
             # Re-calculate shadow region
             abs_x_start = top_left[0]
             abs_x_end = top_left[0] + w_inp + dw
@@ -264,10 +281,10 @@ def plot(
                 row_sums = detect_horizontal_edges(actual_shadow_crop)
                 
                 has_shadow = analyze_shadow_presence(
-                    actual_shadow_crop, threshold=shadow_threshold
+                    actual_shadow_crop, threshold=cur_thresh
                 )
                 clicked = not has_shadow
-                axs[1, 2].set_title(f"Shadow Region (Clicked={clicked})")
+                axs[1, 2].set_title(f"Shadow Region (Clicked={clicked}, thr={cur_thresh:.0f})")
 
                 if len(row_sums) > 0:
                     y_positions = np.arange(len(row_sums))
@@ -277,10 +294,10 @@ def plot(
                     axs[1, 3].set_xlabel("Gradient Sum")
                     axs[1, 3].set_ylabel("Row Index")
                     axs[1, 3].axvline(
-                        x=shadow_threshold,
+                        x=cur_thresh,
                         color="red",
                         linestyle="--",
-                        label="Default Threshold",
+                        label=f"Threshold ({cur_thresh:.0f})",
                     )
                     axs[1, 3].legend()
                 else:
@@ -296,6 +313,7 @@ def plot(
         dh_slider.on_changed(update_shadow)
         dw_slider.on_changed(update_shadow)
         shadow_slider.on_changed(update_shadow)
+        thresh_slider.on_changed(update_shadow)
         update_shadow()
     else:
         for ax in (axs[1, 2], axs[1, 3]):

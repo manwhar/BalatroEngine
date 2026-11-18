@@ -117,9 +117,14 @@ def eval(
                 y_max=bottom_right[1] + height + dy + dh,
             )
 
+            eff_shadow_threshold = (
+                template.shadow_threshold
+                if getattr(template, "shadow_threshold", None) is not None
+                else config.shadow_threshold
+            )
             shadow_img_gray = crop_image_to_roi(img_gray, shadow_region)
             has_shadow = analyze_shadow_presence(
-                shadow_img_gray, threshold=config.shadow_threshold
+                shadow_img_gray, threshold=eff_shadow_threshold
             )
             clicked = not has_shadow
 
@@ -145,7 +150,7 @@ def eval(
                 "max_val": match.confidence,
                 "clicked": clicked,
                 "label": template.name,
-                "shadow_threshold": config.shadow_threshold,
+                "shadow_threshold": eff_shadow_threshold,
                 "template_name": template.name,
                 "template_json_path": config.template_json_path,
                 "current_shadow_dy": template.shadow_dy,
@@ -175,6 +180,9 @@ def eval(
                     template.shadow_dh = data[template.name].get(
                         "shadow_dh", template.shadow_dh
                     )
+                    if "shadow_threshold" in data[template.name]:
+                        raw_t = data[template.name]["shadow_threshold"]
+                        template.shadow_threshold = float(raw_t) if raw_t is not None else None
             except Exception as e:
                 logger.error(f"Failed to reload template data for {template.name}: {e}")
 

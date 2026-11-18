@@ -489,6 +489,53 @@ class TestTrajectoryCodec(unittest.TestCase):
             _assert_states_equivalent(self, traj.get_state(i), rebuilt_traj.get_state(i))
         _assert_states_equivalent(self, state, rebuild_gamestate(payload))
 
+    def test_telemetry_to_trajectory_run_splitting_and_roundtrip(self):
+        from pathlib import Path
+        from tools.telemetry_to_trajectory import (
+            load_telemetry_entries,
+            split_telemetry_runs,
+            select_run,
+            build_trajectory_from_telemetry,
+        )
+
+        # 1. Synthetic multi-run + Clearance Sale pack pricing (no double discount)
+        base_state = {
+            "seed": "TEST1234",
+            "deck_name": "Red Deck",
+            "stake": 1,
+            "location": "shop",
+            "ante": 1,
+            "round": 1,
+            "money": 20,
+            "vouchers": ["v_clearance_sale"],
+            "shop_packs": [{"name": "Jumbo Standard Pack", "key": "p_standard_jumbo_1", "choose": 1, "extra": 5, "cost": 4}],
+        }
+        e1 = {"run_id": "r1", "step": 1, "timestamp": 10.0, "action": "Open Pack", "action_metadata": {"target_idx": 0}, "state": base_state}
+        e2 = {"run_id": "r1", "step": 2, "timestamp": 11.0, "action": "Skip Pack", "action_metadata": {}, "state": {**base_state, "location": "pack", "money": 16, "shop_packs": []}}
+        e3 = {"run_id": "r2", "step": 1, "timestamp": 20.0, "action": "Select Blind", "action_metadata": {}, "state": {**base_state, "location": "select", "ante": 1, "round": 0, "money": 4, "vouchers": []}}
+        runs = split_telemetry_runs([e1, e2, e3])
+        self.assertEqual(len(runs), 2)
+        st, traj, warns = build_trajectory_from_telemetry(runs[0], reconcile_truth=False)
+        self.assertEqual(warns, [])
+        self.assertEqual(st.money, 16)
+        from game.trajectory_codec import SCHEMA_VERSION
+        payload = serialize_trajectory(st, traj)
+        self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
+        _assert_states_equivalent(self, st, rebuild_gamestate(payload))
+
+        # 2. Local telemetry run A8CQP141 if present
+        local_p = Path(__file__).resolve().parent.parent / "assets" / "local" / "run_telemetry.jsonl"
+        if local_p.exists() and local_p.stat().st_size > 0:
+            entries = load_telemetry_entries(local_p)
+            local_runs = split_telemetry_runs(entries)
+            chosen = select_run(local_runs, seed="A8CQP141")
+            st_l, traj_l, warns_l = build_trajectory_from_telemetry(chosen, reconcile_truth=False)
+            self.assertEqual(warns_l, [])
+            p_l = serialize_trajectory(st_l, traj_l)
+            self.assertEqual(p_l["num_steps"], 15)
+            rebuilt_l = rebuild_trajectory(p_l)
+            _assert_states_equivalent(self, st_l, rebuilt_l.get_state(len(rebuilt_l.deltas) - 1))
+
 
 if __name__ == "__main__":
     unittest.main()
