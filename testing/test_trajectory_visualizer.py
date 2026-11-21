@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -50,6 +51,7 @@ from game.trajectory_codec import serialize_trajectory
 from tools.visualize_trajectory import (
     TEXTURES_2X_DIR,
     TrajectoryVisualizerServer,
+    VideoFrameCache,
     build_visualization_payload,
     find_matching_video,
     load_balatro_sprite_manifest,
@@ -469,6 +471,253 @@ class TestVisualizerServer(unittest.TestCase):
                         jpg_bytes = r_frm.read()
                         self.assertEqual(r_frm.status, 200)
                         self.assertTrue(jpg_bytes.startswith(b"\xff\xd8"))
+                finally:
+                    conn.close()
+            finally:
+                server.close()
+                thread.join(timeout=5)
+
+
+def _create_synthetic_video(video_dir: Path, num_frames: int = 20) -> Path:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+
+    for ext, fourcc_str in ((".mp4", "mp4v"), (".avi", "MJPG")):
+        cand = video_dir / f"test_video{ext}"
+        writer = cv2.VideoWriter(
+            str(cand),
+            cv2.VideoWriter_fourcc(*fourcc_str),
+            10.0,
+            (64, 48),
+        )
+        if not writer.isOpened():
+            writer.release()
+            continue
+        try:
+            for idx in range(num_frames):
+                frame = np.full((48, 64, 3), (idx * 10) % 255, dtype=np.uint8)
+                writer.write(frame)
+        finally:
+            writer.release()
+        if cand.is_file() and cand.stat().st_size > 2048:
+            cap = cv2.VideoCapture(str(cand))
+            ok = cap.isOpened() and int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) >= num_frames
+            cap.release()
+            if ok:
+                return cand
+    raise RuntimeError("No working cv2.VideoWriter codec found for synthetic test video.")
+
+
+class TestVisualizerComparisonAndVideo(unittest.TestCase):
+    """Tests telemetry comparison endpoints, error-first preloading, /api/video Range, and HTML controls."""
+
+    def _make_pair(self, tmp: Path) -> tuple[Path, Path]:
+        def _build(*, inject_error: bool) -> dict:
+            deck = [
+                _sample_card(1, Rank.ACE, Suit.SPADES),
+                _sample_card(2, Rank.KING, Suit.HEARTS),
+                _sample_card(3, Rank.QUEEN, Suit.CLUBS),
+            ]
+            st = GameState(
+                seed="VISCMP",
+                deck=Deck.RED_DECK,
+                stake=Stake.WHITE,
+                location=Location.SELECT,
+                money=10,
+                full_deck=[PlayingCard(**vars(c)) for c in deck],
+                apply_deck_stake_on_init=False,
+            )
+            traj = RunTrajectory()
+            traj.record_step(st)  # step 0, f=0
+
+            st = st.copy()
+            st.frame_idx = 5
+            st.location = Location.BLIND
+            traj.record_step(st, Action(type=ActionType.SELECT_BLIND, frame_idx=5, timestamp=0.5))  # step 1
+
+            st = st.copy()
+            st.frame_idx = 15
+            st.hands_left = 3
+            if inject_error:
+                st.full_deck.append(_sample_card(50, Rank.TWO, Suit.DIAMONDS))
+            traj.record_step(
+                st,
+                Action(
+                    type=ActionType.PLAY_HAND,
+                    frame_idx=15,
+                    timestamp=1.5,
+                    selected_cards=[_sample_card(1, Rank.ACE, Suit.SPADES)],
+                ),
+            )  # step 2 (error when inject_error=True)
+
+            st = st.copy()
+            st.frame_idx = 18
+            st.round = 2
+            traj.record_step(st, Action(type=ActionType.END_ROUND, frame_idx=18, timestamp=1.8))  # step 3
+            return serialize_trajectory(st, traj)
+
+        actual_path = tmp / "run_actual_trajectory.json"
+        gt_path = tmp / "run_VISCMP_gt_trajectory.json"
+        actual_path.write_text(json.dumps(_build(inject_error=True)), encoding="utf-8")
+        gt_path.write_text(json.dumps(_build(inject_error=False)), encoding="utf-8")
+        return actual_path, gt_path
+
+    def test_error_first_priority_preloader_and_pinning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vid_path = _create_synthetic_video(Path(tmpdir), num_frames=20)
+            cache = VideoFrameCache(vid_path, max_items=4)
+            try:
+                self.assertTrue(cache.meta.get("available"))
+                cache.start_preload(priority_frames=[15, 18], secondary_frames=[0, 5, 10, 12])
+                deadline = time.monotonic() + 5.0
+                status = cache.preload_status()
+                while not status["done"] and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    status = cache.preload_status()
+                self.assertTrue(status["done"])
+                self.assertEqual(status["priority_cached"], 2)
+                self.assertEqual(status["priority_total"], 2)
+                self.assertEqual(status["total_cached"], 6)
+                # Priority error frames [15, 18] MUST be decoded strictly before secondary frames
+                self.assertEqual(status["decoded_order"][:2], [15, 18])
+
+                # Pin protection: even if max_items is capped artificially, pinned frames survive eviction
+                with cache._lock:
+                    cache.max_items = 4
+                    cache._cache[9991] = b"x"
+                    cache._evict_if_needed()
+                    cache._cache[9992] = b"y"
+                    cache._evict_if_needed()
+                    self.assertIn(15, cache._cache)
+                    self.assertIn(18, cache._cache)
+            finally:
+                cache.close()
+
+    def test_compare_endpoints_preload_video_range_and_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            actual_path, gt_path = self._make_pair(tmp)
+            vid_path = _create_synthetic_video(tmp, num_frames=20)
+            vid_bytes = vid_path.read_bytes()
+
+            # Start server with startup telemetry_path=gt_path so preloader prioritizes error frame [15] first!
+            server = TrajectoryVisualizerServer(
+                trajectory_path=actual_path,
+                video_path=vid_path,
+                telemetry_path=gt_path,
+                traj_dir=tmp,
+                video_dir=tmp,
+                host="127.0.0.1",
+                port=0,
+            )
+            thread = threading.Thread(target=server.httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                # Wait for priority preloader to finish on 4 steps
+                deadline = time.monotonic() + 5.0
+                while not server.app_state.frame_cache.preload_status()["done"] and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                order = server.app_state.frame_cache.preload_status()["decoded_order"]
+                self.assertEqual(order[0], 15)  # Step 2 (error step) decoded FIRST!
+
+                conn = http.client.HTTPConnection(server.host, server.port, timeout=10)
+                try:
+                    # 1. Rendered HTML smoke checks for video player toggle & error navigation
+                    conn.request("GET", "/")
+                    r_html = conn.getresponse()
+                    html = r_html.read()
+                    self.assertEqual(r_html.status, 200)
+                    for needle in (
+                        b'id="videoPlayer"',
+                        b'id="btnVideoMode"',
+                        b'id="telemetrySelect"',
+                        b'id="btnPrevErr"',
+                        b'id="btnNextErr"',
+                        b'data-tab="errors"',
+                        b"/api/video",
+                        b"/api/compare",
+                        b"/api/preload-status",
+                    ):
+                        self.assertIn(needle, html)
+
+                    # 2. Startup trajectory payload contains non-cascading comparison summary
+                    conn.request("GET", "/api/trajectory")
+                    r_traj = conn.getresponse()
+                    traj_payload = json.loads(r_traj.read().decode("utf-8"))
+                    self.assertEqual(r_traj.status, 200)
+                    self.assertEqual(traj_payload["comparison"]["summary"]["error_step_indices"], [2])
+
+                    # 3. Telemetry sources & dynamic /api/compare + security traversal guard
+                    conn.request("GET", "/api/telemetry-sources")
+                    r_src = conn.getresponse()
+                    src_data = json.loads(r_src.read().decode("utf-8"))
+                    self.assertEqual(r_src.status, 200)
+                    self.assertTrue(any(it["name"] == gt_path.name for it in src_data["items"]))
+
+                    conn.request("GET", "/api/compare?source=none")
+                    r_clr = conn.getresponse()
+                    clr_data = json.loads(r_clr.read().decode("utf-8"))
+                    self.assertEqual(r_clr.status, 200)
+                    self.assertIsNone(clr_data["comparison"])
+
+                    from urllib.parse import quote
+                    conn.request("GET", f"/api/compare?source={quote(str(gt_path))}")
+                    r_cmp = conn.getresponse()
+                    cmp_data = json.loads(r_cmp.read().decode("utf-8"))
+                    self.assertEqual(r_cmp.status, 200)
+                    self.assertEqual(cmp_data["comparison"]["summary"]["error_step_indices"], [2])
+
+                    conn.request("GET", "/api/compare?source=../../game.lua")
+                    r_sec = conn.getresponse()
+                    r_sec.read()
+                    self.assertEqual(r_sec.status, 403)
+
+                    # 4. Preload status endpoint
+                    conn.request("GET", "/api/preload-status")
+                    r_pre = conn.getresponse()
+                    pre_data = json.loads(r_pre.read().decode("utf-8"))
+                    self.assertEqual(r_pre.status, 200)
+                    self.assertEqual(pre_data["priority_cached"], 1)
+
+                    # 5. Byte-Range /api/video HEAD, full GET (200), Partial GET (206), Open-ended (206), 416
+                    conn.request("HEAD", "/api/video")
+                    r_head = conn.getresponse()
+                    r_head.read()
+                    self.assertEqual(r_head.status, 200)
+                    self.assertEqual(r_head.getheader("Accept-Ranges"), "bytes")
+                    self.assertEqual(int(r_head.getheader("Content-Length")), len(vid_bytes))
+
+                    conn.request("GET", "/api/video")
+                    r_full = conn.getresponse()
+                    full_body = r_full.read()
+                    self.assertEqual(r_full.status, 200)
+                    self.assertEqual(r_full.getheader("Accept-Ranges"), "bytes")
+                    self.assertEqual(full_body, vid_bytes)
+
+                    conn.request("GET", "/api/video", headers={"Range": "bytes=0-1023"})
+                    r_part = conn.getresponse()
+                    part_body = r_part.read()
+                    self.assertEqual(r_part.status, 206)
+                    self.assertEqual(
+                        r_part.getheader("Content-Range"),
+                        f"bytes 0-1023/{len(vid_bytes)}",
+                    )
+                    self.assertEqual(part_body, vid_bytes[:1024])
+
+                    conn.request("GET", "/api/video", headers={"Range": "bytes=1024-"})
+                    r_tail = conn.getresponse()
+                    tail_body = r_tail.read()
+                    self.assertEqual(r_tail.status, 206)
+                    self.assertEqual(
+                        r_tail.getheader("Content-Range"),
+                        f"bytes 1024-{len(vid_bytes) - 1}/{len(vid_bytes)}",
+                    )
+                    self.assertEqual(tail_body, vid_bytes[1024:])
+
+                    conn.request("GET", "/api/video", headers={"Range": "bytes=999999999-"})
+                    r_416 = conn.getresponse()
+                    r_416.read()
+                    self.assertEqual(r_416.status, 416)
                 finally:
                     conn.close()
             finally:

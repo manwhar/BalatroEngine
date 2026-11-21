@@ -11,7 +11,8 @@ RunTracker.run_id = nil
 RunTracker._active_pack = nil
 RunTracker.undo_stack = {}
 RunTracker.log_lines = {}
-RunTracker.MAX_UNDO = 25
+RunTracker.MAX_UNDO = 50
+RunTracker._in_undo = false
 
 local function is_revertable_state()
     if not G or not G.GAME or not G.STATES then return false end
@@ -25,33 +26,22 @@ local function is_revertable_state()
 end
 
 local function capture_revert_savetext()
-    if not recursive_table_cull then return nil end
-    local cardAreas = {}
-    for k, v in pairs(G) do
-        if (type(v) == "table") and v.is and v:is(CardArea) then
-            local ser = v:save()
-            if ser then cardAreas[k] = ser end
+    if save_run and STR_PACK then
+        local prev_no_save = G.F_NO_SAVING
+        local prev_fh_run = G.FILE_HANDLER and G.FILE_HANDLER.run
+        local prev_fh_q = G.FILE_HANDLER and G.FILE_HANDLER.update_queued
+        G.F_NO_SAVING = false
+        save_run()
+        G.F_NO_SAVING = prev_no_save
+        if G.FILE_HANDLER then
+            G.FILE_HANDLER.run = prev_fh_run
+            G.FILE_HANDLER.update_queued = prev_fh_q
+        end
+        if G.ARGS and G.ARGS.save_run then
+            return { packed = STR_PACK(G.ARGS.save_run) }
         end
     end
-    local tags = {}
-    if G.GAME and G.GAME.tags then
-        for k, v in ipairs(G.GAME.tags) do
-            if (type(v) == "table") and v.is and v:is(Tag) then
-                local ser = v:save()
-                if ser then tags[k] = ser end
-            end
-        end
-    end
-    return recursive_table_cull{
-        cardAreas = cardAreas,
-        tags = tags,
-        GAME = G.GAME,
-        STATE = G.STATE,
-        ACTION = G.action or nil,
-        BLIND = G.GAME.blind:save(),
-        BACK = G.GAME.selected_back:save(),
-        VERSION = G.VERSION
-    }
+    return nil
 end
 
 local function rewrite_telemetry_logs()
@@ -491,6 +481,9 @@ function RunTracker.snapshot_gamestate(action_name, action_metadata)
 end
 
 function RunTracker.undo_last_action()
+    if RunTracker._in_undo then
+        return false, "Undo already in progress"
+    end
     if not RunTracker.enabled or not G or not G.GAME then
         return false, "No active run"
     end
@@ -509,12 +502,27 @@ function RunTracker.undo_last_action()
     RunTracker.action_step = snap.prev_action_step
     RunTracker._active_pack = nil
 
-    if G.FUNCS and G.FUNCS.start_run then
-        G.FUNCS.start_run(nil, { savetext = snap.savetext })
-    elseif G.start_run then
+    local savetext = (snap.savetext and snap.savetext.packed and STR_UNPACK)
+        and STR_UNPACK(snap.savetext.packed)
+        or snap.savetext
+
+    if G.delete_run and G.start_run then
         if G.E_MANAGER then G.E_MANAGER:clear_queue() end
-        G:delete_run()
-        G:start_run({ savetext = snap.savetext })
+        if G.screenwipe then
+            G.screenwipe:remove()
+            G.screenwipe = nil
+        end
+        RunTracker._in_undo = true
+        local ok, err = pcall(function()
+            G:delete_run()
+            G:start_run({ savetext = savetext })
+        end)
+        RunTracker._in_undo = false
+        if not ok then error(err) end
+    elseif G.FUNCS and G.FUNCS.start_run then
+        RunTracker._in_undo = true
+        G.FUNCS.start_run(nil, { savetext = savetext })
+        RunTracker._in_undo = false
     end
 
     return true, actions_reverted, snap.action_name, snap.prev_action_step
@@ -531,14 +539,19 @@ function RunTracker.hook_actions()
         function Game:start_run(args)
             local is_cv_off = not (G.DATASET_MOD and G.DATASET_MOD.config and G.DATASET_MOD.config.mode and G.DATASET_MOD.config.mode ~= "off")
             local is_fresh_run = not (args and args.savetext)
+            local was_undo = RunTracker._in_undo
             local ret = orig_start_run(self, args)
-            if is_cv_off then
-                if is_fresh_run then
+            if was_undo then
+                RunTracker._active_pack = nil
+            elseif is_fresh_run then
+                RunTracker.undo_stack = {}
+                if is_cv_off then
                     RunTracker.reset()
-                else
-                    RunTracker.run_id = RunTracker.run_id or make_run_id()
-                    RunTracker._active_pack = nil
                 end
+            elseif is_cv_off then
+                RunTracker.undo_stack = {}
+                RunTracker.run_id = RunTracker.run_id or make_run_id()
+                RunTracker._active_pack = nil
             end
             return ret
         end

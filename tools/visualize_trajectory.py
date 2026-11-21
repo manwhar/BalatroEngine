@@ -18,6 +18,7 @@ import argparse
 import copy
 import json
 import mimetypes
+import os
 import re
 import sys
 import threading
@@ -77,10 +78,15 @@ from game.trajectory_codec import (
 
 DEFAULT_TRAJECTORIES_DIR = REPO_ROOT / "output" / "trajectories"
 DEFAULT_VIDEOS_DIR = REPO_ROOT / "assets" / "sample_inputs" / "videos"
+DEFAULT_TELEMETRY_DIRS = (
+    REPO_ROOT / "assets" / "local",
+    REPO_ROOT / "testing" / "telemetry_data",
+)
 TEXTURES_2X_DIR = REPO_ROOT / "balatro_source" / "resources" / "textures" / "2x"
 GAME_LUA_PATH = REPO_ROOT / "balatro_source" / "game.lua"
 
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
+_VIDEO_STREAM_CHUNK_BYTES = 262144
 
 # Verified 2x texture sheet dimensions matching balatro_source/resources/textures/2x/*.png
 SPRITE_SHEETS: dict[str, dict[str, int]] = {
@@ -1591,16 +1597,83 @@ def discover_trajectories(
     return items
 
 
-class VideoFrameCache:
-    """Thread-safe OpenCV VideoCapture wrapper with LRU JPEG byte cache."""
+def discover_telemetry_sources(
+    traj_dir: Path = DEFAULT_TRAJECTORIES_DIR,
+    extra_paths: Sequence[Path | None] = (),
+) -> list[dict[str, Any]]:
+    """Lists available telemetry `.jsonl` and `*_gt_trajectory.json` comparison sources."""
+    candidates: list[Path] = []
+    for p in extra_paths:
+        if p is not None and p.is_file():
+            candidates.append(p)
+    for tdir in DEFAULT_TELEMETRY_DIRS:
+        if tdir.is_dir():
+            candidates.extend(
+                p for p in tdir.iterdir() if p.is_file() and p.suffix.lower() == ".jsonl"
+            )
+    if traj_dir.is_dir():
+        candidates.extend(
+            p
+            for p in traj_dir.iterdir()
+            if p.is_file() and p.name.lower().endswith("_gt_trajectory.json")
+        )
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        balatro_log = Path(appdata) / "Balatro" / "run_telemetry.jsonl"
+        if balatro_log.is_file():
+            candidates.append(balatro_log)
+    root_log = REPO_ROOT / "run_telemetry.jsonl"
+    if root_log.is_file():
+        candidates.append(root_log)
 
-    def __init__(self, video_path: Path | None, max_items: int = 128) -> None:
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in candidates:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp not in seen and rp.is_file():
+            seen.add(rp)
+            unique.append(rp)
+
+    unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    items: list[dict[str, Any]] = []
+    for rp in unique:
+        kind = "jsonl" if rp.suffix.lower() == ".jsonl" else "gt_json"
+        try:
+            rel_label = str(rp.relative_to(REPO_ROOT)).replace("\\", "/")
+        except ValueError:
+            rel_label = rp.name
+        items.append(
+            {
+                "name": rp.name,
+                "label": rel_label,
+                "path": str(rp),
+                "kind": kind,
+                "size_kb": round(rp.stat().st_size / 1024.0, 1),
+            }
+        )
+    return items
+
+
+class VideoFrameCache:
+    """Thread-safe OpenCV VideoCapture wrapper with priority preloading & LRU cache."""
+
+    def __init__(self, video_path: Path | None, max_items: int = 512) -> None:
         self.video_path = video_path
         self.max_items = max(1, max_items)
         self._lock = threading.Lock()
         self._cache: OrderedDict[int, bytes] = OrderedDict()
+        self._pinned_frames: set[int] = set()
         self._cap: Any = None
         self._last_pos: int | None = None
+        self._preload_stop: threading.Event | None = None
+        self._preload_thread: threading.Thread | None = None
+        self._preload_priority_targets: list[int] = []
+        self._preload_all_targets: list[int] = []
+        self._preload_history: list[int] = []
+        self._preload_done: bool = True
         self.meta: dict[str, Any] = {"available": False, "path": None, "filename": None}
         if video_path is not None and video_path.is_file():
             self._init_capture(video_path)
@@ -1626,13 +1699,25 @@ class VideoFrameCache:
             "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
         }
 
+    def _clamp_frame(self, frame_idx: int) -> int:
+        total = self.meta.get("total_frames") or 0
+        return max(0, min(int(frame_idx), total - 1)) if total > 0 else max(0, int(frame_idx))
+
+    def _evict_if_needed(self) -> None:
+        """Evicts oldest non-pinned cached frame while over `max_items` (caller holds `_lock`)."""
+        while len(self._cache) > self.max_items:
+            evict_key = next((k for k in self._cache if k not in self._pinned_frames), None)
+            if evict_key is None:
+                self._cache.popitem(last=False)
+            else:
+                self._cache.pop(evict_key)
+
     def get_frame_jpeg(self, frame_idx: int, quality: int = 88) -> bytes | None:
         """Reads and JPEG-encodes `frame_idx` cleanly with LRU caching."""
         with self._lock:
             if self._cap is None:
                 return None
-            total = self.meta.get("total_frames") or 0
-            clamped = max(0, min(frame_idx, total - 1)) if total > 0 else max(0, frame_idx)
+            clamped = self._clamp_frame(frame_idx)
             cached = self._cache.get(clamped)
             if cached is not None:
                 self._cache.move_to_end(clamped)
@@ -1655,16 +1740,158 @@ class VideoFrameCache:
                 return None
             jpg_bytes = buf.tobytes()
             self._cache[clamped] = jpg_bytes
-            if len(self._cache) > self.max_items:
-                self._cache.popitem(last=False)
+            self._evict_if_needed()
             return jpg_bytes
 
+    def stop_preload(self) -> None:
+        """Signals any running background preloader to stop and waits for exit."""
+        stop_ev = self._preload_stop
+        thread = self._preload_thread
+        if stop_ev is not None:
+            stop_ev.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        self._preload_stop = None
+        self._preload_thread = None
+
+    def start_preload(
+        self,
+        priority_frames: Sequence[int],
+        secondary_frames: Sequence[int] = (),
+        *,
+        quality: int = 88,
+    ) -> None:
+        """Starts background JPEG pre-decoding with `priority_frames` decoded first."""
+        self.stop_preload()
+        if not self.meta.get("available") or self.video_path is None:
+            with self._lock:
+                self._preload_priority_targets = []
+                self._preload_all_targets = []
+                self._preload_history = []
+                self._preload_done = True
+            return
+
+        seen: set[int] = set()
+        priority: list[int] = []
+        for f in priority_frames:
+            cf = self._clamp_frame(f)
+            if cf not in seen:
+                seen.add(cf)
+                priority.append(cf)
+        secondary: list[int] = []
+        for f in secondary_frames:
+            cf = self._clamp_frame(f)
+            if cf not in seen:
+                seen.add(cf)
+                secondary.append(cf)
+
+        ordered = priority + secondary
+        with self._lock:
+            self._pinned_frames = set(priority)
+            self.max_items = max(self.max_items, len(ordered) + 64)
+            self._preload_priority_targets = priority
+            self._preload_all_targets = ordered
+            self._preload_history = []
+            self._preload_done = len(ordered) == 0
+
+        if not ordered:
+            return
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._preload_worker,
+            args=(stop_event, ordered, quality),
+            daemon=True,
+            name="VideoFramePreloader",
+        )
+        self._preload_stop = stop_event
+        self._preload_thread = thread
+        thread.start()
+
+    def _preload_worker(
+        self,
+        stop_event: threading.Event,
+        ordered_frames: list[int],
+        quality: int,
+    ) -> None:
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            with self._lock:
+                self._preload_done = True
+            return
+
+        cap = cv2.VideoCapture(str(self.video_path))
+        if not cap.isOpened():
+            with self._lock:
+                self._preload_done = True
+            return
+
+        last_pos: int | None = None
+        try:
+            for clamped in ordered_frames:
+                if stop_event.is_set():
+                    return
+                with self._lock:
+                    already = clamped in self._cache
+                if already:
+                    with self._lock:
+                        self._preload_history.append(clamped)
+                    continue
+
+                if last_pos != clamped:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, clamped)
+                ok, frame = cap.read()
+                if (not ok or frame is None) and not stop_event.is_set():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, clamped)
+                    ok, frame = cap.read()
+                if stop_event.is_set():
+                    return
+                if not ok or frame is None:
+                    last_pos = None
+                    continue
+
+                last_pos = clamped + 1
+                ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if not ok_enc:
+                    continue
+                jpg_bytes = buf.tobytes()
+                with self._lock:
+                    if clamped not in self._cache:
+                        self._cache[clamped] = jpg_bytes
+                        self._evict_if_needed()
+                    self._preload_history.append(clamped)
+        finally:
+            cap.release()
+            with self._lock:
+                if not stop_event.is_set():
+                    self._preload_done = True
+
+    def preload_status(self) -> dict[str, Any]:
+        with self._lock:
+            p_total = len(self._preload_priority_targets)
+            p_cached = sum(1 for f in self._preload_priority_targets if f in self._cache)
+            a_total = len(self._preload_all_targets)
+            a_cached = sum(1 for f in self._preload_all_targets if f in self._cache)
+            return {
+                "available": bool(self.meta.get("available")),
+                "priority_cached": p_cached,
+                "priority_total": p_total,
+                "total_cached": a_cached,
+                "total_targets": a_total,
+                "done": self._preload_done,
+                "cached_count": len(self._cache),
+                "decoded_order": list(self._preload_history),
+            }
+
     def close(self) -> None:
+        self.stop_preload()
         with self._lock:
             if self._cap is not None:
                 self._cap.release()
                 self._cap = None
             self._cache.clear()
+            self._pinned_frames.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1672,8 +1899,35 @@ class VideoFrameCache:
 # ---------------------------------------------------------------------------
 
 
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parses a single HTTP `Range: bytes=...` header into inclusive `(start, end)`."""
+    if not range_header or "=" not in range_header:
+        return None
+    unit, _, spec = range_header.strip().partition("=")
+    if unit.lower() != "bytes" or "," in spec:
+        return None
+    start_s, _, end_s = spec.strip().partition("-")
+    try:
+        if start_s == "":
+            if end_s == "":
+                return None
+            suffix_len = int(end_s)
+            if suffix_len <= 0 or file_size <= 0:
+                return None
+            start = max(0, file_size - suffix_len)
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start < 0 or end < start or start >= file_size:
+        return None
+    return start, min(end, file_size - 1)
+
+
 class _VisualizerState:
-    """Thread-safe holder for the active trajectory payload, manifest, and video cache."""
+    """Thread-safe holder for the active trajectory payload, manifest, comparison, and video cache."""
 
     def __init__(
         self,
@@ -1682,13 +1936,24 @@ class _VisualizerState:
         video_path: Path | None,
         traj_dir: Path,
         video_dir: Path,
+        telemetry_path: Path | None = None,
+        telemetry_seed: str | None = None,
+        telemetry_run_index: int | None = None,
     ) -> None:
         self.lock = threading.Lock()
         self.traj_dir = traj_dir
         self.video_dir = video_dir
+        self.telemetry_path: Path | None = (
+            telemetry_path.resolve() if telemetry_path is not None else None
+        )
+        self.telemetry_seed = telemetry_seed
+        self.telemetry_run_index = telemetry_run_index
         self.manifest = load_balatro_sprite_manifest()
         self.trajectory_path: Path | None = None
+        self._raw_trajectory_data: dict[str, Any] | None = None
         self.frame_cache: VideoFrameCache | None = None
+        self.comparison: dict[str, Any] | None = None
+        self.comparison_source: str | None = None
         self.payload: dict[str, Any] = {
             "schema_version": None,
             "num_steps": 0,
@@ -1696,12 +1961,46 @@ class _VisualizerState:
             "video": {"available": False},
             "run_stats": [],
             "steps": [],
+            "comparison": None,
         }
         if trajectory_path is not None and trajectory_path.is_file():
-            self.load_trajectory(trajectory_path, explicit_video=video_path)
+            should_compare = self.telemetry_path is not None and self.telemetry_path.is_file()
+            self.load_trajectory(
+                trajectory_path,
+                explicit_video=video_path,
+                start_preload=not should_compare,
+            )
+            if should_compare:
+                self.run_comparison(
+                    self.telemetry_path,
+                    seed=self.telemetry_seed,
+                    run_index=self.telemetry_run_index,
+                )
+
+    def _trigger_frame_preload(self) -> None:
+        with self.lock:
+            cache = self.frame_cache
+            steps = self.payload.get("steps", [])
+            comp = self.comparison
+        if cache is None or not cache.meta.get("available"):
+            return
+        err_indices = set(comp.get("summary", {}).get("error_step_indices", [])) if comp else set()
+        priority: list[int] = []
+        secondary: list[int] = []
+        for idx, st in enumerate(steps):
+            frame_idx = int(st.get("frame_idx") or st.get("state", {}).get("frame_idx") or 0)
+            if idx in err_indices:
+                priority.append(frame_idx)
+            else:
+                secondary.append(frame_idx)
+        cache.start_preload(priority, secondary)
 
     def load_trajectory(
-        self, traj_path: Path, explicit_video: Path | str | None = None
+        self,
+        traj_path: Path,
+        explicit_video: Path | str | None = None,
+        *,
+        start_preload: bool = True,
     ) -> dict[str, Any]:
         traj_path = traj_path.resolve()
         data = json.loads(traj_path.read_text(encoding="utf-8"))
@@ -1710,15 +2009,83 @@ class _VisualizerState:
         new_payload = build_visualization_payload(data, video_info=new_cache.meta)
         new_payload["trajectory_name"] = traj_path.name
         new_payload["trajectory_path"] = str(traj_path)
+        new_payload["comparison"] = None
 
         with self.lock:
             old_cache = self.frame_cache
             self.trajectory_path = traj_path
+            self._raw_trajectory_data = data
             self.frame_cache = new_cache
             self.payload = new_payload
-            if old_cache is not None:
-                old_cache.close()
+            self.comparison = None
+            self.comparison_source = None
+        if old_cache is not None:
+            old_cache.close()
+        if start_preload:
+            self._trigger_frame_preload()
         return new_payload
+
+    def run_comparison(
+        self,
+        source_path: Path | None,
+        *,
+        seed: str | None = None,
+        run_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        if source_path is None:
+            with self.lock:
+                self.comparison = None
+                self.comparison_source = None
+                self.payload["comparison"] = None
+            self._trigger_frame_preload()
+            return None
+
+        resolved = source_path.resolve()
+        with self.lock:
+            raw_data = self._raw_trajectory_data
+            traj_path = self.trajectory_path
+        actual_source = raw_data if raw_data is not None else traj_path
+        if actual_source is None:
+            raise ValueError("No trajectory is currently loaded.")
+
+        from tools.compare_trajectories import compare_trajectories
+
+        report = compare_trajectories(
+            actual_source,
+            resolved,
+            seed=seed,
+            run_index=run_index,
+        )
+        report["source_path"] = str(resolved)
+        report["source_name"] = resolved.name
+
+        with self.lock:
+            self.comparison = report
+            self.comparison_source = str(resolved)
+            self.payload["comparison"] = report
+        self._trigger_frame_preload()
+        return report
+
+    def list_telemetry_sources(self) -> dict[str, Any]:
+        extra = [self.telemetry_path]
+        if self.trajectory_path is not None:
+            p_dir = self.trajectory_path.parent
+            if p_dir.is_dir():
+                for cand in p_dir.iterdir():
+                    if cand.is_file() and (
+                        cand.suffix.lower() == ".jsonl"
+                        or cand.name.lower().endswith("_gt_trajectory.json")
+                    ):
+                        extra.append(cand)
+        items = discover_telemetry_sources(self.traj_dir, extra_paths=extra)
+        with self.lock:
+            active_source = self.comparison_source
+        return {"active_source": active_source, "items": items}
+
+    def get_video_path(self) -> Path | None:
+        with self.lock:
+            cache = self.frame_cache
+            return cache.video_path if cache is not None else None
 
     def list_trajectories(self) -> dict[str, Any]:
         items = discover_trajectories(self.traj_dir, self.video_dir)
@@ -1729,9 +2096,70 @@ class _VisualizerState:
 
     def close(self) -> None:
         with self.lock:
-            if self.frame_cache is not None:
-                self.frame_cache.close()
-                self.frame_cache = None
+            cache = self.frame_cache
+            self.frame_cache = None
+        if cache is not None:
+            cache.close()
+
+
+def _resolve_compare_source(
+    raw_source: str,
+    app_state: _VisualizerState,
+) -> tuple[Path | None, int, str | None]:
+    clean = raw_source.strip()
+    if clean.lower() in ("", "none", "off", "clear"):
+        return None, 200, None
+
+    if ".." in Path(clean).parts:
+        return None, 403, "Forbidden telemetry source path"
+
+    allowed_roots: list[Path] = [REPO_ROOT.resolve(), app_state.traj_dir.resolve()]
+    with app_state.lock:
+        if app_state.trajectory_path is not None:
+            allowed_roots.append(app_state.trajectory_path.parent.resolve())
+        startup_tel = app_state.telemetry_path
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        allowed_roots.append((Path(appdata) / "Balatro").resolve())
+
+    discovered_paths = {
+        Path(it["path"]).resolve() for it in app_state.list_telemetry_sources()["items"]
+    }
+    if startup_tel is not None:
+        discovered_paths.add(startup_tel.resolve())
+
+    cand = Path(clean)
+    if not cand.is_file() and not cand.is_absolute():
+        search_candidates = [REPO_ROOT / clean, app_state.traj_dir / clean]
+        for sdir in (*DEFAULT_TELEMETRY_DIRS, app_state.traj_dir):
+            search_candidates.append(sdir / cand.name)
+        for sc in search_candidates:
+            if sc.is_file():
+                cand = sc
+                break
+
+    try:
+        resolved = cand.resolve()
+    except OSError:
+        return None, 400, f"Invalid telemetry path: {raw_source}"
+
+    if resolved.suffix.lower() not in (".jsonl", ".json"):
+        return None, 403, "Forbidden source file extension"
+
+    is_allowed = resolved in discovered_paths
+    if not is_allowed:
+        for root in allowed_roots:
+            try:
+                resolved.relative_to(root)
+                is_allowed = True
+                break
+            except ValueError:
+                continue
+    if not is_allowed:
+        return None, 403, "Forbidden telemetry source path"
+    if not resolved.is_file():
+        return None, 404, f"Telemetry or GT file not found: {raw_source}"
+    return resolved, 200, None
 
 
 def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False):
@@ -1761,6 +2189,75 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
             raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
             self._send_bytes(status, "application/json; charset=utf-8", raw)
 
+        def _serve_video(self, *, send_body: bool) -> None:
+            video_path = app_state.get_video_path()
+            if video_path is None or not video_path.is_file():
+                if send_body:
+                    self._send_json(404, {"error": "No video loaded for active trajectory"})
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                return
+
+            file_size = video_path.stat().st_size
+            ctype, _ = mimetypes.guess_type(str(video_path))
+            content_type = ctype or "video/mp4"
+            range_hdr = self.headers.get("Range")
+
+            if range_hdr:
+                parsed_range = _parse_range_header(range_hdr, file_size)
+                if parsed_range is None:
+                    self.send_response(416)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = parsed_range
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            else:
+                start = 0
+                length = file_size
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+
+            if not send_body or length == 0:
+                return
+
+            try:
+                with video_path.open("rb") as vf:
+                    vf.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = vf.read(min(_VIDEO_STREAM_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
+
+        def do_HEAD(self) -> None:
+            path = unquote(urlparse(self.path).path)
+            if path == "/api/video":
+                self._serve_video(send_body=False)
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
@@ -1777,6 +2274,55 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
 
             if path == "/api/trajectories":
                 self._send_json(200, app_state.list_trajectories())
+                return
+
+            if path == "/api/telemetry-sources":
+                self._send_json(200, app_state.list_telemetry_sources())
+                return
+
+            if path == "/api/compare":
+                raw_src = qs.get("source", [""])[0]
+                seed_arg = qs.get("seed", [None])[0]
+                run_idx_raw = qs.get("run_index", [None])[0]
+                run_idx_arg = int(run_idx_raw) if run_idx_raw and run_idx_raw.isdigit() else None
+                resolved, status, err_msg = _resolve_compare_source(raw_src, app_state)
+                if status != 200:
+                    self._send_json(status, {"error": err_msg or "Invalid comparison request"})
+                    return
+                try:
+                    report = app_state.run_comparison(
+                        resolved, seed=seed_arg, run_index=run_idx_arg
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(500, {"error": str(exc)})
+                    return
+                self._send_json(200, {"comparison": report})
+                return
+
+            if path == "/api/preload-status":
+                with app_state.lock:
+                    cache = app_state.frame_cache
+                if cache is None:
+                    self._send_json(
+                        200,
+                        {
+                            "available": False,
+                            "priority_cached": 0,
+                            "priority_total": 0,
+                            "total_cached": 0,
+                            "total_targets": 0,
+                            "done": True,
+                            "cached_count": 0,
+                        },
+                    )
+                    return
+                status_payload = cache.preload_status()
+                status_payload.pop("decoded_order", None)
+                self._send_json(200, status_payload)
+                return
+
+            if path == "/api/video":
+                self._serve_video(send_body=True)
                 return
 
             if path == "/api/trajectory":
@@ -1859,6 +2405,9 @@ class TrajectoryVisualizerServer:
         video_path: Path | None = None,
         traj_dir: Path = DEFAULT_TRAJECTORIES_DIR,
         video_dir: Path = DEFAULT_VIDEOS_DIR,
+        telemetry_path: Path | None = None,
+        telemetry_seed: str | None = None,
+        telemetry_run_index: int | None = None,
         host: str = "127.0.0.1",
         port: int = 8765,
         verbose: bool = False,
@@ -1868,6 +2417,9 @@ class TrajectoryVisualizerServer:
             video_path=video_path,
             traj_dir=traj_dir,
             video_dir=video_dir,
+            telemetry_path=telemetry_path,
+            telemetry_seed=telemetry_seed,
+            telemetry_run_index=telemetry_run_index,
         )
         handler = _make_request_handler(self.app_state, verbose=verbose)
         self.httpd = ThreadingHTTPServer((host, port), handler)
@@ -1935,7 +2487,7 @@ def _render_html_page() -> str:
 
   .app-shell {
     display: grid;
-    grid-template-rows: 46px 1fr 64px;
+    grid-template-rows: auto 1fr 64px;
     height: 100vh;
     width: 100vw;
   }
@@ -1943,10 +2495,10 @@ def _render_html_page() -> str:
   /* Header Bar */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 0 12px; gap: 10px;
+    min-height: 46px; padding: 4px 12px; gap: 8px; flex-wrap: wrap; row-gap: 4px;
     background: #101622; border-bottom: 1px solid var(--border);
   }
-  .topbar-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .topbar-group { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
   .brand { font-weight: 700; letter-spacing: 0.4px; color: var(--gold); white-space: nowrap; }
   select, input[type="number"], input[type="text"], button {
     background: var(--panel-alt); color: var(--text); border: 1px solid var(--border);
@@ -2147,11 +2699,41 @@ def _render_html_page() -> str:
     position: relative; width: 100%; aspect-ratio: 16 / 9; background: #05070b;
     display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: zoom-in;
   }
-  .video-stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .video-stage.video-mode { cursor: default; }
+  .video-stage img, .video-stage video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
   .video-toolbar {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
     padding: 4px 8px; background: #101622; border-top: 1px solid var(--border); font-size: 11px;
   }
+  .preload-pill {
+    font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px;
+    background: var(--panel-alt); border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .preload-pill.ready { background: var(--green-bg); border-color: rgba(34,197,94,0.45); color: #86efac; }
+
+  .err-pill-ok { background: var(--green-bg); border-color: rgba(34,197,94,0.5); color: #86efac; }
+  .err-pill-bad { background: var(--red-bg); border-color: rgba(239,68,68,0.65); color: #fecaca; font-weight: 700; }
+  .err-nav-btn { background: rgba(127,29,29,0.35); border-color: rgba(239,68,68,0.55); color: #fecaca; }
+  .err-nav-btn:hover { background: rgba(185,28,28,0.55); border-color: #ef4444; }
+  .tab-btn.has-errors { border-color: rgba(239,68,68,0.65); color: #fca5a5; }
+  .tab-btn.has-errors.active { background: #5c1922; border-color: #ef4444; color: #fff; }
+  .err-banner {
+    margin-top: 6px; padding: 6px 8px; border-radius: 5px;
+    background: rgba(127, 29, 29, 0.25); border: 1px solid rgba(239, 68, 68, 0.55);
+    font-size: 11.5px; color: #fecaca;
+  }
+  .err-row {
+    padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px;
+    background: var(--panel-alt); margin-bottom: 5px; cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+  }
+  .err-row:hover { border-color: #ef4444; background: rgba(127, 29, 29, 0.22); }
+  .err-row.active { border-color: var(--red); background: rgba(239, 68, 68, 0.16); box-shadow: 0 0 0 1px rgba(239,68,68,0.4); }
+  .err-chip {
+    padding: 2px 7px; border-radius: 12px; font-size: 10.5px; font-weight: 700;
+    background: var(--panel-alt); border: 1px solid var(--border); color: var(--muted);
+  }
+  .err-chip.active { background: rgba(239,68,68,0.22); border-color: var(--red); color: #fecaca; }
 
   .tab-bar { display: flex; gap: 4px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
   .tab-btn {
@@ -2178,10 +2760,15 @@ def _render_html_page() -> str:
     border-radius: 4px; cursor: pointer; display: flex; align-items: flex-end; overflow: hidden;
   }
   .scrub-tick {
-    flex: 1; height: 100%; min-width: 1px; border-right: 1px solid rgba(0,0,0,0.25);
+    position: relative; flex: 1; height: 100%; min-width: 1px; border-right: 1px solid rgba(0,0,0,0.25);
     display: flex; align-items: flex-end;
   }
   .scrub-tick-bar { width: 100%; transition: opacity 0.1s; }
+  .scrub-err-mark {
+    position: absolute; top: 0; left: 0; right: 0; height: 5px;
+    background: #ef4444; box-shadow: 0 0 4px rgba(239, 68, 68, 0.9);
+    pointer-events: none; z-index: 2;
+  }
   .scrub-playhead {
     position: absolute; top: 0; bottom: 0; width: 3px; background: #fff;
     box-shadow: 0 0 6px #fff; pointer-events: none; z-index: 4;
@@ -2224,13 +2811,20 @@ def _render_html_page() -> str:
   <header class="topbar">
     <div class="topbar-group">
       <span class="brand">BALATRO TRAJECTORY</span>
-      <select id="trajSelect" title="Switch trajectory JSON"></select>
+      <select id="trajSelect" title="Switch trajectory JSON" style="max-width:210px;"></select>
       <div id="runMetaBadges" class="topbar-group"></div>
     </div>
 
     <div class="topbar-group">
+      <select id="telemetrySelect" title="Compare active run against ground-truth telemetry (.jsonl) or GT trajectory (.json)" style="max-width:175px;">
+        <option value="">Compare: None</option>
+      </select>
+      <span id="compareStatusPill" class="meta-pill" style="display:none; cursor:pointer;" title="Open Errors inspector tab"></span>
+      <button id="btnPrevErr" class="err-nav-btn" style="display:none;" title="Jump to previous test error ([)">&lt; Err</button>
+      <button id="btnNextErr" class="err-nav-btn" style="display:none;" title="Jump to next test error (])">Err &gt;</button>
       <select id="filterSelect" title="Filter Prev/Next navigation">
         <option value="all">Filter: All Steps</option>
+        <option value="test_errors">Test Errors Only</option>
         <option value="changed">Changed Only</option>
         <option value="play_discard">Play / Discard</option>
         <option value="shop_pack">Shop / Pack</option>
@@ -2287,15 +2881,23 @@ def _render_html_page() -> str:
         <div id="videoStage" class="video-stage" title="Click to enlarge video frame">
           <span id="videoPlaceholder" style="color:var(--muted);">No video matched</span>
           <img id="videoImg" alt="VOD frame" style="display:none;" />
+          <video id="videoPlayer" controls preload="metadata" style="display:none;"></video>
         </div>
         <div class="video-toolbar">
-          <span id="videoCaption">Frame -</span>
-          <div style="display:flex; gap:4px;">
-            <button data-nudge="-5">-5f</button>
-            <button data-nudge="-1">-1f</button>
-            <button data-nudge="0">Reset</button>
-            <button data-nudge="1">+1f</button>
-            <button data-nudge="5">+5f</button>
+          <div style="display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden;">
+            <span id="videoCaption" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Frame -</span>
+            <span id="preloadBadge" class="preload-pill" style="display:none;"></span>
+          </div>
+          <div style="display:flex; align-items:center; gap:4px; flex-shrink:0;">
+            <button id="btnVideoMode" title="Toggle between frame screenshots and HTML5 video player (V)">Video Player</button>
+            <button id="btnSyncVideo" style="display:none;" title="Seek video player to current step timestamp">Sync</button>
+            <span id="frameNudgeGroup" style="display:flex; gap:4px;">
+              <button data-nudge="-5">-5f</button>
+              <button data-nudge="-1">-1f</button>
+              <button data-nudge="0">Reset</button>
+              <button data-nudge="1">+1f</button>
+              <button data-nudge="5">+5f</button>
+            </span>
           </div>
         </div>
       </div>
@@ -2308,6 +2910,7 @@ def _render_html_page() -> str:
           <button class="tab-btn" data-tab="hands">Poker Hands</button>
           <button class="tab-btn" data-tab="piles">Piles</button>
           <button class="tab-btn" data-tab="raw">Modifiers / Raw</button>
+          <button class="tab-btn" data-tab="errors" id="tabBtnErrors">Errors</button>
         </div>
         <div id="tabBody" class="tab-body"></div>
       </div>
@@ -2318,8 +2921,9 @@ def _render_html_page() -> str:
   <footer class="timeline-bar">
     <div id="scrubberTrack" class="scrubber-track"></div>
     <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
-      <span id="timelineHoverInfo">Hover or drag timeline to scrub steps &nbsp;|&nbsp; Shortcuts: &larr;/&rarr; Step, Space Play, D Deck, 1-4 Tabs</span>
+      <span id="timelineHoverInfo">Hover or drag timeline to scrub steps &nbsp;|&nbsp; Shortcuts: &larr;/&rarr; Step, [ / ] Err, V Video, Space Play, D Deck, 1-5 Tabs</span>
       <span id="timelineLocationLegend">
+        <span id="legendErrItem" style="color:#ef4444; display:none;">&#9632; Test Error &nbsp;</span>
         <span style="color:#60a5fa;">&#9632; Blind</span> &nbsp;
         <span style="color:#f59e0b;">&#9632; Shop</span> &nbsp;
         <span style="color:#c084fc;">&#9632; Pack</span> &nbsp;
@@ -2381,10 +2985,14 @@ const APP = {
   manifest: null,
   payload: null,
   trajectories: null,
+  telemetrySources: null,
   stepIdx: 0,
   frameOffset: 0,
   activeTab: "diff",
+  errorCategoryFilter: "all",
+  videoMode: "frame",
   playTimer: null,
+  preloadTimer: null,
 };
 
 function esc(v) {
@@ -2577,14 +3185,83 @@ function renderSmallDeckCardHtml(pc, { cls = "", cornerBadge = "", extraSub = ""
   </div>`;
 }
 
+function getErrorStepIndices() {
+  return APP.payload?.comparison?.summary?.error_step_indices || [];
+}
+
+function getStepDiscrepancies(stepIdx) {
+  return APP.payload?.comparison?.steps_by_actual_idx?.[String(stepIdx)] || [];
+}
+
+function setActiveTab(tabName) {
+  APP.activeTab = tabName;
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tabName));
+  const st = APP.payload?.steps?.[APP.stepIdx];
+  if (st) renderActiveTab(st);
+}
+
+function renderComparisonChrome() {
+  const comp = APP.payload?.comparison;
+  const pill = document.getElementById("compareStatusPill");
+  const prevErrBtn = document.getElementById("btnPrevErr");
+  const nextErrBtn = document.getElementById("btnNextErr");
+  const tabErrBtn = document.getElementById("tabBtnErrors");
+  const legendErr = document.getElementById("legendErrItem");
+
+  if (!comp) {
+    pill.style.display = "none";
+    prevErrBtn.style.display = "none";
+    nextErrBtn.style.display = "none";
+    legendErr.style.display = "none";
+    tabErrBtn.textContent = "Errors";
+    tabErrBtn.classList.remove("has-errors");
+    return;
+  }
+
+  const sm = comp.summary || {};
+  const errCount = sm.error_step_count || 0;
+  pill.style.display = "inline-flex";
+  if (errCount === 0) {
+    pill.className = "meta-pill err-pill-ok";
+    pill.textContent = "✓ 0 Errors";
+    prevErrBtn.style.display = "none";
+    nextErrBtn.style.display = "none";
+    legendErr.style.display = "none";
+    tabErrBtn.textContent = "Errors (0)";
+    tabErrBtn.classList.remove("has-errors");
+  } else {
+    pill.className = "meta-pill err-pill-bad";
+    pill.textContent = `✕ ${errCount} Error Step${errCount === 1 ? "" : "s"}`;
+    prevErrBtn.style.display = "inline-block";
+    nextErrBtn.style.display = "inline-block";
+    legendErr.style.display = "inline";
+    tabErrBtn.textContent = `Errors (${errCount})`;
+    tabErrBtn.classList.add("has-errors");
+  }
+}
+
+function stepErrorRelative(delta) {
+  const errs = getErrorStepIndices();
+  if (!errs.length) return;
+  if (delta > 0) {
+    const next = errs.find(idx => idx > APP.stepIdx);
+    goToStep(next !== undefined ? next : errs[0]);
+  } else {
+    const prev = [...errs].reverse().find(idx => idx < APP.stepIdx);
+    goToStep(prev !== undefined ? prev : errs[errs.length - 1]);
+  }
+}
+
 function getFilteredSteps() {
   const steps = APP.payload?.steps || [];
   const mode = document.getElementById("filterSelect").value;
   if (mode === "all") return steps.map((_, i) => i);
+  const errSet = new Set(getErrorStepIndices());
   return steps.reduce((acc, st, i) => {
     const t = st.action?.type || "";
     const d = st.diff || {};
-    if (mode === "changed" && d.has_changes) acc.push(i);
+    if (mode === "test_errors" && errSet.has(i)) acc.push(i);
+    else if (mode === "changed" && d.has_changes) acc.push(i);
     else if (mode === "play_discard" && (t === "Play Hand" || t === "Discard")) acc.push(i);
     else if (mode === "shop_pack" && ["shop", "pack"].includes(st.state.location)) acc.push(i);
     else if (mode === "blind_round" && (["Select Blind", "Skip Blind", "End Round", "Cash Out", "Next Round"].includes(t))) acc.push(i);
@@ -2804,8 +3481,9 @@ function renderAll() {
   `;
 
   // RIGHT: VIDEO, ACTION, TABS
+  renderComparisonChrome();
   renderVideoFrame(st.frame_idx, st.timestamp);
-  renderActionPanel(step.action);
+  renderActionPanel(step.action, APP.stepIdx);
   renderActiveTab(step);
   renderScrubber();
 
@@ -3016,28 +3694,93 @@ function renderMiddleStage(st, diff, act) {
   `;
 }
 
+function computeStepVideoTime(baseFrameIdx, timestamp) {
+  const vMeta = APP.payload?.video;
+  const targetFrame = Math.max(0, (baseFrameIdx || 0) + APP.frameOffset);
+  const fps = vMeta?.fps || 60;
+  if (fps > 0 && targetFrame > 0) return targetFrame / fps;
+  return timestamp || 0;
+}
+
+function toggleVideoMode() {
+  APP.videoMode = APP.videoMode === "video" ? "frame" : "video";
+  const btn = document.getElementById("btnVideoMode");
+  btn.textContent = APP.videoMode === "video" ? "Frame View" : "Video Player";
+  btn.classList.toggle("active-toggle", APP.videoMode === "video");
+  const st = APP.payload?.steps?.[APP.stepIdx]?.state;
+  renderVideoFrame(st?.frame_idx || 0, st?.timestamp || 0);
+}
+
+function seekVideoPlayerToStep() {
+  const videoEl = document.getElementById("videoPlayer");
+  const st = APP.payload?.steps?.[APP.stepIdx]?.state;
+  if (!st || !APP.payload?.video?.available) return;
+  const syncTime = computeStepVideoTime(st.frame_idx, st.timestamp);
+  videoEl.dataset.pendingSeek = String(syncTime);
+  if (videoEl.readyState >= 1) {
+    try { videoEl.currentTime = syncTime; } catch (e) {}
+  }
+}
+
 function renderVideoFrame(baseFrameIdx, timestamp) {
   const vMeta = APP.payload?.video;
+  const stageEl = document.getElementById("videoStage");
   const imgEl = document.getElementById("videoImg");
+  const videoEl = document.getElementById("videoPlayer");
   const phEl = document.getElementById("videoPlaceholder");
+  const nudgeEl = document.getElementById("frameNudgeGroup");
+  const syncBtn = document.getElementById("btnSyncVideo");
   const targetFrame = Math.max(0, (baseFrameIdx || 0) + APP.frameOffset);
   const offLabel = APP.frameOffset ? ` (${APP.frameOffset > 0 ? "+" : ""}${APP.frameOffset}f)` : "";
-  document.getElementById("videoCaption").textContent =
-    `Frame ${targetFrame}${offLabel} (click moment)  |  t = ${(timestamp || 0).toFixed(2)}s`;
+  const syncTime = computeStepVideoTime(baseFrameIdx, timestamp);
 
   if (!vMeta || !vMeta.available) {
+    document.getElementById("videoCaption").textContent =
+      `Frame ${targetFrame}${offLabel}  |  t = ${(timestamp || 0).toFixed(2)}s`;
     imgEl.style.display = "none";
+    if (!videoEl.paused) videoEl.pause();
+    videoEl.style.display = "none";
     phEl.style.display = "block";
     phEl.textContent = "No matched video file";
     return;
   }
+
+  phEl.style.display = "none";
+  if (APP.videoMode === "video") {
+    stageEl.classList.add("video-mode");
+    stageEl.title = "";
+    imgEl.style.display = "none";
+    nudgeEl.style.display = "none";
+    syncBtn.style.display = "inline-block";
+    videoEl.style.display = "block";
+    document.getElementById("videoCaption").textContent =
+      `Video @ ${syncTime.toFixed(2)}s (Frame ${targetFrame})`;
+    const videoUrl = `/api/video?traj=${encodeURIComponent(APP.payload?.trajectory_name || "active")}`;
+    videoEl.dataset.pendingSeek = String(syncTime);
+    if (videoEl.dataset.srcUrl !== videoUrl) {
+      videoEl.dataset.srcUrl = videoUrl;
+      videoEl.src = videoUrl;
+    } else if (videoEl.readyState >= 1) {
+      try { videoEl.currentTime = syncTime; } catch (e) {}
+    }
+    return;
+  }
+
+  stageEl.classList.remove("video-mode");
+  stageEl.title = "Click to enlarge video frame";
+  if (!videoEl.paused) videoEl.pause();
+  videoEl.style.display = "none";
+  nudgeEl.style.display = "flex";
+  syncBtn.style.display = "none";
+  document.getElementById("videoCaption").textContent =
+    `Frame ${targetFrame}${offLabel} (click moment)  |  t = ${(timestamp || 0).toFixed(2)}s`;
+
   const url = `/api/frame/${targetFrame}`;
   if (imgEl.dataset.srcUrl !== url) {
     imgEl.dataset.srcUrl = url;
     imgEl.src = url;
   }
   imgEl.style.display = "block";
-  phEl.style.display = "none";
   if (document.getElementById("videoModal").classList.contains("open")) {
     document.getElementById("videoModalImg").src = url;
     document.getElementById("videoModalCaption").textContent =
@@ -3045,10 +3788,22 @@ function renderVideoFrame(baseFrameIdx, timestamp) {
   }
 }
 
-function renderActionPanel(act) {
+function renderActionPanel(act, stepIdx) {
   const el = document.getElementById("actionPanel");
+  const discs = getStepDiscrepancies(stepIdx);
+  const discHtml = discs.length
+    ? `<div class="err-banner">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+          <strong>${discs.length} Discrepanc${discs.length === 1 ? "y" : "ies"} on Step ${stepIdx}</strong>
+          <button style="padding:1px 6px;font-size:10px;" onclick="setActiveTab('errors')">Details</button>
+        </div>
+        ${discs.slice(0, 3).map(d => `<div style="margin-top:2px;">&bull; <span class="badge badge-red">${esc(d.category)}</span> ${esc(d.message)}</div>`).join("")}
+        ${discs.length > 3 ? `<div style="margin-top:2px;color:#fca5a5;">+ ${discs.length - 3} more in Errors tab</div>` : ""}
+      </div>`
+    : "";
+
   if (!act) {
-    el.innerHTML = `<div class="section-title">Action</div><div style="color:var(--muted);">Initial step (no action)</div>`;
+    el.innerHTML = `<div class="section-title">Action</div><div style="color:var(--muted);">Initial step (no action)</div>${discHtml}`;
     return;
   }
   const ti = act.target_item;
@@ -3083,6 +3838,7 @@ function renderActionPanel(act) {
     ${targetHtml}
     ${orderNotes.length ? `<div style="font-size:11px;color:var(--muted);margin-top:4px;">${esc(orderNotes.join("  |  "))}</div>` : ""}
     ${act.metadata?.hud_ocr ? `<div style="font-size:11px;color:#94a3b8;margin-top:4px;">OCR: ${esc(JSON.stringify(act.metadata.hud_ocr))}</div>` : ""}
+    ${discHtml}
   `;
 }
 
@@ -3157,6 +3913,76 @@ function renderActiveTab(step) {
       misc: { tarots_used: st.tarots_used, unused_discards: st.unused_discards, ectoplasm_minus: st.ectoplasm_minus, gros_michel_extinct: st.gros_michel_extinct, last_tarot_planet: st.last_tarot_planet, unique_planets_used: st.unique_planets_used, pending_cv_checks: st.pending_cv_checks },
     };
     body.innerHTML = `<pre style="margin:0;font-size:11px;white-space:pre-wrap;color:#cbd5e1;">${esc(JSON.stringify(mods, null, 2))}</pre>`;
+    return;
+  }
+
+  if (APP.activeTab === "errors") {
+    const comp = APP.payload?.comparison;
+    if (!comp) {
+      body.innerHTML = `<div style="color:var(--muted);padding:10px;line-height:1.5;">
+        No ground-truth comparison loaded.<br/>
+        Choose a telemetry <code>.jsonl</code> or GT <code>_trajectory.json</code> in the topbar <strong>Compare</strong> selector, or launch with <code>--telemetry path/to/run_telemetry.jsonl</code>.
+      </div>`;
+      return;
+    }
+    const sm = comp.summary || {};
+    const warnHtml = (comp.warnings || []).map(w => `<div class="err-banner" style="margin-top:0;margin-bottom:6px;background:rgba(245,158,11,0.14);border-color:rgba(245,158,11,0.5);color:#fde68a;">${esc(w)}</div>`).join("");
+    const statsHtml = `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px;">
+      <span class="badge ${sm.error_step_count ? "badge-red" : "badge-green"}">Err Steps: ${sm.error_step_count || 0}</span>
+      <span class="badge badge-muted">Diffs: ${sm.total_discrepancies || 0}</span>
+      <span class="badge badge-blue">Aligned: ${sm.aligned_pairs || 0}</span>
+      <span class="badge badge-muted">Miss GT: ${sm.missing_actions || 0}</span>
+      <span class="badge badge-muted">Extra: ${sm.extra_actions || 0}</span>
+      <span class="badge badge-muted">Suppressed: ${sm.suppressed_cascades || 0}</span>
+    </div>`;
+
+    const cats = Object.entries(sm.by_category || {});
+    const chipsHtml = cats.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;">
+          <button class="err-chip ${APP.errorCategoryFilter === "all" ? "active" : ""}" onclick="APP.errorCategoryFilter='all'; renderActiveTab(APP.payload.steps[APP.stepIdx]);">All (${sm.error_step_count || 0})</button>
+          ${cats.map(([cat, cnt]) => `<button class="err-chip ${APP.errorCategoryFilter === cat ? "active" : ""}" onclick="APP.errorCategoryFilter='${esc(cat)}'; renderActiveTab(APP.payload.steps[APP.stepIdx]);">${esc(cat)} (${cnt})</button>`).join("")}
+        </div>`
+      : "";
+
+    const curDiscs = getStepDiscrepancies(APP.stepIdx);
+    const curHtml = curDiscs.length
+      ? `<div style="margin-bottom:8px;">
+          <div class="section-title" style="color:#fca5a5;">Current Step ${APP.stepIdx} Discrepancies</div>
+          <table class="compact">
+            <thead><tr><th>Cat</th><th>Expected (GT)</th><th>Actual</th><th>Message</th></tr></thead>
+            <tbody>
+              ${curDiscs.map(d => `<tr class="row-changed">
+                <td><span class="badge badge-red">${esc(d.category)}</span></td>
+                <td><code>${esc(d.expected === null || d.expected === undefined ? "—" : (typeof d.expected === "string" ? d.expected : JSON.stringify(d.expected)))}</code></td>
+                <td><code>${esc(d.actual === null || d.actual === undefined ? "—" : (typeof d.actual === "string" ? d.actual : JSON.stringify(d.actual)))}</code></td>
+                <td>${esc(d.message)}</td>
+              </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>`
+      : "";
+
+    const allErrs = (comp.errors || []).filter(e =>
+      APP.errorCategoryFilter === "all" || (e.categories || []).includes(APP.errorCategoryFilter)
+    );
+    const listHtml = allErrs.length
+      ? allErrs.map(e => {
+          const isCur = e.actual_step_idx === APP.stepIdx;
+          const catBadges = (e.categories || []).map(c => `<span class="badge badge-red">${esc(c)}</span>`).join(" ");
+          const firstMsg = e.discrepancies?.[0]?.message || "";
+          const moreCount = (e.discrepancies?.length || 0) - 1;
+          return `<div class="err-row ${isCur ? "active" : ""}" onclick="goToStep(${e.actual_step_idx})">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:3px;">
+              <strong>Step ${e.actual_step_idx}${e.expected_step_idx !== null && e.expected_step_idx !== undefined ? ` <span style="color:var(--muted);font-weight:400;">(GT ${e.expected_step_idx})</span>` : ""}</strong>
+              <span style="font-size:10.5px;color:var(--muted);">f=${e.frame_idx} &bull; A${e.ante}R${e.round} &bull; ${esc(e.action_type)}</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:3px;">${catBadges}</div>
+            <div style="font-size:11px;color:#e2e8f0;">${esc(firstMsg)}${moreCount > 0 ? ` <span style="color:var(--muted);">(+${moreCount} more)</span>` : ""}</div>
+          </div>`;
+        }).join("")
+      : `<div style="color:#86efac;padding:8px;">No discrepancies${APP.errorCategoryFilter !== "all" ? ` in category "${esc(APP.errorCategoryFilter)}"` : ""} — trajectory matches ground truth!</div>`;
+
+    body.innerHTML = `${warnHtml}${statsHtml}${chipsHtml}${curHtml}<div class="section-title">All Error Steps (${allErrs.length})</div>${listHtml}`;
   }
 }
 
@@ -3164,6 +3990,7 @@ function renderScrubber() {
   const stats = APP.payload?.run_stats || [];
   const track = document.getElementById("scrubberTrack");
   const colors = { blind: "#3b82f6", shop: "#f59e0b", pack: "#c084fc", select: "#22c55e" };
+  const errSet = new Set(getErrorStepIndices());
   let html = "";
   let lastAnte = null;
   for (let i = 0; i < stats.length; i++) {
@@ -3171,7 +3998,9 @@ function renderScrubber() {
     const hPct = r.has_changes ? "85%" : "42%";
     const anteBorder = (lastAnte !== null && r.ante !== lastAnte) ? "border-left:2px solid #fff;" : "";
     lastAnte = r.ante;
+    const errMark = errSet.has(i) ? `<div class="scrub-err-mark"></div>` : "";
     html += `<div class="scrub-tick" data-step="${i}" style="${anteBorder}">
+      ${errMark}
       <div class="scrub-tick-bar" style="height:${hPct};background:${colors[r.location] || "#64748b"};opacity:${i === APP.stepIdx ? 1 : 0.72};"></div>
     </div>`;
   }
@@ -3333,24 +4162,93 @@ function togglePlay() {
   }, speed);
 }
 
+function stopPreloadPolling() {
+  if (APP.preloadTimer) {
+    clearInterval(APP.preloadTimer);
+    APP.preloadTimer = null;
+  }
+}
+
+async function pollPreloadStatusOnce() {
+  const badge = document.getElementById("preloadBadge");
+  try {
+    const resp = await fetch("/api/preload-status");
+    if (!resp.ok) return;
+    const s = await resp.json();
+    if (!s.available) {
+      badge.style.display = "none";
+      stopPreloadPolling();
+      return;
+    }
+    badge.style.display = "inline-block";
+    if (s.priority_total > 0 && s.priority_cached < s.priority_total) {
+      badge.className = "preload-pill";
+      badge.textContent = `Err frames: ${s.priority_cached}/${s.priority_total}`;
+    } else if (!s.done) {
+      badge.className = "preload-pill";
+      badge.textContent = s.priority_total > 0
+        ? `✓ Err cached (${s.priority_cached}/${s.priority_total}) · ${s.total_cached}/${s.total_targets}`
+        : `Caching: ${s.total_cached}/${s.total_targets}`;
+    } else {
+      badge.className = "preload-pill ready";
+      badge.textContent = s.priority_total > 0
+        ? `✓ ${s.priority_cached}/${s.priority_total} err + ${s.total_cached} frames`
+        : `✓ ${s.total_cached} frames`;
+      stopPreloadPolling();
+    }
+  } catch (e) {}
+}
+
+function startPreloadPolling() {
+  stopPreloadPolling();
+  pollPreloadStatusOnce();
+  APP.preloadTimer = setInterval(pollPreloadStatusOnce, 750);
+}
+
+async function runComparisonBySource(sourcePath) {
+  const q = sourcePath ? `?source=${encodeURIComponent(sourcePath)}` : "?source=none";
+  const resp = await fetch(`/api/compare${q}`);
+  const data = await resp.json();
+  if (!resp.ok) {
+    alert(`Comparison failed: ${data.error || resp.status}`);
+    return;
+  }
+  APP.payload.comparison = data.comparison || null;
+  APP.errorCategoryFilter = "all";
+  if ((data.comparison?.summary?.error_step_count || 0) > 0) {
+    APP.activeTab = "errors";
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === "errors"));
+  }
+  renderAll();
+  startPreloadPolling();
+}
+
 async function loadTrajectoryByName(name) {
+  const videoEl = document.getElementById("videoPlayer");
+  if (!videoEl.paused) videoEl.pause();
+  videoEl.dataset.srcUrl = "";
   const q = name ? `?name=${encodeURIComponent(name)}` : "";
   const resp = await fetch(`/api/trajectory${q}`);
   APP.payload = await resp.json();
   APP.stepIdx = 0;
   APP.frameOffset = 0;
+  APP.errorCategoryFilter = "all";
+  document.getElementById("telemetrySelect").value = "";
   renderAll();
+  startPreloadPolling();
 }
 
 async function init() {
-  const [manifestResp, listResp, trajResp] = await Promise.all([
+  const [manifestResp, listResp, trajResp, telResp] = await Promise.all([
     fetch("/api/manifest"),
     fetch("/api/trajectories"),
     fetch("/api/trajectory"),
+    fetch("/api/telemetry-sources"),
   ]);
   APP.manifest = await manifestResp.json();
   APP.trajectories = await listResp.json();
   APP.payload = await trajResp.json();
+  APP.telemetrySources = await telResp.json();
 
   const sel = document.getElementById("trajSelect");
   const items = APP.trajectories.items || [];
@@ -3358,7 +4256,28 @@ async function init() {
     ? items.map(it => `<option value="${esc(it.name)}" ${it.name === APP.trajectories.active_name ? "selected" : ""}>${esc(it.name)} (${it.size_kb} KB${it.video ? " + MP4" : ""})</option>`).join("")
     : `<option value="">Current In-Memory Trajectory</option>`;
 
+  const telSel = document.getElementById("telemetrySelect");
+  const telItems = APP.telemetrySources.items || [];
+  const activeTel = APP.telemetrySources.active_source || APP.payload?.comparison?.source_path || "";
+  telSel.innerHTML = `<option value="">Compare: None</option>`
+    + telItems.map(it => `<option value="${esc(it.path)}" ${it.path === activeTel ? "selected" : ""}>${esc(it.label)} (${it.size_kb} KB)</option>`).join("");
+
+  const videoEl = document.getElementById("videoPlayer");
+  videoEl.addEventListener("loadedmetadata", () => {
+    const t = Number(videoEl.dataset.pendingSeek);
+    if (Number.isFinite(t)) {
+      try { videoEl.currentTime = t; } catch (e) {}
+    }
+  });
+
   sel.addEventListener("change", () => { if (sel.value) loadTrajectoryByName(sel.value); });
+  telSel.addEventListener("change", () => runComparisonBySource(telSel.value));
+  document.getElementById("compareStatusPill").addEventListener("click", () => setActiveTab("errors"));
+  document.getElementById("btnPrevErr").addEventListener("click", () => stepErrorRelative(-1));
+  document.getElementById("btnNextErr").addEventListener("click", () => stepErrorRelative(1));
+  document.getElementById("btnVideoMode").addEventListener("click", toggleVideoMode);
+  document.getElementById("btnSyncVideo").addEventListener("click", seekVideoPlayerToStep);
+
   document.getElementById("btnFirst").addEventListener("click", () => goToStep(0));
   document.getElementById("btnLast").addEventListener("click", () => goToStep((APP.payload?.steps?.length || 1) - 1));
   document.getElementById("btnPrev").addEventListener("click", () => stepRelative(-1));
@@ -3371,12 +4290,7 @@ async function init() {
   });
 
   document.querySelectorAll(".tab-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      APP.activeTab = btn.dataset.tab;
-      document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
-      const st = APP.payload?.steps?.[APP.stepIdx];
-      if (st) renderActiveTab(st);
-    });
+    btn.addEventListener("click", () => setActiveTab(btn.dataset.tab));
   });
 
   document.querySelectorAll("[data-nudge]").forEach(btn => {
@@ -3402,10 +4316,13 @@ async function init() {
     if (dragging) scrubFromClientX(e.clientX);
     const tick = e.target?.closest?.(".scrub-tick");
     if (tick) {
-      const r = APP.payload?.run_stats?.[Number(tick.dataset.step)];
+      const sIdx = Number(tick.dataset.step);
+      const r = APP.payload?.run_stats?.[sIdx];
       if (r) {
+        const discs = getStepDiscrepancies(sIdx);
+        const errText = discs.length ? `  |  ✕ ${discs.length} error(s): ${discs[0].message}` : "";
         document.getElementById("timelineHoverInfo").textContent =
-          `Step ${r.step_idx} | Frame ${r.frame_idx} | ${r.action_type} | Ante ${r.ante} R${r.round} | $${r.money ?? "—"}`;
+          `Step ${r.step_idx} | Frame ${r.frame_idx} | ${r.action_type} | Ante ${r.ante} R${r.round} | $${r.money ?? "—"}${errText}`;
       }
     }
   });
@@ -3428,8 +4345,9 @@ async function init() {
       `Card #${c.id}: ${c.rank} of ${c.suit} | Zone: ${c.zone} | Enh: ${c.enhancement || "none"} | Seal: ${c.seal || "none"} | Ed: ${c.edition || "none"} | +Chips: ${c.bonus_chips || 0}${modStr}${zoneStr}`;
   });
 
-  // Video Zoom Modal
+  // Video Zoom Modal (Frame mode only so native video controls stay clickable)
   document.getElementById("videoStage").addEventListener("click", () => {
+    if (APP.videoMode !== "frame") return;
     if (!APP.payload?.video?.available) return;
     document.getElementById("videoModal").classList.add("open");
     const st = APP.payload.steps[APP.stepIdx].state;
@@ -3444,6 +4362,9 @@ async function init() {
     if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target?.tagName)) return;
     if (e.key === "ArrowRight") { e.preventDefault(); stepRelative(1); }
     else if (e.key === "ArrowLeft") { e.preventDefault(); stepRelative(-1); }
+    else if (e.key === "]") { e.preventDefault(); stepErrorRelative(1); }
+    else if (e.key === "[") { e.preventDefault(); stepErrorRelative(-1); }
+    else if (e.key === "v" || e.key === "V") { e.preventDefault(); toggleVideoMode(); }
     else if (e.key === "Home") { e.preventDefault(); goToStep(0); }
     else if (e.key === "End") { e.preventDefault(); goToStep((APP.payload?.steps?.length || 1) - 1); }
     else if (e.key === " ") { e.preventDefault(); togglePlay(); }
@@ -3453,13 +4374,17 @@ async function init() {
     } else if (e.key === "Escape") {
       closeDeckModal();
       document.getElementById("videoModal").classList.remove("open");
-    } else if (["1", "2", "3", "4"].includes(e.key)) {
-      const tabs = ["diff", "hands", "piles", "raw"];
-      document.querySelector(`.tab-btn[data-tab="${tabs[Number(e.key) - 1]}"]`)?.click();
+    } else if (["1", "2", "3", "4", "5"].includes(e.key)) {
+      const tabs = ["diff", "hands", "piles", "raw", "errors"];
+      setActiveTab(tabs[Number(e.key) - 1]);
     }
   });
 
+  if ((APP.payload?.comparison?.summary?.error_step_count || 0) > 0) {
+    setActiveTab("errors");
+  }
   renderAll();
+  startPreloadPolling();
 }
 
 init();
@@ -3484,6 +4409,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to *_trajectory.json (defaults to newest JSON in output/trajectories/)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "--gt",
+        dest="telemetry",
+        type=Path,
+        default=None,
+        help="Optional Lua run_telemetry.jsonl or GT *_trajectory.json for non-cascading error checks",
+    )
+    parser.add_argument(
+        "--telemetry-seed",
+        type=str,
+        default=None,
+        help="Optional seed filter when selecting a run from --telemetry .jsonl",
+    )
+    parser.add_argument(
+        "--telemetry-run-index",
+        type=int,
+        default=None,
+        help="Optional 0-based run segment index when loading --telemetry .jsonl",
     )
     parser.add_argument(
         "--video",
@@ -3512,10 +4457,15 @@ def main(argv: list[str] | None = None) -> None:
     traj_path = args.trajectory or _resolve_default_trajectory(DEFAULT_TRAJECTORIES_DIR)
     if traj_path is not None and not traj_path.is_file():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
+    if args.telemetry is not None and not args.telemetry.is_file():
+        raise FileNotFoundError(f"Telemetry/GT file not found: {args.telemetry}")
 
     server = TrajectoryVisualizerServer(
         trajectory_path=traj_path,
         video_path=args.video,
+        telemetry_path=args.telemetry,
+        telemetry_seed=args.telemetry_seed,
+        telemetry_run_index=args.telemetry_run_index,
         host=args.host,
         port=args.port,
         verbose=args.verbose,
@@ -3525,6 +4475,12 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[TrajectoryVisualizer] Loaded trajectory: {traj_path}")
     if server.app_state.frame_cache and server.app_state.frame_cache.meta.get("available"):
         print(f"[TrajectoryVisualizer] Matched video: {server.app_state.frame_cache.meta['filename']}")
+    if server.app_state.comparison is not None:
+        sm = server.app_state.comparison["summary"]
+        print(
+            f"[TrajectoryVisualizer] Ground-truth test: {sm['error_step_count']} error step(s), "
+            f"{sm['total_discrepancies']} discrepancy(ies) ({args.telemetry})"
+        )
 
     if not args.no_browser:
         threading.Timer(0.25, lambda: webbrowser.open(server.url)).start()
