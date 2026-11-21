@@ -74,6 +74,7 @@ from game.engine.rng_sim.rng import BalatroRNG, Tw223, pseudohash, pseudoseed
 from game.engine.rng_sim.state import (
     ALL_POKER_HANDS_ORDER,
     DEFAULT_VISIBLE_POKER_HANDS,
+    LUAJIT_POKER_HANDS_ORDER,
     Card,
     Deck,
     GameState,
@@ -81,6 +82,7 @@ from game.engine.rng_sim.state import (
     SimCard,
     SimDeck,
     SimGameState,
+    order_poker_hands_luajit,
 )
 
 __all__ = [
@@ -104,6 +106,7 @@ __all__ = [
     "Joker",
     "JokerInstance",
     "JokerName",
+    "LUAJIT_POKER_HANDS_ORDER",
     "LuckyHitResult",
     "P_BOSS_BLINDS",
     "P_CARDS_KEYS",
@@ -151,6 +154,7 @@ __all__ = [
     "normalize_tag_key",
     "normalize_tarot_key",
     "normalize_voucher_key",
+    "order_poker_hands_luajit",
     "poll_tarot_pool",
     "predict_cartomancer_tarot",
     "predict_certificate",

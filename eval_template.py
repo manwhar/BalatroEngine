@@ -61,6 +61,11 @@ def eval(
 
     debug_enabled = logger.isEnabledFor(logging.DEBUG)
     info_enabled = logger.isEnabledFor(logging.INFO)
+    eff_conf_thresh = (
+        float(template.conf_threshold)
+        if getattr(template, "conf_threshold", None) is not None
+        else config.elem_conf_thresh
+    )
     specs = template.get_compiled_specs(img_w, img_h, config.expand_roi_factor)
 
     for spec in specs:
@@ -84,7 +89,7 @@ def eval(
                 spec.template_size,
                 config.matching_method,
                 spec.px_roi,
-                config.elem_conf_thresh,
+                eff_conf_thresh,
                 coarse_margin=config.coarse_margin,
             )
             top_left = (match.top_left[0] + x1 + dx, match.top_left[1] + y1 + dy)
@@ -98,7 +103,7 @@ def eval(
                 spec.template_size,
                 config.matching_method,
                 spec.px_roi,
-                config.elem_conf_thresh,
+                eff_conf_thresh,
             )
             top_left = (match.top_left[0] + x1, match.top_left[1] + y1)
 

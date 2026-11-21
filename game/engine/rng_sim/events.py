@@ -37,6 +37,7 @@ from game.engine.rng_sim.state import (
     Voucher,
     VoucherName,
     card_is_rank,
+    order_poker_hands_luajit,
     parse_suit,
     seal_balatro_name,
 )
@@ -606,9 +607,7 @@ def get_to_do_list_hand(
             else list(DEFAULT_VISIBLE_POKER_HANDS)
         )
     )
-    hands_pool: list[PokerHand] = [
-        h if isinstance(h, PokerHand) else PokerHand(str(h)) for h in raw_pool
-    ]
+    hands_pool: list[PokerHand] = order_poker_hands_luajit(raw_pool)
 
     raw_prev = (
         current_hand

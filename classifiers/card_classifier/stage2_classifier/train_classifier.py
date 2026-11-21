@@ -185,7 +185,14 @@ def run_train_classifier(
         for images, targets in _iter_batches(train_dataset, train_loader, shuffle=True):
             images = images.to(device, non_blocking=True)
             if train_dataset.raw_tensor_mode:
-                images = apply_gpu_batch_augmentations(images, is_train=True, compression_prob=0.5, cursor_prob=0.3, color_jitter=True)
+                images = apply_gpu_batch_augmentations(
+                    images,
+                    is_train=True,
+                    compression_prob=0.6,
+                    cursor_prob=0.3,
+                    color_jitter=True,
+                    geom_prob=0.4,
+                )
             if use_amp:
                 images = images.contiguous(memory_format=torch.channels_last)
             targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}

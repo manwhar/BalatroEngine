@@ -113,6 +113,8 @@ class MultiHeadItemClassifier(nn.Module):
             key_logits = logits["key"].masked_fill(self._invalid_key_mask, float("-inf"))
             key_probs = torch.softmax(key_logits, dim=-1)
             key_confs, key_preds = torch.max(key_probs, dim=-1)
+            top_k = min(5, key_probs.size(-1))
+            top_vals, top_idxs = torch.topk(key_probs, k=top_k, dim=-1)
 
             ed_probs = torch.softmax(logits["edition"], dim=-1)
             ed_confs, ed_preds = torch.max(ed_probs, dim=-1)
@@ -127,9 +129,17 @@ class MultiHeadItemClassifier(nn.Module):
             for i in range(x.size(0)):
                 k_idx = key_preds[i].item()
                 e_idx = ed_preds[i].item()
+                top_keys = [
+                    (
+                        IDX_TO_KEY.get(int(top_idxs[i, j].item()), "unknown"),
+                        float(top_vals[i, j].item()),
+                    )
+                    for j in range(top_k)
+                ]
                 results.append({
                     "key": IDX_TO_KEY.get(k_idx, "unknown"),
                     "key_conf": key_confs[i].item(),
+                    "top_keys": top_keys,
                     "edition": IDX_TO_EDITION.get(e_idx, "None"),
                     "edition_conf": ed_confs[i].item(),
                     "eternal": eternal_probs[i].item() > 0.5,

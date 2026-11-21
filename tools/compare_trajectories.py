@@ -737,6 +737,45 @@ def _suppress_property_drift(
     return rem_a, rem_e, suppressed
 
 
+def _filter_collection_cascade(
+    prev_a_c: Counter[Any],
+    curr_a_c: Counter[Any],
+    prev_e_c: Counter[Any],
+    curr_e_c: Counter[Any],
+    *,
+    suppress_rank_suit_drift: bool = False,
+) -> tuple[bool, bool]:
+    """Checks whether a collection transition diff is purely self-correction / pre-existing drift.
+
+    Returns `(has_transition_diff, is_cascaded)`.
+    """
+    a_gain = curr_a_c - prev_a_c
+    a_loss = prev_a_c - curr_a_c
+    e_gain = curr_e_c - prev_e_c
+    e_loss = prev_e_c - curr_e_c
+    if (a_gain, a_loss) == (e_gain, e_loss):
+        return False, False
+
+    prev_missing_in_a = prev_e_c - prev_a_c
+    prev_extra_in_a = prev_a_c - prev_e_c
+
+    extra_a_gain = (a_gain - e_gain) - prev_missing_in_a
+    missing_a_gain = (e_gain - a_gain) - prev_extra_in_a
+    extra_a_loss = (a_loss - e_loss) - prev_extra_in_a
+    missing_a_loss = (e_loss - a_loss) - prev_missing_in_a
+
+    if suppress_rank_suit_drift and prev_extra_in_a and prev_missing_in_a:
+        extra_a_loss, missing_a_loss, _ = _suppress_property_drift(
+            extra_a_loss, missing_a_loss, prev_extra_in_a, prev_missing_in_a
+        )
+        extra_a_gain, missing_a_gain, _ = _suppress_property_drift(
+            extra_a_gain, missing_a_gain, prev_extra_in_a, prev_missing_in_a
+        )
+
+    is_cascade = not (extra_a_gain or missing_a_gain or extra_a_loss or missing_a_loss)
+    return True, is_cascade
+
+
 def _calc_interest(state: GameState) -> int:
     if state.no_interest or state.deck == Deck.GREEN_DECK:
         return 0
@@ -986,6 +1025,7 @@ def _check_aligned_pair(
     prev_a_step: MaterializedStep,
     curr_e_step: MaterializedStep,
     prev_e_step: MaterializedStep,
+    next_a_step: MaterializedStep | None = None,
 ) -> list[Discrepancy]:
     out: list[Discrepancy] = []
     curr_a, prev_a = curr_a_step.state, prev_a_step.state
@@ -1071,16 +1111,23 @@ def _check_aligned_pair(
                         )
                     )
 
-    # 2. Full Deck transition (per-step delta)
-    a_deck_gain = curr_deck_a - prev_deck_a
-    a_deck_loss = prev_deck_a - curr_deck_a
-    e_deck_gain = curr_deck_e - prev_deck_e
-    e_deck_loss = prev_deck_e - curr_deck_e
-    if (a_deck_gain, a_deck_loss) != (e_deck_gain, e_deck_loss):
+    # 2. Full Deck transition (per-step delta with self-correction suppression)
+    has_deck_diff, deck_cascaded = _filter_collection_cascade(
+        prev_deck_a,
+        curr_deck_a,
+        prev_deck_e,
+        curr_deck_e,
+        suppress_rank_suit_drift=True,
+    )
+    if has_deck_diff:
+        a_deck_gain = curr_deck_a - prev_deck_a
+        a_deck_loss = prev_deck_a - curr_deck_a
+        e_deck_gain = curr_deck_e - prev_deck_e
+        e_deck_loss = prev_deck_e - curr_deck_e
         out.append(
             Discrepancy(
                 category="deck",
-                kind="transition_mismatch",
+                kind="drift_reconciliation" if deck_cascaded else "transition_mismatch",
                 field="full_deck_delta",
                 expected=_format_deck_delta(e_deck_gain, e_deck_loss),
                 actual=_format_deck_delta(a_deck_gain, a_deck_loss),
@@ -1088,6 +1135,7 @@ def _check_aligned_pair(
                     f"Deck transition mismatch: expected {_format_deck_delta(e_deck_gain, e_deck_loss)}, "
                     f"actual {_format_deck_delta(a_deck_gain, a_deck_loss)}"
                 ),
+                cascaded=deck_cascaded,
                 expected_step_idx=exp_idx,
                 detail={
                     "expected_deck_size": len(curr_e.full_deck or []),
@@ -1096,7 +1144,7 @@ def _check_aligned_pair(
             )
         )
 
-    # 3. Economy transition (per-step Δmoney + Δreroll_cost)
+    # 3. Economy transition (per-step Δmoney + Δreroll_cost with convergence & timing guards)
     if None not in (prev_a.money, curr_a.money, prev_e.money, curr_e.money):
         dm_a = int(curr_a.money) - int(prev_a.money)
         dm_e = int(curr_e.money) - int(prev_e.money)
@@ -1107,10 +1155,41 @@ def _check_aligned_pair(
                 and int(prev_a.money) != int(prev_e.money)
                 and (dm_a - dm_e) == interest_diff
             )
+            is_self_correction = (
+                int(prev_a.money) != int(prev_e.money)
+                and (
+                    int(curr_a.money) == int(curr_e.money)
+                    or (
+                        dm_e == 0
+                        and abs(int(curr_a.money) - int(curr_e.money))
+                        < abs(int(prev_a.money) - int(prev_e.money))
+                    )
+                )
+            )
+            next_hud_money = (
+                (next_a_step.delta.action.metadata or {}).get("hud_ocr", {}).get("hud_money")
+                if (next_a_step is not None and next_a_step.delta.action is not None)
+                else None
+            )
+            is_hud_timing = (
+                a_type in (ActionType.PLAY_HAND, ActionType.DISCARD, ActionType.END_ROUND)
+                and next_hud_money is not None
+                and int(next_hud_money) == int(curr_e.money)
+            )
+            is_money_cascade = is_interest_cascade or is_self_correction or is_hud_timing
+            kind_str = (
+                "interest_cascade"
+                if is_interest_cascade
+                else (
+                    "self_correction"
+                    if is_self_correction
+                    else ("hud_timing_cascade" if is_hud_timing else "delta_mismatch")
+                )
+            )
             out.append(
                 Discrepancy(
                     category="economy",
-                    kind="interest_cascade" if is_interest_cascade else "delta_mismatch",
+                    kind=kind_str,
                     field="money_delta",
                     expected=dm_e,
                     actual=dm_a,
@@ -1119,22 +1198,24 @@ def _check_aligned_pair(
                         f"actual {_format_signed_delta(dm_a, '$')} "
                         f"(cumulative: actual=${curr_a.money} vs GT=${curr_e.money})"
                     ),
-                    cascaded=is_interest_cascade,
+                    cascaded=is_money_cascade,
                     expected_step_idx=exp_idx,
                 )
             )
 
-    if a_type in (ActionType.REROLL_SHOP, ActionType.CASH_OUT, ActionType.REDEEM_VOUCHER) or (
-        curr_a.reroll_cost != prev_a.reroll_cost or curr_e.reroll_cost != prev_e.reroll_cost
-    ):
+    if a_type == ActionType.REROLL_SHOP:
         if None not in (prev_a.reroll_cost, curr_a.reroll_cost, prev_e.reroll_cost, curr_e.reroll_cost):
             dr_a = int(curr_a.reroll_cost) - int(prev_a.reroll_cost)
             dr_e = int(curr_e.reroll_cost) - int(prev_e.reroll_cost)
             if dr_a != dr_e:
+                is_reroll_cascade = (
+                    int(prev_a.reroll_cost) != int(prev_e.reroll_cost)
+                    and int(curr_a.reroll_cost) == int(curr_e.reroll_cost)
+                )
                 out.append(
                     Discrepancy(
                         category="economy",
-                        kind="delta_mismatch",
+                        kind="self_correction" if is_reroll_cascade else "delta_mismatch",
                         field="reroll_cost_delta",
                         expected=dr_e,
                         actual=dr_a,
@@ -1142,6 +1223,7 @@ def _check_aligned_pair(
                             f"Reroll cost delta mismatch: expected {_format_signed_delta(dr_e, '$')}, "
                             f"actual {_format_signed_delta(dr_a, '$')}"
                         ),
+                        cascaded=is_reroll_cascade,
                         expected_step_idx=exp_idx,
                     )
                 )
@@ -1149,9 +1231,10 @@ def _check_aligned_pair(
     # 4. Inventory transitions (jokers, consumables, vouchers, tags)
     aj_prev, aj_curr = _jokers_counter(prev_a), _jokers_counter(curr_a)
     ej_prev, ej_curr = _jokers_counter(prev_e), _jokers_counter(curr_e)
-    aj_gain, aj_loss = aj_curr - aj_prev, aj_prev - aj_curr
-    ej_gain, ej_loss = ej_curr - ej_prev, ej_prev - ej_curr
-    if (aj_gain, aj_loss) != (ej_gain, ej_loss):
+    has_j_diff, j_cascaded = _filter_collection_cascade(aj_prev, aj_curr, ej_prev, ej_curr)
+    if has_j_diff:
+        aj_gain, aj_loss = aj_curr - aj_prev, aj_prev - aj_curr
+        ej_gain, ej_loss = ej_curr - ej_prev, ej_prev - ej_curr
         exp_desc = (
             f"+{_format_counter_items(ej_gain, _format_joker_sig)} "
             f"-{_format_counter_items(ej_loss, _format_joker_sig)}"
@@ -1163,20 +1246,22 @@ def _check_aligned_pair(
         out.append(
             Discrepancy(
                 category="inventory",
-                kind="transition_mismatch",
+                kind="drift_reconciliation" if j_cascaded else "transition_mismatch",
                 field="jokers_delta",
                 expected=exp_desc,
                 actual=act_desc,
                 message=f"Jokers transition mismatch: expected {exp_desc}, actual {act_desc}",
+                cascaded=j_cascaded,
                 expected_step_idx=exp_idx,
             )
         )
 
     ac_prev, ac_curr = _consumables_counter(prev_a), _consumables_counter(curr_a)
     ec_prev, ec_curr = _consumables_counter(prev_e), _consumables_counter(curr_e)
-    ac_gain, ac_loss = ac_curr - ac_prev, ac_prev - ac_curr
-    ec_gain, ec_loss = ec_curr - ec_prev, ec_prev - ec_curr
-    if (ac_gain, ac_loss) != (ec_gain, ec_loss):
+    has_c_diff, c_cascaded = _filter_collection_cascade(ac_prev, ac_curr, ec_prev, ec_curr)
+    if has_c_diff:
+        ac_gain, ac_loss = ac_curr - ac_prev, ac_prev - ac_curr
+        ec_gain, ec_loss = ec_curr - ec_prev, ec_prev - ec_curr
         exp_desc = (
             f"+{_format_counter_items(ec_gain, _format_consumable_sig)} "
             f"-{_format_counter_items(ec_loss, _format_consumable_sig)}"
@@ -1188,24 +1273,26 @@ def _check_aligned_pair(
         out.append(
             Discrepancy(
                 category="inventory",
-                kind="transition_mismatch",
+                kind="drift_reconciliation" if c_cascaded else "transition_mismatch",
                 field="consumables_delta",
                 expected=exp_desc,
                 actual=act_desc,
                 message=f"Consumables transition mismatch: expected {exp_desc}, actual {act_desc}",
+                cascaded=c_cascaded,
                 expected_step_idx=exp_idx,
             )
         )
 
-    av_gain = _vouchers_counter(curr_a) - _vouchers_counter(prev_a)
-    ev_gain = _vouchers_counter(curr_e) - _vouchers_counter(prev_e)
-    av_loss = _vouchers_counter(prev_a) - _vouchers_counter(curr_a)
-    ev_loss = _vouchers_counter(prev_e) - _vouchers_counter(curr_e)
-    if (av_gain, av_loss) != (ev_gain, ev_loss):
+    av_prev, av_curr = _vouchers_counter(prev_a), _vouchers_counter(curr_a)
+    ev_prev, ev_curr = _vouchers_counter(prev_e), _vouchers_counter(curr_e)
+    has_v_diff, v_cascaded = _filter_collection_cascade(av_prev, av_curr, ev_prev, ev_curr)
+    if has_v_diff:
+        av_gain, av_loss = av_curr - av_prev, av_prev - av_curr
+        ev_gain, ev_loss = ev_curr - ev_prev, ev_prev - ev_curr
         out.append(
             Discrepancy(
                 category="inventory",
-                kind="transition_mismatch",
+                kind="drift_reconciliation" if v_cascaded else "transition_mismatch",
                 field="vouchers_delta",
                 expected=f"+{sorted(ev_gain.elements())} -{sorted(ev_loss.elements())}",
                 actual=f"+{sorted(av_gain.elements())} -{sorted(av_loss.elements())}",
@@ -1213,19 +1300,21 @@ def _check_aligned_pair(
                     f"Vouchers transition mismatch: "
                     f"expected +{sorted(ev_gain.elements())}, actual +{sorted(av_gain.elements())}"
                 ),
+                cascaded=v_cascaded,
                 expected_step_idx=exp_idx,
             )
         )
 
     at_prev, at_curr = _tags_counter(prev_a), _tags_counter(curr_a)
     et_prev, et_curr = _tags_counter(prev_e), _tags_counter(curr_e)
-    at_gain, at_loss = at_curr - at_prev, at_prev - at_curr
-    et_gain, et_loss = et_curr - et_prev, et_prev - et_curr
-    if (at_gain, at_loss) != (et_gain, et_loss):
+    has_t_diff, t_cascaded = _filter_collection_cascade(at_prev, at_curr, et_prev, et_curr)
+    if has_t_diff:
+        at_gain, at_loss = at_curr - at_prev, at_prev - at_curr
+        et_gain, et_loss = et_curr - et_prev, et_prev - et_curr
         out.append(
             Discrepancy(
                 category="inventory",
-                kind="transition_mismatch",
+                kind="drift_reconciliation" if t_cascaded else "transition_mismatch",
                 field="active_tags_delta",
                 expected=f"+{sorted(et_gain.elements())} -{sorted(et_loss.elements())}",
                 actual=f"+{sorted(at_gain.elements())} -{sorted(at_loss.elements())}",
@@ -1234,40 +1323,57 @@ def _check_aligned_pair(
                     f"expected +{sorted(et_gain.elements())} -{sorted(et_loss.elements())}, "
                     f"actual +{sorted(at_gain.elements())} -{sorted(at_loss.elements())}"
                 ),
+                cascaded=t_cascaded,
                 expected_step_idx=exp_idx,
             )
         )
 
-    # 5. Poker hand levels & play counts transitions
-    changed_hands: dict[str, dict[str, tuple[int, int]]] = {}
+    # 5. Poker hand levels & play counts transitions (suppress self-correction convergence)
+    changed_hands_primary: dict[str, dict[str, tuple[int, int]]] = {}
+    changed_hands_cascaded: dict[str, dict[str, tuple[int, int]]] = {}
     for ph in PokerHand:
-        dl_a = curr_a.hand_levels.get(ph, 1) - prev_a.hand_levels.get(ph, 1)
-        dl_e = curr_e.hand_levels.get(ph, 1) - prev_e.hand_levels.get(ph, 1)
-        dp_a = curr_a.hand_play_counts.get(ph, 0) - prev_a.hand_play_counts.get(ph, 0)
-        dp_e = curr_e.hand_play_counts.get(ph, 0) - prev_e.hand_play_counts.get(ph, 0)
-        entry_d: dict[str, tuple[int, int]] = {}
+        pl_a, cl_a = prev_a.hand_levels.get(ph, 1), curr_a.hand_levels.get(ph, 1)
+        pl_e, cl_e = prev_e.hand_levels.get(ph, 1), curr_e.hand_levels.get(ph, 1)
+        pp_a, cp_a = prev_a.hand_play_counts.get(ph, 0), curr_a.hand_play_counts.get(ph, 0)
+        pp_e, cp_e = prev_e.hand_play_counts.get(ph, 0), curr_e.hand_play_counts.get(ph, 0)
+        dl_a, dl_e = cl_a - pl_a, cl_e - pl_e
+        dp_a, dp_e = cp_a - pp_a, cp_e - pp_e
+        entry_pri: dict[str, tuple[int, int]] = {}
+        entry_cas: dict[str, tuple[int, int]] = {}
         if dl_a != dl_e:
-            entry_d["level_delta"] = (dl_e, dl_a)
+            if pl_a != pl_e and cl_a == cl_e:
+                entry_cas["level_delta"] = (dl_e, dl_a)
+            else:
+                entry_pri["level_delta"] = (dl_e, dl_a)
         if dp_a != dp_e:
-            entry_d["play_count_delta"] = (dp_e, dp_a)
-        if entry_d:
-            changed_hands[ph.value] = entry_d
-    if changed_hands:
+            if pp_a != pp_e and cp_a == cp_e:
+                entry_cas["play_count_delta"] = (dp_e, dp_a)
+            else:
+                entry_pri["play_count_delta"] = (dp_e, dp_a)
+        if entry_pri:
+            changed_hands_primary[ph.value] = entry_pri
+        elif entry_cas:
+            changed_hands_cascaded[ph.value] = entry_cas
+
+    if changed_hands_primary or changed_hands_cascaded:
+        chosen = changed_hands_primary if changed_hands_primary else changed_hands_cascaded
+        is_ph_cascaded = not changed_hands_primary
         summary_parts = [
             f"{hn}: "
             + ", ".join(
                 f"{k} exp={v[0]:+d} act={v[1]:+d}" for k, v in hdiffs.items()
             )
-            for hn, hdiffs in changed_hands.items()
+            for hn, hdiffs in chosen.items()
         ]
         out.append(
             Discrepancy(
                 category="poker_hands",
-                kind="delta_mismatch",
+                kind="self_correction" if is_ph_cascaded else "delta_mismatch",
                 field="poker_hands_delta",
-                expected={h: {k: v[0] for k, v in d.items()} for h, d in changed_hands.items()},
-                actual={h: {k: v[1] for k, v in d.items()} for h, d in changed_hands.items()},
+                expected={h: {k: v[0] for k, v in d.items()} for h, d in chosen.items()},
+                actual={h: {k: v[1] for k, v in d.items()} for h, d in chosen.items()},
                 message="Poker hand delta mismatch: " + "; ".join(summary_parts),
+                cascaded=is_ph_cascaded,
                 expected_step_idx=exp_idx,
             )
         )
@@ -1276,28 +1382,32 @@ def _check_aligned_pair(
     d_ante_a = curr_a.ante - prev_a.ante
     d_ante_e = curr_e.ante - prev_e.ante
     if d_ante_a != d_ante_e:
+        is_ante_casc = prev_a.ante != prev_e.ante and curr_a.ante == curr_e.ante
         out.append(
             Discrepancy(
                 category="blind_hud",
-                kind="delta_mismatch",
+                kind="self_correction" if is_ante_casc else "delta_mismatch",
                 field="ante_delta",
                 expected=d_ante_e,
                 actual=d_ante_a,
                 message=f"Ante delta mismatch: expected {d_ante_e:+d}, actual {d_ante_a:+d} (actual={curr_a.ante}, GT={curr_e.ante})",
+                cascaded=is_ante_casc,
                 expected_step_idx=exp_idx,
             )
         )
     d_round_a = curr_a.round - prev_a.round
     d_round_e = curr_e.round - prev_e.round
     if d_round_a != d_round_e:
+        is_round_casc = prev_a.round != prev_e.round and curr_a.round == curr_e.round
         out.append(
             Discrepancy(
                 category="blind_hud",
-                kind="delta_mismatch",
+                kind="self_correction" if is_round_casc else "delta_mismatch",
                 field="round_delta",
                 expected=d_round_e,
                 actual=d_round_a,
                 message=f"Round delta mismatch: expected {d_round_e:+d}, actual {d_round_a:+d} (actual={curr_a.round}, GT={curr_e.round})",
+                cascaded=is_round_casc,
                 expected_step_idx=exp_idx,
             )
         )
@@ -1382,14 +1492,16 @@ def _check_aligned_pair(
             dh_a = int(curr_a.hands_left) - int(prev_a.hands_left)
             dh_e = int(curr_e.hands_left) - int(prev_e.hands_left)
             if dh_a != dh_e:
+                is_h_casc = int(prev_a.hands_left) != int(prev_e.hands_left) and int(curr_a.hands_left) == int(curr_e.hands_left)
                 out.append(
                     Discrepancy(
                         category="blind_hud",
-                        kind="delta_mismatch",
+                        kind="self_correction" if is_h_casc else "delta_mismatch",
                         field="hands_left_delta",
                         expected=dh_e,
                         actual=dh_a,
                         message=f"Hands left delta mismatch: expected {dh_e:+d}, actual {dh_a:+d}",
+                        cascaded=is_h_casc,
                         expected_step_idx=exp_idx,
                     )
                 )
@@ -1397,14 +1509,16 @@ def _check_aligned_pair(
             dd_a = int(curr_a.discards_left) - int(prev_a.discards_left)
             dd_e = int(curr_e.discards_left) - int(prev_e.discards_left)
             if dd_a != dd_e:
+                is_d_casc = int(prev_a.discards_left) != int(prev_e.discards_left) and int(curr_a.discards_left) == int(curr_e.discards_left)
                 out.append(
                     Discrepancy(
                         category="blind_hud",
-                        kind="delta_mismatch",
+                        kind="self_correction" if is_d_casc else "delta_mismatch",
                         field="discards_left_delta",
                         expected=dd_e,
                         actual=dd_a,
                         message=f"Discards left delta mismatch: expected {dd_e:+d}, actual {dd_a:+d}",
+                        cascaded=is_d_casc,
                         expected_step_idx=exp_idx,
                     )
                 )
@@ -1480,26 +1594,28 @@ def _check_aligned_pair(
     # 9. Observed Shop / Pack shelves (checked on entry / reroll or new items only)
     obs_shop_a = _extract_observed_shop_counter(curr_a_step)
     obs_shop_e = _extract_observed_shop_counter(curr_e_step)
-    if obs_shop_a is not None and obs_shop_e is not None:
+    if obs_shop_a is not None and obs_shop_e is not None and a_type != ActionType.NEXT_ROUND:
         prev_obs_a = _extract_observed_shop_counter(prev_a_step) if prev_a.location == Location.SHOP else None
         prev_obs_e = _extract_observed_shop_counter(prev_e_step) if prev_e.location == Location.SHOP else None
         prev_was_reroll = prev_a_step.delta.action is not None and prev_a_step.delta.action.type == ActionType.REROLL_SHOP
         if prev_obs_a is None or prev_obs_e is None or prev_was_reroll:
-            new_a, new_e = obs_shop_a, obs_shop_e
+            new_a = obs_shop_a - obs_shop_e
+            new_e = obs_shop_e - obs_shop_a
         else:
-            new_a = obs_shop_a - prev_obs_a
-            new_e = obs_shop_e - prev_obs_e
-        if new_a != new_e and (new_a or new_e):
+            # Mid-shop: ignore items newly spotted by CV that match what GT already had in shop
+            new_a = (obs_shop_a - prev_obs_a) - obs_shop_e
+            new_e = (obs_shop_e - prev_obs_e) - obs_shop_a
+        if new_a or new_e:
             out.append(
                 Discrepancy(
                     category="shop_pack",
                     kind="observed_shop_mismatch",
                     field="observed_shop",
-                    expected=_format_counter_items(new_e - new_a, _format_shop_sig),
-                    actual=_format_counter_items(new_a - new_e, _format_shop_sig),
+                    expected=_format_counter_items(new_e, _format_shop_sig),
+                    actual=_format_counter_items(new_a, _format_shop_sig),
                     message=(
-                        f"Observed shop mismatch: expected +{_format_counter_items(new_e - new_a, _format_shop_sig)}, "
-                        f"actual +{_format_counter_items(new_a - new_e, _format_shop_sig)}"
+                        f"Observed shop mismatch: expected +{_format_counter_items(new_e, _format_shop_sig)}, "
+                        f"actual +{_format_counter_items(new_a, _format_shop_sig)}"
                     ),
                     expected_step_idx=exp_idx,
                 )
@@ -1594,7 +1710,10 @@ def compare_trajectories(
             else:
                 prev_a = steps_a[max(0, idx_a - 1)]
                 prev_e = steps_e[max(0, idx_e - 1)]
-                for d in _check_aligned_pair(steps_a[idx_a], prev_a, steps_e[idx_e], prev_e):
+                next_a = steps_a[idx_a + 1] if idx_a + 1 < len(steps_a) else None
+                for d in _check_aligned_pair(
+                    steps_a[idx_a], prev_a, steps_e[idx_e], prev_e, next_a
+                ):
                     _add_disc(idx_a, d)
         elif kind == "extra_in_actual" and idx_a is not None:
             extra_actions += 1

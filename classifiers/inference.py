@@ -653,6 +653,7 @@ def batch_recognize_shops(
                         "debuffed": attrs["debuffed_conf"],
                     },
                     card_details=None,
+                    top_keys=list(attrs.get("top_keys", ())),
                 )
 
                 out_obj = outputs[g_idx]

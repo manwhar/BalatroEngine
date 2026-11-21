@@ -7,7 +7,7 @@ End-to-end inference orchestrator for Balatro shop screens:
 Returns sorted left-to-right list of ShopItemResult objects.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ class ShopItemResult:
     box: list[int]  # [x1, y1, x2, y2]
     confidences: dict[str, float]
     card_details: Any = None
+    top_keys: list[tuple[str, float]] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -418,6 +419,7 @@ class ShopRecognitionPipeline:
                             "debuffed": attrs["debuffed_conf"],
                         },
                         card_details=None,
+                        top_keys=list(attrs.get("top_keys", ())),
                     )
                 )
 

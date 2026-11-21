@@ -1785,46 +1785,116 @@ class RunTrajectory:
         return curr
 
     def impute_retroactive_boss_blinds(self):
-        """Backward-propagates discovered boss blinds to all preceding steps in the same ante,
-        using PRNG simulation from seed when available."""
-        ante_bosses: dict[int, BlindName] = {}
-        for s in range(len(self.deltas)):
-            st = self.get_state(s)
-            if st.boss_blind:
-                ante_bosses[st.ante] = st.boss_blind
+        """Backward-propagates discovered boss blinds per contiguous ante segment,
+        using PRNG simulation from seed when available without clobbering Hieroglyph revisits."""
+        if not self.deltas:
+            return
 
-        # PRNG fallback based on seed if any step has a seed
-        first_state = self.get_state(0) if self.deltas else None
-        seed = getattr(first_state, "seed", "") if first_state else ""
+        states: list[GameState] = [self.get_state(0)]
+        for s in range(1, len(self.deltas)):
+            states.append(apply_delta(states[-1].copy(), self.deltas[s]))
+
+        # Partition steps into contiguous ante-visit segments (so Hieroglyph ante -1 keeps separate segments).
+        segments: list[tuple[int, int, int]] = []
+        seg_start = 0
+        for s in range(1, len(states)):
+            if states[s].ante != states[s - 1].ante:
+                segments.append((seg_start, s - 1, states[seg_start].ante))
+                seg_start = s
+        segments.append((seg_start, len(states) - 1, states[seg_start].ante))
+
+        # PRNG fallback based on seed for first visits without any observed boss blind.
+        prng_bosses: dict[int, BlindName] = {}
+        seed = getattr(states[0], "seed", "")
         if seed:
             try:
                 from game.engine.rng_sim.api import BalatroRun
 
                 run = BalatroRun(seed)
-                max_ante = max(
-                    (self.get_state(s).ante for s in range(len(self.deltas))), default=1
-                )
+                max_ante = max((st.ante for st in states), default=1)
                 bosses = run.predict_boss_blinds(max_ante=max(8, max_ante))
                 for a_idx, b_pred in enumerate(bosses, start=1):
-                    if a_idx not in ante_bosses:
-                        ante_bosses[a_idx] = b_pred.blind_name
+                    prng_bosses[a_idx] = b_pred.blind_name
             except Exception:
                 pass
 
-        for step, kf in self.keyframes.items():
-            if kf.ante in ante_bosses:
-                kf.boss_blind = ante_bosses[kf.ante]
+        desired: list[BlindName | None] = [st.boss_blind for st in states]
+        visited_antes: set[int] = set()
 
-        for delta in self.deltas:
-            step_state = self.get_state(delta.step_idx)
-            if step_state.ante in ante_bosses and not delta.boss_blind:
-                target_boss = ante_bosses[step_state.ante]
+        for s_start, s_end, ante_num in segments:
+            reroll_idx = s_end + 1
+            for s in range(s_start, s_end + 1):
+                act = self.deltas[s].action
+                if act is not None and act.type == ActionType.REROLL_BOSS:
+                    reroll_idx = s
+                    break
+
+            seg_boss: BlindName | None = None
+            # Priority 1: actual Boss Blind round fought in this segment.
+            for s in range(s_start, s_end + 1):
+                st = states[s]
                 if (
-                    delta.step_idx == 0
-                    or delta.ante is not None
-                    or self.get_state(delta.step_idx - 1).boss_blind != target_boss
+                    st.location == Location.BLIND
+                    and st.current_blind not in (BlindName.SMALL, BlindName.BIG)
+                    and st.boss_blind is not None
                 ):
-                    delta.boss_blind = target_boss
+                    seg_boss = st.boss_blind
+                    break
+            # Priority 2: latest non-None boss observed in Small/Big Blind or Blind Select (before post-boss shop).
+            if seg_boss is None:
+                for s in range(s_start, s_end + 1):
+                    st = states[s]
+                    if (
+                        st.location in (Location.SELECT, Location.BLIND)
+                        and st.current_blind in (BlindName.SMALL, BlindName.BIG)
+                        and st.boss_blind is not None
+                    ):
+                        seg_boss = st.boss_blind
+            # Priority 3: any non-None boss in segment, or PRNG fallback on first visit to this ante.
+            if seg_boss is None:
+                for s in range(s_start, s_end + 1):
+                    if states[s].boss_blind is not None:
+                        seg_boss = states[s].boss_blind
+                        break
+            if seg_boss is None and ante_num not in visited_antes:
+                seg_boss = prng_bosses.get(ante_num)
+            visited_antes.add(ante_num)
+
+            pre_boss: BlindName | None = None
+            if reroll_idx <= s_end:
+                for s in range(s_start, reroll_idx):
+                    if states[s].boss_blind is not None:
+                        pre_boss = states[s].boss_blind
+                        break
+            target_pre = pre_boss if pre_boss is not None else seg_boss
+
+            for s in range(s_start, s_end + 1):
+                st = states[s]
+                fill_boss = target_pre if s < reroll_idx else seg_boss
+                if fill_boss is None:
+                    continue
+                if st.boss_blind is None or (
+                    s < reroll_idx
+                    and st.current_blind in (BlindName.SMALL, BlindName.BIG)
+                ):
+                    desired[s] = fill_boss
+
+        for step, kf in self.keyframes.items():
+            if 0 <= step < len(desired) and desired[step] is not None:
+                kf.boss_blind = desired[step]
+
+        for s, delta in enumerate(self.deltas):
+            target_boss = desired[s]
+            if target_boss is None:
+                continue
+            if s == 0 or delta.ante is not None or desired[s - 1] != target_boss:
+                delta.boss_blind = target_boss
+                if delta.field_diffs is not None and "boss_blind" in delta.field_diffs:
+                    delta.field_diffs["boss_blind"] = target_boss
+            else:
+                delta.boss_blind = None
+                if delta.field_diffs:
+                    delta.field_diffs.pop("boss_blind", None)
 
 
 def step_simulation(

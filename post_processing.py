@@ -19,11 +19,13 @@ import argparse
 from collections import Counter
 import copy
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from config import configure_logging, get_config
@@ -37,14 +39,18 @@ from game.balatro_models import (
     Card,
     CardBounds,
     Deck,
+    Edition,
     Enhancement,
     HandCard,
     Joker,
     JokerName,
     Location,
     Planet,
+    PlanetName,
     PlayingCard,
+    PokerHand,
     Rank,
+    Seal,
     Spectral,
     Stake,
     Suit,
@@ -53,10 +59,13 @@ from game.balatro_models import (
     Voucher,
 )
 from game.engine.cv_stubs import (
+    _PLANET_LOOKUP,
+    _clean_str,
     _convert_card_result_to_hand_card,
     _convert_items_of_type,
 )
-from game.engine.jokers import on_joker_added
+from game.engine.jokers import _get_visible_poker_hands, on_joker_added
+from game.engine.rng_sim.events import get_to_do_list_hand
 from game.engine.rules import on_action, trigger_end_of_round_effects
 from game.gamestate import GameState, RunTrajectory, _cards_match
 
@@ -866,6 +875,10 @@ def _init_diagnostics() -> dict[str, Any]:
         "cashout_without_round_won": [],
         "empty_hand_cv_actions": [],
         "missing_shop_cv_actions": [],
+        "deck_constrained_remaps": 0,
+        "face_down_plays_resolved": 0,
+        "inferred_cash_outs": 0,
+        "inferred_skip_packs": 0,
     }
 
 
@@ -987,7 +1000,99 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
         print(
             f"[WARN] SHOP/PACK actions missing CV output: {len(missing_shop)} time(s) (frames {missing_shop[:8]})"
         )
+
+    remaps = diag.get("deck_constrained_remaps", 0)
+    fd_resolved = diag.get("face_down_plays_resolved", 0)
+    inf_co = diag.get("inferred_cash_outs", 0)
+    inf_sp = diag.get("inferred_skip_packs", 0)
+    if remaps or fd_resolved or inf_co or inf_sp:
+        print(
+            f"Recovery hooks: deck_remaps={remaps}, fd_plays_resolved={fd_resolved}, "
+            f"inferred_cash_outs={inf_co}, inferred_skip_packs={inf_sp}"
+        )
     print("==============================================")
+
+
+def _get_hud_val(hud_out: Any, field_name: str) -> Any:
+    """Safely extracts a parsed HUD OCR metric from `HudRecognitionOutput` or a test double."""
+    if hud_out is None:
+        return None
+    values = getattr(hud_out, "values", None)
+    if isinstance(values, dict) and values.get(field_name) is not None:
+        return values[field_name]
+    short = field_name[4:] if field_name.startswith("hud_") else field_name
+    val = getattr(hud_out, short, None)
+    if val is not None:
+        return val
+    return getattr(hud_out, field_name, None)
+
+
+_SOFTLOCKED_PLANET_HANDS: dict[str, PokerHand] = {
+    "c_planet_x": PokerHand.FIVE_OF_A_KIND,
+    "c_ceres": PokerHand.FLUSH_HOUSE,
+    "c_eris": PokerHand.FLUSH_FIVE,
+}
+
+_ZERO_TARGET_CONSUMABLES: frozenset[str] = frozenset(
+    {
+        "The Hermit",
+        "Temperance",
+        "Wheel of Fortune",
+        "The Emperor",
+        "The High Priestess",
+        "The Fool",
+        "Judgement",
+        "Immolate",
+        "Wraith",
+        "Sigil",
+        "Ouija",
+        "Ectoplasm",
+        "Ankh",
+        "Hex",
+        "The Soul",
+        "Black Hole",
+        "Familiar",
+        "Grim",
+        "Incantation",
+        *(p.value for p in PlanetName),
+    }
+)
+
+
+def _remap_softlocked_planets(raw_items: Sequence[Any], state: GameState) -> list[Any]:
+    """Remaps softlocked secret-hand Planets (Planet X/Ceres/Eris) using Stage-2 top-k logits."""
+    hand_counts = getattr(state, "hand_play_counts", None) or {}
+    out: list[Any] = []
+    for item in raw_items:
+        key = getattr(item, "key", None)
+        req_hand = _SOFTLOCKED_PLANET_HANDS.get(key) if key else None
+        if req_hand is not None and hand_counts.get(req_hand, 0) <= 0:
+            top_keys = getattr(item, "top_keys", None) or []
+            remapped = None
+            for cand_key, cand_prob in top_keys:
+                if (
+                    cand_prob < 0.05
+                    or not isinstance(cand_key, str)
+                    or not cand_key.startswith("c_")
+                ):
+                    continue
+                cand_req = _SOFTLOCKED_PLANET_HANDS.get(cand_key)
+                if cand_req is not None and hand_counts.get(cand_req, 0) <= 0:
+                    continue
+                if _clean_str(cand_key[2:]) not in _PLANET_LOOKUP:
+                    continue
+                cloned = copy.copy(item)
+                cloned.key = cand_key
+                cloned.card_type = "Planet"
+                cloned_confs = dict(getattr(item, "confidences", None) or {})
+                cloned_confs["key"] = float(cand_prob)
+                cloned.confidences = cloned_confs
+                remapped = cloned
+                break
+            out.append(remapped if remapped is not None else item)
+        else:
+            out.append(item)
+    return out
 
 
 def _sync_hud_into_state(
@@ -997,6 +1102,7 @@ def _sync_hud_into_state(
     action: Action,
     *,
     has_end_round_after: bool = False,
+    next_hud_money: int | None = None,
     diag: dict[str, Any] | None = None,
 ) -> int | float | None:
     """Applies validated HUD OCR readings into `state`, falling back cleanly on `None`.
@@ -1044,15 +1150,25 @@ def _sync_hud_into_state(
                     state.to_do_poker_hand = state.last_hand_played
                     state.money += 4
                     break
-        _record_ocr_override(
-            diag,
-            frame_id=sa.frame_id,
-            action_type=sa.action_type,
-            field_name="money",
-            prev_val=state.money,
-            new_val=new_money,
-        )
-        state.money = new_money
+        if (
+            sa.action_type != ActionType.CASH_OUT
+            and next_hud_money is not None
+            and abs(new_money - state.money) >= 15
+            and abs(next_hud_money - new_money) >= 15
+            and abs(next_hud_money - state.money) <= 10
+        ):
+            # Guard against single-frame rolling-digit OCR truncations (e.g. $58 -> $5 -> $55).
+            new_money = state.money
+        else:
+            _record_ocr_override(
+                diag,
+                frame_id=sa.frame_id,
+                action_type=sa.action_type,
+                field_name="money",
+                prev_val=state.money,
+                new_val=new_money,
+            )
+            state.money = new_money
 
     hands_val = values.get("hud_hands")
     if (
@@ -1290,10 +1406,62 @@ def _sync_bars_into_state(
                     (action.frame_idx, action.type.value, lost_jokers, gained_jokers)
                 )
 
-    raw_cons = list(getattr(shop_out, "consumeables", None) or [])
+    raw_cons = _remap_softlocked_planets(
+        list(getattr(shop_out, "consumeables", None) or []), state
+    )
     if sync_consumables:
         prev_cons = list(state.inventory.consumables) if state.inventory else []
-        obs_cons = _convert_items_of_type(raw_cons, (Tarot, Planet, Spectral))
+        raw_obs_cons: list[tuple[Any, Any]] = []
+        for rc in raw_cons:
+            conv = _convert_items_of_type([rc], (Tarot, Planet, Spectral))
+            if conv:
+                raw_obs_cons.append((rc, conv[0]))
+
+        prev_counts_for_filter = (
+            Counter(_consumable_sig(c) for c in state.inventory.consumables)
+            if state.inventory
+            else Counter()
+        )
+        # Prioritize higher-confidence detections when matching existing inventory slots
+        # so low-confidence edge slivers cannot displace real held cards into "new" slots.
+        kept_indices: set[int] = set()
+        for sig, prev_n in prev_counts_for_filter.items():
+            ranked_idxs = sorted(
+                (
+                    i
+                    for i, (_, cc) in enumerate(raw_obs_cons)
+                    if _consumable_sig(cc) == sig
+                ),
+                key=lambda i: (
+                    float(
+                        (getattr(raw_obs_cons[i][0], "confidences", None) or {}).get(
+                            "detection", 1.0
+                        )
+                    ),
+                    float(
+                        (getattr(raw_obs_cons[i][0], "confidences", None) or {}).get(
+                            "key", 1.0
+                        )
+                    ),
+                ),
+                reverse=True,
+            )
+            kept_indices.update(ranked_idxs[:prev_n])
+
+        obs_cons: list[Any] = []
+        for i, (rc, conv_c) in enumerate(raw_obs_cons):
+            if i not in kept_indices:
+                sig = _consumable_sig(conv_c)
+                confs = getattr(rc, "confidences", None) or {}
+                det_c = float(confs.get("detection", 1.0))
+                key_c = float(confs.get("key", 1.0))
+                next_has_new = (
+                    next_obs_cons_counts is not None
+                    and next_obs_cons_counts[sig] > prev_counts_for_filter[sig]
+                )
+                if not ((det_c >= 0.60 and key_c >= 0.85) or next_has_new):
+                    continue
+            obs_cons.append(conv_c)
         if state.inventory and (obs_cons or state.inventory.consumables):
             effective_obs_cons = list(obs_cons)
             if next_obs_cons_counts is not None:
@@ -1713,6 +1881,463 @@ def _serialize_shop_shelves(state: GameState) -> dict[str, list[dict[str, Any]]]
     }
 
 
+_EDITION_CLS_LABELS: dict[Edition, str] = {
+    Edition.NONE: "None",
+    Edition.FOIL: "Foil",
+    Edition.HOLOGRAPHIC: "Holo",
+    Edition.POLYCHROME: "Polychrome",
+    Edition.NEGATIVE: "None",
+}
+
+_SUIT_CLS_LABELS: dict[Suit, str] = {
+    Suit.HEARTS: "Hearts",
+    Suit.DIAMONDS: "Diamonds",
+    Suit.CLUBS: "Clubs",
+    Suit.SPADES: "Spades",
+    Suit.NONE: "None",
+}
+
+_CLS_HEADS: tuple[str, ...] = ("rank", "suit", "enhancement", "edition", "seal")
+
+
+def _playing_card_cls_labels(card: PlayingCard) -> dict[str, str]:
+    rank_lbl = "Stone" if card.enhancement == Enhancement.STONE else (
+        "None" if card.rank == Rank.NONE else card.rank.value
+    )
+    suit_lbl = _SUIT_CLS_LABELS.get(card.suit, "None")
+    enh_lbl = "None" if card.enhancement == Enhancement.NONE else card.enhancement.value.capitalize()
+    ed_lbl = _EDITION_CLS_LABELS.get(card.edition, "None")
+    seal_lbl = "None" if card.seal == Seal.NONE else card.seal.value.capitalize()
+    return {
+        "rank": rank_lbl,
+        "suit": suit_lbl,
+        "enhancement": enh_lbl,
+        "edition": ed_lbl,
+        "seal": seal_lbl,
+    }
+
+
+def _card_attr_sig(card: PlayingCard) -> tuple[Rank, Suit, Enhancement, Edition, Seal]:
+    return (card.rank, card.suit, card.enhancement, card.edition, card.seal)
+
+
+def _raw_head_prob(raw_card: Any, head_name: str, target_label: str, top1_label: str) -> float:
+    top_probs = getattr(raw_card, "top_probs", None) or {}
+    head_dict = top_probs.get(head_name)
+    if isinstance(head_dict, dict) and target_label in head_dict:
+        return float(head_dict[target_label])
+    if target_label == top1_label:
+        confs = getattr(raw_card, "confidences", None) or {}
+        return float(confs.get(head_name, 0.99))
+    return 0.0
+
+
+def _resolve_hand_with_deck_constraints(
+    state: GameState,
+    raw_cards: Sequence[Any],
+    obs_hand: list[HandCard],
+    *,
+    diag: dict[str, Any] | None = None,
+) -> list[HandCard]:
+    """Refines ambiguous or conflicting face-up card classifications against `state`'s known deck.
+
+    Leaves high-confidence non-conflicting cards (including genuinely new cards from a missed
+    Standard Pack take) untouched via strict per-head probability plausibility gates.
+    """
+    if (
+        not obs_hand
+        or len(obs_hand) != len(raw_cards)
+        or len(obs_hand) > 15
+        or not state.full_deck
+    ):
+        return obs_hand
+
+    faceup_indices = [i for i, hc in enumerate(obs_hand) if not hc.facing_back]
+    if not faceup_indices:
+        return obs_hand
+
+    pool: list[PlayingCard] = []
+    seen_keys: set[tuple[int, int]] = set()
+    candidates_src: list[PlayingCard] = [
+        hc.card for hc in state.hand.cards if not hc.facing_back
+    ]
+    candidates_src.extend(
+        hc._real_card
+        for hc in state.hand.cards
+        if hc.facing_back and hc._real_card is not None
+    )
+    candidates_src.extend(state.remaining_deck)
+    for dc in candidates_src:
+        if getattr(dc, "destroyed", False):
+            continue
+        k = (1, dc.id) if dc.id != 0 else (0, id(dc))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            pool.append(dc)
+
+    if not pool:
+        return obs_hand
+
+    obs_sig_counts = Counter(_card_attr_sig(obs_hand[i].card) for i in faceup_indices)
+    pool_sig_counts = Counter(_card_attr_sig(c) for c in pool)
+
+    m = len(faceup_indices)
+    p = len(pool)
+    inf_cost = 1e6
+    new_card_penalty = 4.2
+    cost_matrix = [[inf_cost] * (p + m) for _ in range(m)]
+
+    for r_idx, obs_idx in enumerate(faceup_indices):
+        raw = raw_cards[obs_idx]
+        obs_c = obs_hand[obs_idx].card
+        obs_lbl = _playing_card_cls_labels(obs_c)
+        top_probs = getattr(raw, "top_probs", None) or {}
+        confs = getattr(raw, "confidences", None) or {}
+        top1_nll = sum(
+            -math.log(max(float(confs.get(h, 0.99)), 1e-6)) for h in _CLS_HEADS
+        )
+        cost_matrix[r_idx][p + r_idx] = top1_nll + new_card_penalty
+        has_conflict = (
+            obs_sig_counts[_card_attr_sig(obs_c)]
+            > pool_sig_counts[_card_attr_sig(obs_c)]
+        )
+
+        for c_idx, cand in enumerate(pool):
+            if _cards_match(cand, obs_c):
+                cost_matrix[r_idx][c_idx] = top1_nll
+                continue
+            if not top_probs:
+                continue
+
+            cand_lbl = _playing_card_cls_labels(cand)
+            diffs = [h for h in _CLS_HEADS if cand_lbl[h] != obs_lbl[h]]
+            if len(diffs) != 1:
+                continue
+
+            p_r = _raw_head_prob(raw, "rank", cand_lbl["rank"], obs_lbl["rank"])
+            p_s = _raw_head_prob(raw, "suit", cand_lbl["suit"], obs_lbl["suit"])
+            p_enh = _raw_head_prob(
+                raw, "enhancement", cand_lbl["enhancement"], obs_lbl["enhancement"]
+            )
+            p_ed = _raw_head_prob(raw, "edition", cand_lbl["edition"], obs_lbl["edition"])
+            p_seal = _raw_head_prob(raw, "seal", cand_lbl["seal"], obs_lbl["seal"])
+            if not (
+                p_r >= 0.03
+                and p_s >= 0.10
+                and p_enh >= 0.10
+                and p_ed >= 0.10
+                and p_seal >= 0.10
+            ):
+                continue
+
+            diff_head = diffs[0]
+            top1_diff_conf = float(
+                confs.get(
+                    diff_head,
+                    (top_probs.get(diff_head) or {}).get(obs_lbl[diff_head], 1.0),
+                )
+            )
+            if has_conflict or top1_diff_conf < 0.985:
+                cost_matrix[r_idx][c_idx] = sum(
+                    -math.log(max(val, 1e-6))
+                    for val in (p_r, p_s, p_enh, p_ed, p_seal)
+                )
+
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    for r_idx, c_idx in zip(row_ind, col_ind):
+        if c_idx >= p or cost_matrix[r_idx][c_idx] >= inf_cost * 0.5:
+            continue
+        obs_idx = faceup_indices[r_idx]
+        cand = pool[c_idx]
+        if not _cards_match(cand, obs_hand[obs_idx].card):
+            updated = copy.deepcopy(cand)
+            updated.debuffed = bool(obs_hand[obs_idx].card.debuffed)
+            obs_hand[obs_idx].card = updated
+            if diag is not None:
+                diag["deck_constrained_remaps"] += 1
+
+    return obs_hand
+
+
+def _collect_play_area_probes(
+    scheduled_actions: Sequence[ScheduledAction],
+    hand_res_by_frame: dict[int, Any],
+) -> dict[int, list[int]]:
+    """Collects post-click `play_area` probe frame indices for PLAY_HAND actions with face-down cards."""
+    probes_by_sa: dict[int, list[int]] = {}
+    n_actions = len(scheduled_actions)
+    for sa_idx, sa in enumerate(scheduled_actions):
+        if sa.action_type != ActionType.PLAY_HAND:
+            continue
+        hand_out = hand_res_by_frame.get(sa.target_frame)
+        if hand_out is None:
+            continue
+        cards = getattr(hand_out, "cards", None) or []
+        if not any(
+            getattr(c, "selected", False) and getattr(c, "face_down", False)
+            for c in cards
+        ):
+            continue
+        next_bound = (
+            scheduled_actions[sa_idx + 1].frame_id - 4
+            if sa_idx + 1 < n_actions
+            else sa.frame_id + 120
+        )
+        probes = [
+            sa.frame_id + off
+            for off in (40, 65, 90)
+            if sa.frame_id + off < next_bound
+        ]
+        if not probes and (next_bound - sa.frame_id) >= 12:
+            probes = [sa.frame_id + (next_bound - sa.frame_id) // 2]
+        if probes:
+            probes_by_sa[sa_idx] = probes
+    return probes_by_sa
+
+
+def _run_play_area_cv_for_face_down_plays(
+    probes_by_sa_idx: dict[int, list[int]],
+    *,
+    video_path: str | Path | None,
+    preloaded_frames: dict[int, Any] | None,
+    fps: float,
+    conf_threshold_hand: float,
+    batch_size: int,
+    device: str | None,
+) -> dict[int, list[Any]]:
+    """Runs on-demand `ROIS["play_area"]` hand recognition across probe frames for face-down plays."""
+    if not probes_by_sa_idx:
+        return {}
+
+    unique_frames = sorted({fid for fids in probes_by_sa_idx.values() for fid in fids})
+    if preloaded_frames is not None:
+        probe_frames_by_idx = {
+            fid: preloaded_frames[fid]
+            for fid in unique_frames
+            if fid in preloaded_frames
+        }
+    elif video_path is not None and unique_frames:
+        from classifiers.common.video_utils import extract_video_frames
+
+        probe_frames_by_idx = extract_video_frames(video_path, unique_frames)
+    else:
+        probe_frames_by_idx = {}
+
+    if not probe_frames_by_idx:
+        return {}
+
+    from classifiers.inference import batch_recognize_hands
+
+    ordered_ids = sorted(probe_frames_by_idx.keys())
+    frame_inputs = [
+        (probe_frames_by_idx[fid], fid, fid / fps) for fid in ordered_ids
+    ]
+    outs = batch_recognize_hands(
+        frame_inputs,
+        conf_threshold=conf_threshold_hand,
+        batch_size=batch_size,
+        device=device,
+        roi_key="play_area",
+    )
+    out_by_frame = {out.frame_index: out for out in outs}
+    return {
+        sa_idx: [out_by_frame[fid] for fid in fids if fid in out_by_frame]
+        for sa_idx, fids in probes_by_sa_idx.items()
+    }
+
+
+def _select_consensus_play_area_cards(
+    probe_outputs: Sequence[Any], expected_count: int
+) -> list[Any] | None:
+    """Selects consensus left-to-right revealed cards from multiple `play_area` probe frames."""
+    if expected_count <= 0:
+        return None
+    valid = [
+        out
+        for out in probe_outputs
+        if len(getattr(out, "cards", None) or ()) == expected_count
+        and all(not getattr(c, "face_down", False) for c in out.cards)
+    ]
+    if not valid:
+        return None
+
+    chosen: list[Any] = []
+    for k in range(expected_count):
+        scores: dict[tuple[Any, ...], float] = {}
+        best_sample: dict[tuple[Any, ...], tuple[float, Any]] = {}
+        for out in valid:
+            c = out.cards[k]
+            confs = getattr(c, "confidences", None) or {}
+            w = float(confs.get("rank", 1.0)) * float(confs.get("suit", 1.0))
+            sig = (c.rank, c.suit, c.enhancement, c.edition, c.seal)
+            scores[sig] = scores.get(sig, 0.0) + w
+            prev_best = best_sample.get(sig)
+            if prev_best is None or w > prev_best[0]:
+                best_sample[sig] = (w, c)
+        win_sig = max(scores, key=lambda s: scores[s])
+        chosen.append(best_sample[win_sig][1])
+    return chosen
+
+
+def _resolve_played_face_down_cards(
+    state: GameState,
+    action: Action,
+    revealed_raw: Sequence[Any],
+    *,
+    diag: dict[str, Any] | None = None,
+) -> bool:
+    """Resolves face-down selected cards on PLAY_HAND using revealed `play_area` CV observations."""
+    selected_hcs = [hc for hc in state.hand.cards if hc.selected]
+    if not selected_hcs or not any(hc.facing_back for hc in selected_hcs):
+        return False
+    if len(revealed_raw) != len(selected_hcs):
+        return False
+
+    revealed_hcs = [_convert_card_result_to_hand_card(c) for c in revealed_raw]
+    _resolve_hand_with_deck_constraints(state, revealed_raw, revealed_hcs, diag=diag)
+
+    used_rev: set[int] = set()
+    for hc in selected_hcs:
+        if hc.facing_back:
+            continue
+        hit = next(
+            (
+                j
+                for j, rev in enumerate(revealed_hcs)
+                if j not in used_rev and _cards_match(hc.card, rev.card)
+            ),
+            None,
+        )
+        if hit is None:
+            hit = next(
+                (
+                    j
+                    for j, rev in enumerate(revealed_hcs)
+                    if j not in used_rev
+                    and hc.card.rank == rev.card.rank
+                    and hc.card.suit == rev.card.suit
+                ),
+                None,
+            )
+        if hit is not None:
+            used_rev.add(hit)
+
+    remaining_fd_hcs = [hc for hc in selected_hcs if hc.facing_back]
+    remaining_rev_hcs = [
+        rev for j, rev in enumerate(revealed_hcs) if j not in used_rev
+    ]
+    if len(remaining_fd_hcs) != len(remaining_rev_hcs):
+        return False
+
+    claimed_ids: set[int] = {
+        hc.card.id
+        for hc in state.hand.cards
+        if not hc.facing_back and hc.card.id != 0
+    }
+    claimed_ids.update(
+        hc._real_card.id
+        for hc in state.hand.cards
+        if hc.facing_back and hc._real_card is not None and hc._real_card.id != 0
+    )
+    next_deck_id = max((c.id for c in state.full_deck), default=0) + 1
+
+    def _find_matching_deck_card(target: PlayingCard, cands: Sequence[PlayingCard]) -> PlayingCard | None:
+        for dc in cands:
+            if (
+                not getattr(dc, "destroyed", False)
+                and dc.id not in claimed_ids
+                and _cards_match(dc, target)
+            ):
+                return dc
+        for dc in cands:
+            if (
+                not getattr(dc, "destroyed", False)
+                and dc.id not in claimed_ids
+                and dc.rank == target.rank
+                and dc.suit == target.suit
+                and dc.enhancement == target.enhancement
+            ):
+                return dc
+        return None
+
+    for hc, rev_hc in zip(remaining_fd_hcs, remaining_rev_hcs):
+        obs_card = rev_hc.card
+        resolved: PlayingCard | None = None
+        if hc.bounds and hc.bounds.candidate_cards:
+            resolved = _find_matching_deck_card(obs_card, hc.bounds.candidate_cards)
+        if resolved is None:
+            resolved = _find_matching_deck_card(obs_card, state.remaining_deck)
+        if resolved is None:
+            resolved = copy.deepcopy(obs_card)
+            resolved.id = next_deck_id
+            next_deck_id += 1
+            state.full_deck.append(resolved)
+        resolved.debuffed = bool(obs_card.debuffed)
+        claimed_ids.add(resolved.id)
+        hc.resolve_face_down(resolved, lift_facing_back=True)
+
+    action.selected_cards = [
+        copy.deepcopy(hc.card) for hc in state.hand.cards if hc.selected
+    ]
+    action.metadata["revealed_played_cards"] = [
+        (
+            "Stone"
+            if c.enhancement == Enhancement.STONE
+            else f"{c.rank.value}{c.suit.value[0].upper() if c.suit != Suit.NONE else ''}"
+        )
+        for c in action.selected_cards
+    ]
+    state.update_face_down_candidates()
+    state.reconcile_face_down_adjacencies()
+    if diag is not None:
+        diag["face_down_plays_resolved"] += 1
+    return True
+
+
+def _sync_on_screen_to_do_list(
+    state: GameState,
+    cards_list: Sequence[Any],
+    todo_unbought: list[PokerHand],
+) -> None:
+    """Ensures every visible To Do List in shop/pack has a single deterministic `'to_do'` roll."""
+    todo_jokers = [
+        c
+        for c in cards_list
+        if isinstance(c, Joker) and c.name == JokerName.TO_DO_LIST
+    ]
+    if not todo_jokers:
+        return
+    if getattr(state, "rng", None) is not None:
+        visible = _get_visible_poker_hands(state)
+        while len(todo_unbought) < len(todo_jokers):
+            rolled = get_to_do_list_hand(
+                state.rng,
+                current_hand=None,
+                visible_hands=visible,
+                is_initial_spawn=True,
+            )
+            todo_unbought.append(rolled)
+    for idx, joker in enumerate(todo_jokers):
+        if idx < len(todo_unbought):
+            joker.state["target_hand"] = todo_unbought[idx]
+
+
+def _find_todo_relative_index(
+    cards_list: Sequence[Any], target_idx: int | None
+) -> int | None:
+    """Returns which k-th To Do List in `cards_list` sits at `target_idx`, or None."""
+    if target_idx is None or target_idx < 0 or target_idx >= len(cards_list):
+        return None
+    card = cards_list[target_idx]
+    if not (isinstance(card, Joker) and card.name == JokerName.TO_DO_LIST):
+        return None
+    return sum(
+        1
+        for i, c in enumerate(cards_list[:target_idx])
+        if isinstance(c, Joker) and c.name == JokerName.TO_DO_LIST
+    )
+
+
 def _build_run_trajectory_with_plan(
     d: dict[str, Any],
     video_path: str | Path | None = None,
@@ -1811,6 +2436,16 @@ def _build_run_trajectory_with_plan(
         device=device,
         expressive=expressive,
     )
+    play_area_probes = _collect_play_area_probes(scheduled_actions, hand_res_by_frame)
+    play_area_res_by_sa = _run_play_area_cv_for_face_down_plays(
+        play_area_probes,
+        video_path=video_path,
+        preloaded_frames=preloaded_frames,
+        fps=resolved_fps,
+        conf_threshold_hand=conf_threshold_hand,
+        batch_size=batch_size,
+        device=device,
+    )
     if diag is not None:
         diag["timings"]["batched_cv_ocr"] = time.perf_counter() - t2
 
@@ -1852,6 +2487,21 @@ def _build_run_trajectory_with_plan(
                 return obs_cons_counts_by_sa_idx[j]
         return None
 
+    def _next_hud_money(cur_idx: int) -> int | None:
+        for j in range(cur_idx + 1, len(scheduled_actions)):
+            nxt_hud = hud_res_by_frame.get(scheduled_actions[j].target_frame)
+            m = _get_hud_val(nxt_hud, "hud_money")
+            if m is not None:
+                return int(m)
+        return None
+
+    last_consumable_mutated_frame: int = -1
+    shop_reroll_seq = 0
+    shop_todo_ctx: tuple[int, int, int] | None = None
+    shop_todo_unbought: list[PokerHand] = []
+    pack_todo_ctx: tuple[int, int, int] | None = None
+    pack_todo_unbought: list[PokerHand] = []
+
     action_iter = (
         tqdm(
             enumerate(scheduled_actions),
@@ -1882,15 +2532,98 @@ def _build_run_trajectory_with_plan(
         ):
             action.metadata["include_round_payout"] = True
 
+        # Drop false-positive Discard (0 discards left, e.g. Burglar) and cancelled Play Hand
+        # drag-offs BEFORE mutating hand/bars/deck/HUD.
+        hud_peek = hud_res_by_frame.get(sa.target_frame)
+        if sa.action_type == A.DISCARD:
+            hud_disc = _get_hud_val(hud_peek, "hud_discards")
+            if (state.discards_left or 0) <= 0 and hud_disc in (None, 0):
+                for hc in state.hand.cards:
+                    hc.selected = False
+                continue
+
+        if sa.action_type == A.PLAY_HAND:
+            cur_hands = _get_hud_val(hud_peek, "hud_hands")
+            cur_round = _get_hud_val(hud_peek, "hud_round")
+            cur_score = _get_hud_val(hud_peek, "hud_round_score")
+            if cur_hands is not None:
+                cancelled_play = False
+                for nxt in scheduled_actions[sa_idx + 1 :]:
+                    if nxt.action_type in (
+                        A.END_ROUND,
+                        A.CASH_OUT,
+                        A.SELECT_BLIND,
+                        A.SKIP_BLIND,
+                        A.NEXT_ROUND,
+                    ):
+                        break
+                    if nxt.action_type == A.PLAY_HAND:
+                        nxt_hud = hud_res_by_frame.get(nxt.target_frame)
+                        nxt_hands = _get_hud_val(nxt_hud, "hud_hands")
+                        nxt_round = _get_hud_val(nxt_hud, "hud_round")
+                        nxt_score = _get_hud_val(nxt_hud, "hud_round_score")
+                        if (
+                            nxt_hands is not None
+                            and int(nxt_hands) == int(cur_hands)
+                            and (
+                                cur_round is None
+                                or nxt_round is None
+                                or int(nxt_round) == int(cur_round)
+                            )
+                            and (
+                                cur_score is None
+                                or nxt_score is None
+                                or cur_score == nxt_score
+                            )
+                        ):
+                            cancelled_play = True
+                        break
+                if cancelled_play:
+                    for hc in state.hand.cards:
+                        hc.selected = False
+                    continue
+
         # Ensure blind transition leaves no stale hand cards from the prior round
         if sa.action_type in (A.SELECT_BLIND, A.SKIP_BLIND, A.CASH_OUT):
             state.hand.cards.clear()
+
+        # Infer preclicked CASH_OUT when entering SHOP directly from BLIND without CASH_OUT
+        if (
+            state.location == Location.BLIND
+            and sa.ambient_location == Location.SHOP
+            and sa.action_type != A.CASH_OUT
+        ):
+            prev_fid = scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+            inferred_co_frame = max(prev_fid + 1, sa.frame_id - 1)
+            synth_co = Action(
+                type=A.CASH_OUT,
+                frame_idx=inferred_co_frame,
+                timestamp=inferred_co_frame / resolved_fps,
+                metadata={
+                    "inferred": True,
+                    "source": "preclicked_cash_out",
+                    "include_round_payout": True,
+                },
+            )
+            state.hand.cards.clear()
+            state.frame_idx = synth_co.frame_idx
+            state.timestamp = synth_co.timestamp
+            if not state.round_won:
+                trigger_end_of_round_effects(state, synth_co)
+            on_action(state, synth_co)
+            trajectory.record_step(state, synth_co)
+            shop_reroll_seq = 0
+            shop_todo_ctx = None
+            shop_todo_unbought.clear()
+            if diag is not None:
+                diag["inferred_cash_outs"] += 1
 
         shop_out = shop_res_by_frame.get(sa.target_frame)
         if state.location == Location.PACK and sa.ambient_location in (
             Location.SHOP,
             Location.SELECT,
         ):
+            recovered_buffoon_pick = False
             if (
                 state.active_pack is not None
                 and state.active_pack.booster_type == BoosterType.BUFFOON
@@ -1912,11 +2645,49 @@ def _build_run_trajectory_with_plan(
                     else:
                         gained_from_pack.append(oj)
                 if 1 <= len(gained_from_pack) <= max(1, state.active_pack.choose):
+                    recovered_buffoon_pick = True
                     for gj in gained_from_pack:
                         new_j = copy.deepcopy(gj)
                         state.inventory.jokers.append(new_j)
                         on_joker_added(state, new_j)
                     state.ensure_joker_ids()
+
+            obs_cons_here = obs_cons_counts_by_sa_idx.get(sa_idx)
+            held_cons_here = Counter(
+                _consumable_sig(c)
+                for c in (state.inventory.consumables if state.inventory else ())
+            )
+            cons_gained_in_pack = (
+                obs_cons_here is not None
+                and any(
+                    obs_cons_here[sig] > held_cons_here[sig] for sig in obs_cons_here
+                )
+            )
+            if (
+                not recovered_buffoon_pick
+                and not cons_gained_in_pack
+                and state.pack_choices_remaining > 0
+            ):
+                prev_fid = scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+                inferred_skip_frame = max(prev_fid + 1, sa.frame_id - 1)
+                max_skips = 1 + len(getattr(state, "pending_packs", None) or ())
+                skips_done = 0
+                while state.location == Location.PACK and skips_done < max_skips:
+                    skip_action = Action(
+                        type=A.SKIP_PACK,
+                        frame_idx=inferred_skip_frame + skips_done,
+                        timestamp=(inferred_skip_frame + skips_done) / resolved_fps,
+                        metadata={"inferred": True, "source": "preclicked_skip_pack"},
+                    )
+                    state.hand.cards.clear()
+                    state.frame_idx = skip_action.frame_idx
+                    state.timestamp = skip_action.timestamp
+                    on_action(state, skip_action)
+                    trajectory.record_step(state, skip_action)
+                    skips_done += 1
+                    if diag is not None:
+                        diag["inferred_skip_packs"] += 1
+
             state.active_pack = None
             state.pack_cards.clear()
             state.pack_choices_remaining = 0
@@ -1924,25 +2695,27 @@ def _build_run_trajectory_with_plan(
                 state.pending_packs.clear()
             state.location = sa.ambient_location
             state.pre_pack_location = None
+            pack_todo_ctx = None
+            pack_todo_unbought.clear()
 
         raw_jokers: list[Any] = []
         raw_cons: list[Any] = []
         next_cons_counts = _next_obs_cons_counts(sa_idx)
+        stale_cons_frame = (
+            last_consumable_mutated_frame >= 0
+            and sa.target_frame <= last_consumable_mutated_frame + 10
+        )
         if shop_out is not None:
             # Retroactively infer missed USE_CONSUMABLE actions when a held consumable
             # disappears in both the current and next observed CV frame.
-            if state.inventory and state.inventory.consumables:
+            if not stale_cons_frame and state.inventory and state.inventory.consumables:
                 cur_cons_counts = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())
                 prev_frame_id = (
                     scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
                 )
                 inferred_frame = max(prev_frame_id + 1, sa.frame_id - 1)
                 hud_for_infer = hud_res_by_frame.get(sa.target_frame)
-                hud_money_val = (
-                    getattr(hud_for_infer, "hud_money", None)
-                    if hud_for_infer is not None
-                    else None
-                )
+                hud_money_val = _get_hud_val(hud_for_infer, "hud_money")
                 idx_cursor = 0
                 while idx_cursor < len(state.inventory.consumables):
                     held_c = state.inventory.consumables[idx_cursor]
@@ -2003,13 +2776,17 @@ def _build_run_trajectory_with_plan(
                 diag=diag,
                 next_obs_cons_counts=next_cons_counts,
                 sync_jokers=True,
-                sync_consumables=(sa.action_type != A.END_ROUND),
+                sync_consumables=(
+                    sa.action_type != A.END_ROUND and not stale_cons_frame
+                ),
             )
 
         # Sync main shop shelves before matching/stepping shop actions
         if sa.ambient_location == Location.SHOP and shop_out is not None:
             pre_cv_shelves = _serialize_shop_shelves(state)
-            raw_shop_items = list(getattr(shop_out, "shop_items", None) or [])
+            raw_shop_items = _remap_softlocked_planets(
+                list(getattr(shop_out, "shop_items", None) or []), state
+            )
             raw_vouchers = list(getattr(shop_out, "vouchers", None) or [])
             raw_boosters = list(getattr(shop_out, "boosters", None) or [])
 
@@ -2019,6 +2796,11 @@ def _build_run_trajectory_with_plan(
             if getattr(state, "coupon_shop_active", False):
                 for item in state.shop_cards + state.shop_packs:
                     item.couponed = True
+            cur_shop_ctx = (state.ante, state.round, shop_reroll_seq)
+            if cur_shop_ctx != shop_todo_ctx:
+                shop_todo_ctx = cur_shop_ctx
+                shop_todo_unbought.clear()
+            _sync_on_screen_to_do_list(state, state.shop_cards, shop_todo_unbought)
             post_cv_shelves = _serialize_shop_shelves(state)
             if any(post_cv_shelves.values()) and (
                 post_cv_shelves != pre_cv_shelves
@@ -2026,10 +2808,30 @@ def _build_run_trajectory_with_plan(
             ):
                 action.metadata["observed_shop"] = post_cv_shelves
 
-            if sa.action_type in (A.BUY_CARD, A.BUY_AND_USE):
+            if sa.action_type == A.BUY_CARD:
                 action.target_idx = match_button_to_item_index(
                     sa.button_box, raw_shop_items, attach="bottom_center"
                 )
+            elif sa.action_type == A.BUY_AND_USE:
+                consumable_indices = [
+                    idx
+                    for idx, card_obj in enumerate(state.shop_cards)
+                    if isinstance(card_obj, (Tarot, Planet, Spectral))
+                    and idx < len(raw_shop_items)
+                ]
+                if consumable_indices:
+                    rel_idx = match_button_to_item_index(
+                        sa.button_box,
+                        [raw_shop_items[idx] for idx in consumable_indices],
+                        attach="center_right",
+                    )
+                    action.target_idx = (
+                        consumable_indices[rel_idx] if rel_idx is not None else None
+                    )
+                else:
+                    action.target_idx = match_button_to_item_index(
+                        sa.button_box, raw_shop_items, attach="center_right"
+                    )
             elif sa.action_type == A.OPEN_PACK:
                 action.target_idx = match_button_to_item_index(
                     sa.button_box, raw_boosters, attach="bottom_center"
@@ -2041,23 +2843,30 @@ def _build_run_trajectory_with_plan(
 
         # Sync booster pack contents before matching/stepping pack actions
         if sa.ambient_location == Location.PACK and shop_out is not None:
-            raw_pack_items = list(getattr(shop_out, "pack_items", None) or [])
+            raw_pack_items = _remap_softlocked_planets(
+                list(getattr(shop_out, "pack_items", None) or []), state
+            )
             pack_objs = _convert_items_of_type(
                 raw_pack_items, (Joker, Tarot, Planet, Spectral, PlayingCard)
             )
             state.pack_cards = pack_objs
-            if pack_objs:
-                from game.trajectory_codec import _serialize_card
-
-                action.metadata["observed_pack"] = [
-                    _serialize_card(p) for p in pack_objs
-                ]
             if state.active_pack is None:
                 inferred = _infer_booster_pack_from_items(pack_objs)
                 state.active_pack = inferred
                 state.pack_choices_remaining = inferred.choose
                 state.pre_pack_location = sa.pre_pack_location_hint or Location.SHOP
             state.location = Location.PACK
+            cur_pack_ctx = (id(state.active_pack), state.ante, state.round)
+            if cur_pack_ctx != pack_todo_ctx:
+                pack_todo_ctx = cur_pack_ctx
+                pack_todo_unbought.clear()
+            _sync_on_screen_to_do_list(state, state.pack_cards, pack_todo_unbought)
+            if pack_objs:
+                from game.trajectory_codec import _serialize_card
+
+                action.metadata["observed_pack"] = [
+                    _serialize_card(p) for p in pack_objs
+                ]
 
             if sa.action_type == A.USE_IN_PACK:
                 action.target_idx = match_button_to_item_index(
@@ -2109,7 +2918,23 @@ def _build_run_trajectory_with_plan(
                 obs_cards = [
                     _convert_card_result_to_hand_card(c) for c in hand_out.cards
                 ]
+                _resolve_hand_with_deck_constraints(
+                    state, hand_out.cards, obs_cards, diag=diag
+                )
                 _sync_hand_into_state(state, obs_cards, action=action)
+                if (
+                    sa.action_type == A.PLAY_HAND
+                    and sa_idx in play_area_res_by_sa
+                    and any(hc.selected and hc.facing_back for hc in state.hand.cards)
+                ):
+                    expected_cnt = sum(1 for hc in state.hand.cards if hc.selected)
+                    consensus_raw = _select_consensus_play_area_cards(
+                        play_area_res_by_sa[sa_idx], expected_cnt
+                    )
+                    if consensus_raw is not None:
+                        _resolve_played_face_down_cards(
+                            state, action, consensus_raw, diag=diag
+                        )
             if diag is not None and sa.action_type in (A.PLAY_HAND, A.DISCARD):
                 if hand_out is None or not getattr(hand_out, "cards", None):
                     diag["empty_hand_cv_actions"].append(sa.frame_id)
@@ -2144,6 +2969,14 @@ def _build_run_trajectory_with_plan(
             if target_card_name is not None:
                 action.metadata["target_card"] = target_card_name
 
+        if (
+            sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK)
+            and action.metadata.get("target_card") in _ZERO_TARGET_CONSUMABLES
+        ):
+            action.selected_cards = []
+            for hc in state.hand.cards:
+                hc.selected = False
+
         # Sync HUD OCR counters before deterministic simulation (falling back on None predictions)
         hud_out = hud_res_by_frame.get(sa.target_frame)
         deferred_round_score: int | float | None = None
@@ -2154,6 +2987,7 @@ def _build_run_trajectory_with_plan(
                 sa,
                 action,
                 has_end_round_after=_has_end_round_after(scheduled_actions, sa_idx),
+                next_hud_money=_next_hud_money(sa_idx),
                 diag=diag,
             )
 
@@ -2168,12 +3002,50 @@ def _build_run_trajectory_with_plan(
                 action.metadata["_surviving_hand_ids"] = survivors
 
         # Advance simulation
+        bought_shop_td_k = (
+            _find_todo_relative_index(state.shop_cards, action.target_idx)
+            if sa.action_type == A.BUY_CARD
+            else None
+        )
+        bought_pack_td_k = (
+            _find_todo_relative_index(state.pack_cards, action.target_idx)
+            if sa.action_type == A.USE_IN_PACK
+            else None
+        )
         state.frame_idx = action.frame_idx
         state.timestamp = action.timestamp
         prev_loc = state.location
+        prev_cons_len = len(state.inventory.consumables) if state.inventory else 0
         on_action(state, action)
+        if bought_shop_td_k is not None and 0 <= bought_shop_td_k < len(shop_todo_unbought):
+            shop_todo_unbought.pop(bought_shop_td_k)
+        if bought_pack_td_k is not None and 0 <= bought_pack_td_k < len(pack_todo_unbought):
+            pack_todo_unbought.pop(bought_pack_td_k)
+        if sa.action_type == A.REROLL_SHOP:
+            shop_reroll_seq += 1
+        elif sa.action_type in (
+            A.CASH_OUT,
+            A.SELECT_BLIND,
+            A.SKIP_BLIND,
+            A.NEXT_ROUND,
+        ):
+            shop_reroll_seq = 0
+            shop_todo_ctx = None
+            shop_todo_unbought.clear()
+        if state.location != Location.PACK:
+            pack_todo_ctx = None
+            pack_todo_unbought.clear()
+        post_cons_len = len(state.inventory.consumables) if state.inventory else 0
+        if sa.action_type == A.USE_CONSUMABLE or (
+            sa.action_type == A.SELL_CARD and post_cons_len < prev_cons_len
+        ):
+            last_consumable_mutated_frame = action.frame_idx
         action.metadata.pop("_surviving_hand_ids", None)
-        if sa.action_type == A.END_ROUND and shop_out is not None:
+        if (
+            sa.action_type == A.END_ROUND
+            and shop_out is not None
+            and not stale_cons_frame
+        ):
             _, raw_cons = _sync_bars_into_state(
                 state,
                 shop_out,

@@ -242,6 +242,37 @@ DEFAULT_VISIBLE_POKER_HANDS: list[PokerHand] = [
     PokerHand.HIGH_CARD,
 ]
 
+# LuaJIT 2.1 hash-table iteration order for `pairs(G.GAME.hands)` (`game.lua:2001-2014`)
+# when initialized from those 12 literal keys. `card.lua:313` & `card.lua:2977` iterate
+# `pairs(G.GAME.hands)` directly before indexing with `pseudorandom_element`.
+LUAJIT_POKER_HANDS_ORDER: list[PokerHand] = [
+    PokerHand.FLUSH_HOUSE,      # secret
+    PokerHand.FULL_HOUSE,
+    PokerHand.FLUSH,
+    PokerHand.PAIR,
+    PokerHand.HIGH_CARD,
+    PokerHand.STRAIGHT_FLUSH,
+    PokerHand.STRAIGHT,
+    PokerHand.TWO_PAIR,
+    PokerHand.FLUSH_FIVE,       # secret
+    PokerHand.FIVE_OF_A_KIND,   # secret
+    PokerHand.THREE_OF_A_KIND,
+    PokerHand.FOUR_OF_A_KIND,
+]
+
+
+def order_poker_hands_luajit(hands: Sequence[PokerHand | str]) -> list[PokerHand]:
+    """Orders a sequence of poker hands in LuaJIT 2.1 `pairs(G.GAME.hands)` iteration order."""
+    parsed = [h if isinstance(h, PokerHand) else PokerHand(str(h)) for h in hands]
+    hand_set = set(parsed)
+    ordered = [h for h in LUAJIT_POKER_HANDS_ORDER if h in hand_set]
+    known = set(ordered)
+    for h in parsed:
+        if h not in known:
+            ordered.append(h)
+            known.add(h)
+    return ordered
+
 # Lexicographical rank order used by Balatro's card_protos sort (`a.s .. a.r`):
 # '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'J', 'K', 'Q', 'T'
 LEXICOGRAPHICAL_RANKS: list[Rank] = [

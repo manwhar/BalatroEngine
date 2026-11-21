@@ -100,8 +100,14 @@ def analyze_shadow_presence(image: np.ndarray, threshold: float = 1000.0) -> boo
     if gray.shape[0] >= 3 and gray.shape[1] >= 1:
         row_medians = np.median(gray, axis=1)
         min_step = max(10.0, threshold * (10.0 / 52.0))
-        for i in range(len(row_medians)):
+        # Restrict fallback to genuine dark shadows near the button bottom (e.g. Boss Blind);
+        # prevents card borders deeper inside a bright unshadowed strip from false-triggering.
+        for i in range(min(4, len(row_medians))):
             dark = float(row_medians[i])
+            if dark > 85.0:
+                continue
+            if i > 0 and float(np.max(row_medians[:i])) > 150.0:
+                continue
             for j in range(i + 1, min(len(row_medians), i + 4)):
                 step = float(row_medians[j]) - dark
                 if step >= min_step and (float(row_medians[j]) + 1.0) / (dark + 1.0) >= 1.45:

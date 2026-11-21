@@ -29,6 +29,8 @@ def _make_card_res(
     enhancement: str = "None",
     seal: str = "None",
     debuffed: bool = False,
+    confidences: dict[str, float] | None = None,
+    top_probs: dict[str, dict[str, float]] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         rank=rank,
@@ -40,6 +42,8 @@ def _make_card_res(
         debuffed=debuffed,
         face_down=face_down,
         box=[0, 0, 100, 150],
+        confidences=confidences or {},
+        top_probs=top_probs or {},
     )
 
 
@@ -839,10 +843,10 @@ class TestPostProcessingOrchestration(unittest.TestCase):
                 "500": {
                     "action": 4,
                     "box": [650, 575, 740, 640],
-                },  # Reroll Shop -> target 498
+                },  # Reroll Shop -> target 490 (offset -10)
             },
         }
-        needed = (98, 200, 298, 398, 498)
+        needed = (98, 200, 298, 398, 490)
         dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in needed}
 
         observed_hud_fields: dict[int, list[str]] = {}
@@ -901,7 +905,7 @@ class TestPostProcessingOrchestration(unittest.TestCase):
                 elif f_idx == 398:
                     # CASH_OUT observes post-end_round / pre-cash-out money=18 (before +payout)
                     vals.update({"hud_money": 18})
-                elif f_idx == 498:
+                elif f_idx == 490:
                     # REROLL_SHOP: hud_reroll_cost is None (e.g. <90% or failed green check) -> engine falls back to state.reroll_cost (5)!
                     vals.update({"hud_money": 26, "hud_reroll_cost": None})
                 outs.append(
@@ -932,8 +936,8 @@ class TestPostProcessingOrchestration(unittest.TestCase):
         self.assertIn("hud_round_score", observed_hud_fields[200])
         self.assertIn("hud_blind_target", observed_hud_fields[200])
         self.assertNotIn("hud_reroll_cost", observed_hud_fields[200])
-        self.assertIn("hud_reroll_cost", observed_hud_fields[498])
-        self.assertNotIn("hud_round_score", observed_hud_fields[498])
+        self.assertIn("hud_reroll_cost", observed_hud_fields[490])
+        self.assertNotIn("hud_round_score", observed_hud_fields[490])
 
         traj: gs.RunTrajectory = res["trajectory"]
         # Step 2 (PLAY_HAND): round_won stays False because END_ROUND follows (score deferred to after PLAY_HAND step)
@@ -1730,6 +1734,354 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         on_action(imm_state, imm_act)
         self.assertIn(27, [c.id for c in imm_state.full_deck])
         self.assertEqual(len(imm_state.full_deck), 1)
+
+    def test_deck_constrained_matching_fixes_gold_q_and_preserves_new_pack_cards(self):
+        # 1. Duplicate conflict: deck has 1 Jack♦ Gold and 1 Queen♦ Gold;
+        # CV observed [Jack♦ Gold (0.93/0.07), Jack♦ Gold (1.00)].
+        qd_gold = bm.PlayingCard(
+            rank=bm.Rank.QUEEN,
+            suit=bm.Suit.DIAMONDS,
+            enhancement=bm.Enhancement.GOLD,
+            id=1,
+        )
+        jd_gold = bm.PlayingCard(
+            rank=bm.Rank.JACK,
+            suit=bm.Suit.DIAMONDS,
+            enhancement=bm.Enhancement.GOLD,
+            id=2,
+        )
+        qh_gold = bm.PlayingCard(
+            rank=bm.Rank.QUEEN,
+            suit=bm.Suit.HEARTS,
+            enhancement=bm.Enhancement.GOLD,
+            id=3,
+        )
+        base_2c = bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.CLUBS, id=4)
+        state = gs.GameState(
+            location=bm.Location.BLIND,
+            full_deck=[qd_gold, jd_gold, qh_gold, base_2c],
+        )
+
+        raw_dup = [
+            _make_card_res(
+                "Jack",
+                "Diamonds",
+                enhancement="Gold",
+                confidences={"rank": 0.929, "suit": 0.999, "enhancement": 0.999, "edition": 1.0, "seal": 1.0},
+                top_probs={
+                    "rank": {"Jack": 0.929, "Queen": 0.071},
+                    "suit": {"Diamonds": 0.999},
+                    "enhancement": {"Gold": 0.999},
+                    "edition": {"None": 1.0},
+                    "seal": {"None": 1.0},
+                },
+            ),
+            _make_card_res(
+                "Jack",
+                "Diamonds",
+                enhancement="Gold",
+                confidences={"rank": 1.0, "suit": 1.0, "enhancement": 1.0, "edition": 1.0, "seal": 1.0},
+                top_probs={
+                    "rank": {"Jack": 1.0},
+                    "suit": {"Diamonds": 1.0},
+                    "enhancement": {"Gold": 1.0},
+                    "edition": {"None": 1.0},
+                    "seal": {"None": 1.0},
+                },
+            ),
+            # Ambiguous J♥ Gold (0.764 vs Q=0.226) with no J♥ Gold in deck -> snaps to Q♥ Gold
+            _make_card_res(
+                "Jack",
+                "Hearts",
+                enhancement="Gold",
+                confidences={"rank": 0.764, "suit": 1.0, "enhancement": 1.0, "edition": 1.0, "seal": 1.0},
+                top_probs={
+                    "rank": {"Jack": 0.764, "Queen": 0.226},
+                    "suit": {"Hearts": 1.0},
+                    "enhancement": {"Gold": 1.0},
+                    "edition": {"None": 1.0},
+                    "seal": {"None": 1.0},
+                },
+            ),
+            # High-confidence new Polychrome Ace♠ (e.g., missed Standard Pack take) -> must NOT remap!
+            _make_card_res(
+                "Ace",
+                "Spades",
+                edition="Polychrome",
+                confidences={"rank": 0.999, "suit": 0.999, "enhancement": 1.0, "edition": 0.999, "seal": 1.0},
+                top_probs={
+                    "rank": {"Ace": 0.999},
+                    "suit": {"Spades": 0.999},
+                    "enhancement": {"None": 1.0},
+                    "edition": {"Polychrome": 0.999},
+                    "seal": {"None": 1.0},
+                },
+            ),
+        ]
+        obs_hcs = [pp._convert_card_result_to_hand_card(c) for c in raw_dup]
+        diag = pp._init_diagnostics()
+        pp._resolve_hand_with_deck_constraints(state, raw_dup, obs_hcs, diag=diag)
+
+        self.assertEqual(obs_hcs[0].card.rank, bm.Rank.QUEEN)
+        self.assertEqual(obs_hcs[0].card.suit, bm.Suit.DIAMONDS)
+        self.assertEqual(obs_hcs[1].card.rank, bm.Rank.JACK)
+        self.assertEqual(obs_hcs[1].card.suit, bm.Suit.DIAMONDS)
+        self.assertEqual(obs_hcs[2].card.rank, bm.Rank.QUEEN)
+        self.assertEqual(obs_hcs[2].card.suit, bm.Suit.HEARTS)
+        # New pack card preserved untouched!
+        self.assertEqual(obs_hcs[3].card.rank, bm.Rank.ACE)
+        self.assertEqual(obs_hcs[3].card.suit, bm.Suit.SPADES)
+        self.assertEqual(obs_hcs[3].card.edition, bm.Edition.POLYCHROME)
+        self.assertEqual(diag["deck_constrained_remaps"], 2)
+
+        # Syncing adds the genuinely new Polychrome A♠ cleanly into full_deck
+        pp._sync_hand_into_state(state, obs_hcs)
+        self.assertEqual(len(state.full_deck), 5)
+        self.assertTrue(
+            any(
+                c.rank == bm.Rank.ACE and c.suit == bm.Suit.SPADES and c.edition == bm.Edition.POLYCHROME
+                for c in state.full_deck
+            )
+        )
+
+    def test_face_down_played_cards_play_area_resolution_and_bounds_pruning(self):
+        # Simulate The Fish: Small + Big blind skipped? Or play directly on Small Blind where face-down cards are dealt
+        d = {
+            "key": {"Select Blind": 0, "Play Hand": 1},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand -> target 200; probe at 240, 265, 290
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 240, 265, 290)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            return [
+                ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hands(frames, **kwargs):
+            roi_key = kwargs.get("roi_key")
+            outs = []
+            for _, f_idx, ts in frames:
+                cards = []
+                if roi_key == "play_area" and f_idx in (240, 265, 290):
+                    # Played 4 cards revealed in play_area: Pair of Aces (Ace♥, Ace♣, 8♠, 2♠)
+                    cards = [
+                        _make_card_res("Ace", "Hearts", confidences={"rank": 0.99, "suit": 0.99}),
+                        _make_card_res("Ace", "Clubs", confidences={"rank": 0.99, "suit": 0.99}),
+                        _make_card_res("8", "Spades", confidences={"rank": 0.99, "suit": 0.99}),
+                        _make_card_res("2", "Spades", confidences={"rank": 0.99, "suit": 0.99}),
+                    ]
+                elif roi_key is None and f_idx == 200:
+                    # Hand has 4 selected (2 face-up Aces + 2 face-down) plus 1 unselected face-down card
+                    cards = [
+                        _make_card_res("Ace", "Hearts", selected=True),
+                        _make_card_res("Ace", "Clubs", selected=True),
+                        _make_card_res("None", "None", selected=True, face_down=True),
+                        _make_card_res("None", "None", selected=True, face_down=True),
+                        _make_card_res("None", "None", selected=False, face_down=True),
+                    ]
+                outs.append(HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=cards))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        self.assertEqual(plan["diagnostics"]["face_down_plays_resolved"], 1)
+        play_act = traj.deltas[-1].action
+        self.assertEqual(play_act.type, bm.ActionType.PLAY_HAND)
+        self.assertEqual(
+            [(c.rank, c.suit) for c in play_act.selected_cards],
+            [
+                (bm.Rank.ACE, bm.Suit.HEARTS),
+                (bm.Rank.ACE, bm.Suit.CLUBS),
+                (bm.Rank.EIGHT, bm.Suit.SPADES),
+                (bm.Rank.TWO, bm.Suit.SPADES),
+            ],
+        )
+        self.assertTrue(all(c.id > 0 for c in play_act.selected_cards))
+        self.assertEqual(state.hand_play_counts.get(bm.PokerHand.PAIR, 0), 1)
+        self.assertEqual(state.hand_play_counts.get(bm.PokerHand.HIGH_CARD, 0), 0)
+
+        played_ids = {c.id for c in state.played_cards_this_round}
+        rem_ids = {c.id for c in state.remaining_deck}
+        self.assertTrue({c.id for c in play_act.selected_cards}.issubset(played_ids))
+        self.assertTrue(played_ids.isdisjoint(rem_ids))
+        # Held unselected face-down card must have pruned all 4 played cards from its bounds
+        held_fd = [hc for hc in state.hand.cards if hc.facing_back]
+        self.assertEqual(len(held_fd), 1)
+        cand_ids = {c.id for c in held_fd[0].bounds.candidate_cards}
+        self.assertTrue(played_ids.isdisjoint(cand_ids))
+
+    def test_preclicked_cash_out_and_skip_pack_synthesis(self):
+        # 1. Preclicked Cash Out + Preclicked Skip Pack (Red Card +3 Mult)
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Buy Card": 3,
+                "Open Pack": 4,
+                "Next Round": 5,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand -> 200
+                "300": {"action": 2, "box": [500, 500, 600, 550]},  # End Round -> 298
+                # CASH_OUT omitted (preclicked)! Directly Buy Card (Red Card) in shop:
+                "400": {"action": 3, "box": [855, 575, 945, 625]},  # Buy Card[0] -> 400
+                "500": {"action": 4, "box": [1120, 900, 1220, 950]},  # Open Pack -> 498
+                # SKIP_PACK omitted (preclicked)! Directly Next Round -> 598
+                "600": {"action": 5, "box": [100, 100, 200, 150]},
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 298, 400, 498, 598)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 400:
+                    out.shop_items = [_make_shop_item("j_red_card", "Joker", [830, 380, 970, 560])]
+                elif f_idx == 498:
+                    out.joker_bar = [_make_shop_item("j_red_card", "Joker", [520, 40, 660, 220])]
+                    out.boosters = [_make_shop_item("p_celestial_normal_1", "Booster", [1100, 730, 1240, 900])]
+                elif f_idx == 598:
+                    out.joker_bar = [_make_shop_item("j_red_card", "Joker", [520, 40, 660, 220])]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        self.assertEqual(plan["diagnostics"]["inferred_cash_outs"], 1)
+        self.assertEqual(plan["diagnostics"]["inferred_skip_packs"], 1)
+        act_types = [delta.action.type for delta in traj.deltas[1:]]
+        self.assertIn(bm.ActionType.CASH_OUT, act_types)
+        self.assertIn(bm.ActionType.SKIP_PACK, act_types)
+        # Red Card should have gained +3 mult from the inferred preclicked Skip Pack!
+        red_cards = [j for j in state.inventory.jokers if j.name == bm.JokerName.RED_CARD]
+        self.assertEqual(len(red_cards), 1)
+        self.assertEqual(red_cards[0].state.get("mult"), 3)
+
+        # 2. Buffoon pack where a new Joker appears on joker_bar must recover pick, NOT infer Skip Pack
+        d_buf = {
+            "key": {"Cash Out": 0, "Open Pack": 1, "Next Round": 2},
+            "frames": {
+                "100": {"action": 0, "box": [400, 300, 600, 370]},  # Cash Out -> 98
+                "200": {"action": 1, "box": [1120, 900, 1220, 950]},  # Open Pack -> 198
+                "300": {"action": 2, "box": [100, 100, 200, 150]},  # Next Round -> 298
+            },
+        }
+        buf_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 198, 298)}
+
+        def fake_buf_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 198:
+                    out.boosters = [_make_shop_item("p_buffoon_normal_1", "Booster", [1100, 730, 1240, 900])]
+                elif f_idx == 298:
+                    out.joker_bar = [_make_shop_item("j_joker", "Joker", [520, 40, 660, 220])]
+                outs.append(out)
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_buf_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            buf_state, buf_traj, buf_plan = pp._build_run_trajectory_with_plan(
+                d_buf, preloaded_frames=buf_frames, fps=60.0, expressive=True
+            )
+
+        self.assertEqual(buf_plan["diagnostics"]["inferred_skip_packs"], 0)
+        self.assertEqual([j.name for j in buf_state.inventory.jokers], [bm.JokerName.JOKER])
+        self.assertNotIn(bm.ActionType.SKIP_PACK, [delta.action.type for delta in buf_traj.deltas[1:]])
+
+    def test_to_do_list_on_screen_shop_pack_tracking_and_high_card_spawn(self):
+        from game.engine.rng_sim.api import BalatroRun
+
+        # Seed LX6LFV2Q: roll 1 = High Card; roll 2 = next hand on stream
+        expected_run = BalatroRun(seed="LX6LFV2Q")
+        exp_roll1 = expected_run.get_to_do_list_hand(is_initial_spawn=True)
+        exp_roll2 = expected_run.get_to_do_list_hand(is_initial_spawn=True)
+        self.assertEqual(exp_roll1, bm.PokerHand.HIGH_CARD)
+
+        d = {
+            "key": {
+                "Cash Out": 0,
+                "Reroll Shop": 1,
+                "Open Pack": 2,
+                "Use In Pack": 3,
+                "Next Round": 4,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [400, 300, 600, 370]},  # Cash Out -> 98 (enter Shop)
+                "200": {"action": 1, "box": [650, 575, 740, 640]},  # Reroll Shop (sees To Do List #1 on pre-reroll shelf!) -> 190
+                "300": {"action": 2, "box": [1120, 900, 1220, 950]},  # Open Pack -> 298
+                "400": {"action": 3, "box": [855, 575, 945, 625]},  # Use In Pack (picks To Do List #2!) -> 398
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 190, 298, 398)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 190:
+                    # Pre-reroll shop shelf has To Do List (roll 1 -> High Card), rerolled away without buying
+                    out.shop_items = [_make_shop_item("j_todo_list", "Joker", [830, 380, 970, 560])]
+                elif f_idx == 298:
+                    out.boosters = [_make_shop_item("p_buffoon_normal_1", "Booster", [1100, 730, 1240, 900])]
+                elif f_idx == 398:
+                    # Buffoon pack contains To Do List -> must advance to roll 2 (exp_roll2), NOT reuse roll 1
+                    out.pack_items = [_make_shop_item("j_todo_list", "Joker", [830, 380, 970, 560])]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=[]) for _, f_idx, ts in frames]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            state, traj, _ = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, seed="LX6LFV2Q", fps=60.0
+            )
+
+        # Reroll action observed shop To Do List with roll 1 (High Card)
+        reroll_obs = traj.deltas[2].action.metadata["observed_shop"]["cards"][0]
+        self.assertEqual(reroll_obs["state"]["target_hand"], bm.PokerHand.HIGH_CARD.value)
+        # Picking To Do List in Buffoon Pack got roll 2 without double-rolling!
+        self.assertEqual(len(state.inventory.jokers), 1)
+        td = state.inventory.jokers[0]
+        self.assertEqual(td.name, bm.JokerName.TO_DO_LIST)
+        self.assertEqual(td.state.get("target_hand"), exp_roll2)
+        self.assertEqual(state.to_do_poker_hand, exp_roll2)
+        self.assertEqual(state.rng.get_channel_call_count("to_do"), 2)
 
 
 if __name__ == "__main__":

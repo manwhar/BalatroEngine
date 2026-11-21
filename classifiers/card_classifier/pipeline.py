@@ -7,7 +7,7 @@ End-to-end inference orchestrator:
 Returns sorted left-to-right list of CardResult objects.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -47,6 +47,7 @@ class CardResult:
     face_down: bool
     box: list[int]  # [x1, y1, x2, y2]
     confidences: dict[str, float]
+    top_probs: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def display_name(self) -> str:
@@ -81,7 +82,7 @@ def _fit_clamped_arch(
     coef, _, _, _ = np.linalg.lstsq(design_x, y_target, rcond=None)
     c0, c1, c2 = float(coef[0]), float(coef[1]), float(coef[2])
     c2 = max(0.0, min(48.0 * scale, c2))
-    c1 = max(-15.0 * scale, min(15.0 * scale, c1))
+    c1 = max(-5.0 * scale, min(5.0 * scale, c1))
     c0 = float(np.median(y_target - c1 * u - c2 * (u ** 2)))
     return c0, c1, c2
 
@@ -126,6 +127,8 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
     def _eval_mask(mask: list[bool]) -> tuple[float, tuple[float, float, float, float]]:
         sel = np.asarray(mask, dtype=np.float64)
         num_sel = int(sel.sum())
+        if num_sel > 5:
+            return float("inf"), (0.0, 0.0, 0.0, 0.0)
         if num_sel == 0 or num_sel == n:
             c0, c1, c2 = _fit_clamped_arch(design_x, u, ys, scale)
             if num_sel == 0 and c0 < 40.0 * scale:
@@ -206,6 +209,23 @@ def decode_card_prediction(
         "debuffed": float(preds["debuffed_conf"][pred_idx].item()) if "debuffed_conf" in preds else 1.0,
         "face_down": float(preds["face_down_conf"][pred_idx].item()) if "face_down_conf" in preds else 1.0,
     }
+    top_probs: dict[str, dict[str, float]] = {}
+    head_maps = (
+        ("rank", "rank_probs", IDX_TO_RANK),
+        ("suit", "suit_probs", IDX_TO_SUIT),
+        ("edition", "edition_probs", IDX_TO_EDITION),
+        ("enhancement", "enhancement_probs", IDX_TO_ENHANCEMENT),
+        ("seal", "seal_probs", IDX_TO_SEAL),
+    )
+    for head_name, probs_key, idx_map in head_maps:
+        if probs_key in preds:
+            row = preds[probs_key][pred_idx].tolist()
+            top_probs[head_name] = {
+                idx_map[c_i]: float(p)
+                for c_i, p in enumerate(row)
+                if p >= 0.005 and c_i in idx_map
+            }
+
     return CardResult(
         index=index,
         rank=IDX_TO_RANK.get(preds["rank_idx"][pred_idx].item(), "Unknown"),
@@ -218,6 +238,7 @@ def decode_card_prediction(
         face_down=bool(preds["face_down"][pred_idx].item()) if "face_down" in preds else False,
         box=box,
         confidences=confs,
+        top_probs=top_probs,
     )
 
 

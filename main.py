@@ -25,7 +25,7 @@ from post_processing import (
     parse_stake,
     serialize_trajectory_summary,
 )
-from screen_state import ScreenStateTracker
+from screen_state import CoarseScreenState, ScreenStateTracker
 from template import template_loader
 
 
@@ -76,9 +76,7 @@ def _process_frame(
     frame_idx = video_frame.index
     need_ts = config.debug_plot or config.setup_mode
     ts_str = (
-        format_timestamp(video_frame.timestamp_seconds, frame_idx)
-        if need_ts
-        else ""
+        format_timestamp(video_frame.timestamp_seconds, frame_idx) if need_ts else ""
     )
 
     if logger.isEnabledFor(logging.INFO):
@@ -100,6 +98,9 @@ def _process_frame(
     matches = []
     template_clicked = None
     clicked_name = None
+    best_clicked_conf = -1.0
+    cash_out_box: list[int] | None = None
+    cash_out_present = False
     for template in active_templates:
         result = eval(
             template,
@@ -134,9 +135,8 @@ def _process_frame(
                     ux1, uy1, ux2, _ = (int(v) for v in use_res.box)
                     horiz_overlap = max(0, min(sx2, ux2) - max(sx1, ux1))
                     min_w = max(1, min(sx2 - sx1, ux2 - ux1))
-                    if (
-                        horiz_overlap >= 0.5 * min_w
-                        and (sy2 - 2) <= uy1 <= (sy2 + config.shadow_region_height + 2)
+                    if horiz_overlap >= 0.5 * min_w and (sy2 - 2) <= uy1 <= (
+                        sy2 + config.shadow_region_height + 2
                     ):
                         y0 = max(0, sy2 + int(getattr(template, "shadow_dy", 0)))
                         y1 = min(img_gray.shape[0], uy1 - 1)
@@ -157,22 +157,75 @@ def _process_frame(
                             result = _dc_replace(result, clicked=sell_clicked)
                         else:
                             result.clicked = sell_clicked
+        if (
+            result.template_name == "Cash Out"
+            and result.found
+            and not result.clicked
+            and result.box is not None
+            and result.match is not None
+            and int(result.box[1]) <= 425
+        ):
+            if result.match.confidence >= 0.85:
+                cash_out_present = True
+            if result.match.confidence >= 0.95:
+                cash_out_box = [int(v) for v in result.box]
         if hasattr(result, "plot_kwargs") and result.found and result.plot_kwargs:
             matches.append((template, result.plot_kwargs))
         if result.found and result.clicked:
-            clicked_name = result.template_name
-            template_clicked = {
-                "action": template_key[result.template_name],
-                "box": list(result.box) if result.box is not None else None,
-            }
-            break  # only one template can be clicked in a given frame
+            cand_conf = (
+                float(result.match.confidence) if result.match is not None else 1.0
+            )
+            if cand_conf > best_clicked_conf:
+                best_clicked_conf = cand_conf
+                clicked_name = result.template_name
+                template_clicked = {
+                    "action": template_key[result.template_name],
+                    "box": list(result.box) if result.box is not None else None,
+                }
     t2 = time.perf_counter()
 
-    metrics = {
+    metrics: dict[str, Any] = {
         "grayscale_time": t1 - t0,
         "eval_time": t2 - t1,
     }
+    if cash_out_present:
+        metrics["cash_out_present"] = True
+    if cash_out_box is not None:
+        metrics["cash_out_box"] = cash_out_box
     return frame_idx, matches, metrics, template_clicked, clicked_name
+
+
+def _prune_isolated_single_frame_clicks(
+    action_frames: dict[int, dict[str, Any]],
+    template_key: dict[str, int],
+    *,
+    template_names: tuple[str, ...],
+    skip_frames: int,
+) -> dict[int, dict[str, Any]]:
+    """Removes isolated length-1 click blips (animation-blur spikes) for non-transition templates."""
+    target_ids = {template_key[name] for name in template_names if name in template_key}
+    if not target_ids or skip_frames > 2 or not action_frames:
+        return action_frames
+
+    max_gap = max(4, (skip_frames + 1) * 3)
+    runs: list[list[tuple[int, dict[str, Any]]]] = []
+    for frame_idx, entry in sorted(action_frames.items()):
+        if (
+            runs
+            and runs[-1][-1][1].get("action") == entry.get("action")
+            and (frame_idx - runs[-1][-1][0]) <= max_gap
+        ):
+            runs[-1].append((frame_idx, entry))
+        else:
+            runs.append([(frame_idx, entry)])
+
+    kept: dict[int, dict[str, Any]] = {}
+    for run in runs:
+        if len(run) == 1 and run[0][1].get("action") in target_ids:
+            continue
+        for frame_idx, entry in run:
+            kept[frame_idx] = entry
+    return kept
 
 
 def _chunked_iterable(iterable, size: int):
@@ -271,6 +324,93 @@ def detect_video_actions(
 
     num_workers = 1
     action_frames: dict[int, dict[str, Any]] = {}
+    cash_out_visible_streak = 0
+    cash_out_missing_streak = 0
+    cash_out_first_missing_frame: int | None = None
+    cash_out_last_box: list[int] | None = None
+
+    def _reset_cash_out_watch() -> None:
+        nonlocal \
+            cash_out_visible_streak, \
+            cash_out_missing_streak, \
+            cash_out_first_missing_frame
+        cash_out_visible_streak = 0
+        cash_out_missing_streak = 0
+        cash_out_first_missing_frame = None
+
+    def _apply_frame_detection(
+        frame_idx: int,
+        template_clicked: dict[str, Any] | None,
+        clicked_name: str | None,
+        metrics: dict[str, Any],
+    ) -> bool:
+        """Records detected click (or synthetic Cash Out disappearance) and returns True if state changed."""
+        nonlocal cash_out_visible_streak, cash_out_missing_streak
+        nonlocal cash_out_first_missing_frame, cash_out_last_box
+
+        prev_state = (
+            screen_tracker.state,
+            screen_tracker.allow_play_game,
+            screen_tracker.pre_pack_location,
+            screen_tracker.last_cash_out_frame,
+        )
+        if template_clicked is not None and clicked_name is not None:
+            action_frames[frame_idx] = template_clicked
+            screen_tracker.on_template_clicked(clicked_name, frame_idx=frame_idx)
+            if clicked_name in (
+                "Open Run Info Menu",
+                "Open Options Menu",
+                "Cash Out",
+                "Play Hand",
+                "Discard",
+                "Select Blind",
+                "Next Round",
+            ):
+                _reset_cash_out_watch()
+        else:
+            cash_box = metrics.get("cash_out_box")
+            if screen_tracker.state in (
+                CoarseScreenState.BLIND,
+                CoarseScreenState.CASH_OUT,
+            ):
+                if cash_box is not None:
+                    cash_out_visible_streak += 1
+                    cash_out_missing_streak = 0
+                    cash_out_first_missing_frame = None
+                    cash_out_last_box = cash_box
+                elif metrics.get("cash_out_present"):
+                    cash_out_missing_streak = 0
+                    cash_out_first_missing_frame = None
+                elif cash_out_visible_streak >= 2:
+                    if cash_out_missing_streak == 0:
+                        cash_out_first_missing_frame = frame_idx
+                    cash_out_missing_streak += 1
+                    if cash_out_missing_streak >= 10 and "Cash Out" in template_key:
+                        syn_frame = (
+                            cash_out_first_missing_frame
+                            if cash_out_first_missing_frame is not None
+                            else frame_idx
+                        )
+                        if syn_frame not in action_frames:
+                            action_frames[syn_frame] = {
+                                "action": template_key["Cash Out"],
+                                "box": cash_out_last_box,
+                                "metadata": {"source": "cash_out_disappearance"},
+                            }
+                        screen_tracker.on_template_clicked(
+                            "Cash Out", frame_idx=syn_frame
+                        )
+                        _reset_cash_out_watch()
+            else:
+                _reset_cash_out_watch()
+
+        cur_state = (
+            screen_tracker.state,
+            screen_tracker.allow_play_game,
+            screen_tracker.pre_pack_location,
+            screen_tracker.last_cash_out_frame,
+        )
+        return cur_state != prev_state
 
     if config.debug_plot or config.setup_mode:
         # Sequential processing to ensure safe UI/Plotting on the main thread
@@ -283,9 +423,7 @@ def detect_video_actions(
                     video_frame, active_templates, template_key, config, logger
                 )
             )
-            if template_clicked is not None and clicked_name is not None:
-                action_frames[frame_idx] = template_clicked
-                screen_tracker.on_template_clicked(clicked_name, frame_idx=frame_idx)
+            _apply_frame_detection(frame_idx, template_clicked, clicked_name, metrics)
             total_grayscale_time += metrics["grayscale_time"]
             total_eval_time += metrics["eval_time"]
             for template, plot_kwargs in matches:
@@ -314,7 +452,9 @@ def detect_video_actions(
                             )
                             if "shadow_threshold" in data[template.name]:
                                 raw_t = data[template.name]["shadow_threshold"]
-                                template.shadow_threshold = float(raw_t) if raw_t is not None else None
+                                template.shadow_threshold = (
+                                    float(raw_t) if raw_t is not None else None
+                                )
                     except Exception as e:
                         logger.error(
                             f"Failed to reload template data for {template.name}: {e}"
@@ -327,9 +467,7 @@ def detect_video_actions(
             max_workers=config.max_workers
         ) as executor:
             num_workers = executor._max_workers
-            with tqdm(
-                total=total_frames, desc=progress_desc, unit="frame"
-            ) as pbar:
+            with tqdm(total=total_frames, desc=progress_desc, unit="frame") as pbar:
                 for chunk in _chunked_iterable(frames, 64):
                     pending = list(chunk)
                     while pending:
@@ -372,31 +510,23 @@ def detect_video_actions(
                             total_grayscale_time += metrics["grayscale_time"]
                             total_eval_time += metrics["eval_time"]
                             pbar.update(1)
-                            if template_clicked is not None and clicked_name is not None:
-                                action_frames[frame_idx] = template_clicked
-                                prev_state = (
-                                    screen_tracker.state,
-                                    screen_tracker.allow_play_game,
-                                    screen_tracker.pre_pack_location,
-                                    screen_tracker.last_cash_out_frame,
-                                )
-                                screen_tracker.on_template_clicked(
-                                    clicked_name, frame_idx=frame_idx
-                                )
-                                cur_state = (
-                                    screen_tracker.state,
-                                    screen_tracker.allow_play_game,
-                                    screen_tracker.pre_pack_location,
-                                    screen_tracker.last_cash_out_frame,
-                                )
-                                if cur_state != prev_state:
-                                    transitioned_at = idx_in_chunk
-                                    break
+                            if _apply_frame_detection(
+                                frame_idx, template_clicked, clicked_name, metrics
+                            ):
+                                transitioned_at = idx_in_chunk
+                                break
                         if transitioned_at is not None:
                             # Re-run only the suffix after a state transition under the updated whitelist
                             pending = batch[transitioned_at + 1 :] + remainder
                         else:
                             pending = remainder
+
+    action_frames = _prune_isolated_single_frame_clicks(
+        action_frames,
+        template_key,
+        template_names=("Sell Card", "Sort by Rank", "Sort by Suit"),
+        skip_frames=config.skip_frames,
+    )
 
     output_payload: dict[str, Any] = {
         "key": template_key,
@@ -448,36 +578,130 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
 
     # Video & template matching options
-    p.add_argument("--input-video", type=str, default=default_cfg.input_video_path, help="Path to gameplay video")
-    p.add_argument("--output-dir", type=str, default=default_cfg.output_dir, help="Directory for output JSON files")
+    p.add_argument(
+        "--input-video",
+        type=str,
+        default=default_cfg.input_video_path,
+        help="Path to gameplay video",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=default_cfg.output_dir,
+        help="Directory for output JSON files",
+    )
     p.add_argument("--template-json", type=str, default=default_cfg.template_json_path)
     p.add_argument("--template-dir", type=str, default=default_cfg.template_img_dir)
-    p.add_argument("--start-timestamp", type=float, default=default_cfg.start_timestamp, help="Start time in seconds")
-    p.add_argument("--end-timestamp", type=float, default=default_cfg.end_timestamp, help="End time in seconds (omit or use --full-video for entire video)")
-    p.add_argument("--full-video", action="store_true", help="Process the entire video (overrides --end-timestamp to None)")
-    p.add_argument("--skip-frames", type=int, default=default_cfg.skip_frames, help="Skip N frames between template scans")
-    p.add_argument("--use-hwaccel", action=argparse.BooleanOptionalAction, default=default_cfg.use_hwaccel)
-    p.add_argument("--coarse-to-fine", action=argparse.BooleanOptionalAction, default=default_cfg.coarse_to_fine)
+    p.add_argument(
+        "--start-timestamp",
+        type=float,
+        default=default_cfg.start_timestamp,
+        help="Start time in seconds",
+    )
+    p.add_argument(
+        "--end-timestamp",
+        type=float,
+        default=default_cfg.end_timestamp,
+        help="End time in seconds (omit or use --full-video for entire video)",
+    )
+    p.add_argument(
+        "--full-video",
+        action="store_true",
+        help="Process the entire video (overrides --end-timestamp to None)",
+    )
+    p.add_argument(
+        "--skip-frames",
+        type=int,
+        default=default_cfg.skip_frames,
+        help="Skip N frames between template scans",
+    )
+    p.add_argument(
+        "--use-hwaccel",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.use_hwaccel,
+    )
+    p.add_argument(
+        "--coarse-to-fine",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.coarse_to_fine,
+    )
     p.add_argument("--coarse-margin", type=float, default=default_cfg.coarse_margin)
     p.add_argument("--max-workers", type=int, default=default_cfg.max_workers)
-    p.add_argument("--debug-plot", action=argparse.BooleanOptionalAction, default=default_cfg.debug_plot)
-    p.add_argument("--setup-mode", action=argparse.BooleanOptionalAction, default=default_cfg.setup_mode)
-    p.add_argument("--run-benchmark", action=argparse.BooleanOptionalAction, default=default_cfg.run_benchmark)
+    p.add_argument(
+        "--debug-plot",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.debug_plot,
+    )
+    p.add_argument(
+        "--setup-mode",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.setup_mode,
+    )
+    p.add_argument(
+        "--run-benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.run_benchmark,
+    )
 
     # Run metadata & post-processing options
     p.add_argument("--seed", type=str, default="", help="Optional Balatro run seed")
-    p.add_argument("--deck", type=str, default="red", help="Deck name (e.g. red, blue, plasma, abandoned)")
-    p.add_argument("--stake", type=str, default="white", help="Stake name (e.g. white, red, gold)")
-    p.add_argument("--actions-json", type=str, default=None, help="Existing main.py action JSON (skips Stage 1 template matching)")
-    p.add_argument("--actions-out", type=str, default=None, help="Optional output path for Stage 1 action JSON")
-    p.add_argument("--trajectory-out", type=str, default=None, help="Optional output path for reconstructed trajectory JSON")
-    p.add_argument("--skip-post-processing", action="store_true", help="Run only Stage 1 template action detection")
-    p.add_argument("--fps", type=float, default=None, help="Override source video FPS for post-processing")
-    p.add_argument("--conf-hand", type=float, default=0.50, help="Hand card detector confidence threshold")
-    p.add_argument("--conf-shop", type=float, default=0.15, help="Shop/joker detector confidence threshold")
-    p.add_argument("--conf-ocr", type=float, default=0.90, help="HUD OCR confidence threshold")
+    p.add_argument(
+        "--deck",
+        type=str,
+        default="red",
+        help="Deck name (e.g. red, blue, plasma, abandoned)",
+    )
+    p.add_argument(
+        "--stake", type=str, default="white", help="Stake name (e.g. white, red, gold)"
+    )
+    p.add_argument(
+        "--actions-json",
+        type=str,
+        default=None,
+        help="Existing main.py action JSON (skips Stage 1 template matching)",
+    )
+    p.add_argument(
+        "--actions-out",
+        type=str,
+        default=None,
+        help="Optional output path for Stage 1 action JSON",
+    )
+    p.add_argument(
+        "--trajectory-out",
+        type=str,
+        default=None,
+        help="Optional output path for reconstructed trajectory JSON",
+    )
+    p.add_argument(
+        "--skip-post-processing",
+        action="store_true",
+        help="Run only Stage 1 template action detection",
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Override source video FPS for post-processing",
+    )
+    p.add_argument(
+        "--conf-hand",
+        type=float,
+        default=0.50,
+        help="Hand card detector confidence threshold",
+    )
+    p.add_argument(
+        "--conf-shop",
+        type=float,
+        default=0.15,
+        help="Shop/joker detector confidence threshold",
+    )
+    p.add_argument(
+        "--conf-ocr", type=float, default=0.90, help="HUD OCR confidence threshold"
+    )
     p.add_argument("--batch-size", type=int, default=32, help="CV inference batch size")
-    p.add_argument("--device", type=str, default=None, help="Torch device (e.g. cuda, cpu)")
+    p.add_argument(
+        "--device", type=str, default=None, help="Torch device (e.g. cuda, cpu)"
+    )
     p.add_argument(
         "--expressive",
         action="store_true",

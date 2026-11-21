@@ -98,7 +98,14 @@ SPRITE_SHEETS: dict[str, dict[str, int]] = {
     "Enhancers.png": {"cols": 7, "rows": 5, "tw": 142, "th": 190, "w": 994, "h": 950},
     "stickers.png": {"cols": 5, "rows": 3, "tw": 142, "th": 190, "w": 710, "h": 570},
     "tags.png": {"cols": 6, "rows": 5, "tw": 68, "th": 68, "w": 408, "h": 340},
-    "BlindChips.png": {"cols": 21, "rows": 31, "tw": 68, "th": 68, "w": 1428, "h": 2108},
+    "BlindChips.png": {
+        "cols": 21,
+        "rows": 31,
+        "tw": 68,
+        "th": 68,
+        "w": 1428,
+        "h": 2108,
+    },
     "chips.png": {"cols": 5, "rows": 2, "tw": 58, "th": 58, "w": 290, "h": 116},
 }
 
@@ -108,7 +115,9 @@ _KIND_RE = re.compile(r"""\bkind\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _VALUE_RE = re.compile(r"""\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _SUIT_RE = re.compile(r"""\bsuit\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _POS_RE = re.compile(r"""\bpos\s*=\s*\{\s*x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)\s*\}""")
-_SOUL_POS_RE = re.compile(r"""\bsoul_pos\s*=\s*\{\s*x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)\s*\}""")
+_SOUL_POS_RE = re.compile(
+    r"""\bsoul_pos\s*=\s*\{\s*x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)\s*\}"""
+)
 _HEX_RE = re.compile(r"""\bboss_colour\s*=\s*HEX\(\s*['"]([0-9a-fA-F]+)['"]\s*\)""")
 _ENTRY_START_RE = re.compile(r"""([A-Za-z0-9_]+)\s*=\s*\{""")
 
@@ -233,7 +242,9 @@ def _iter_lua_entries(table_body: str) -> list[tuple[str, str]]:
     return entries
 
 
-def _parse_pos(entry_body: str, pattern: re.Pattern[str] = _POS_RE) -> tuple[int, int] | None:
+def _parse_pos(
+    entry_body: str, pattern: re.Pattern[str] = _POS_RE
+) -> tuple[int, int] | None:
     m = pattern.search(entry_body)
     if not m:
         return None
@@ -311,7 +322,9 @@ def _build_sprite_manifest_cached() -> dict[str, Any]:
                 elif "_mega_" in key:
                     size_tier = "Mega"
                 combo_key = f"{size_tier} {kind}"
-                boosters.setdefault(combo_key, {"sheet": "boosters.png", "x": x, "y": y})
+                boosters.setdefault(
+                    combo_key, {"sheet": "boosters.png", "x": x, "y": y}
+                )
                 if name:
                     boosters.setdefault(name, {"sheet": "boosters.png", "x": x, "y": y})
 
@@ -353,7 +366,11 @@ def _build_sprite_manifest_cached() -> dict[str, Any]:
         name = _first_group(_NAME_RE.search(body))
         pos = _parse_pos(body, _POS_RE)
         if name and pos:
-            b_entry: dict[str, Any] = {"sheet": "BlindChips.png", "x": pos[0], "y": pos[1]}
+            b_entry: dict[str, Any] = {
+                "sheet": "BlindChips.png",
+                "x": pos[0],
+                "y": pos[1],
+            }
             hex_m = _HEX_RE.search(body)
             if hex_m:
                 b_entry["color"] = f"#{hex_m.group(1)}"
@@ -504,7 +521,9 @@ def _format_playing_card_label(card: PlayingCard | dict[str, Any]) -> str:
         enh = card.enhancement.value
     if enh == "stone" or (rank == "none" and suit == "none"):
         return "Stone Card" if enh == "stone" else "Unknown Card"
-    suit_sym = {"spades": "♠", "hearts": "♥", "clubs": "♣", "diamonds": "♦"}.get(suit, suit)
+    suit_sym = {"spades": "♠", "hearts": "♥", "clubs": "♣", "diamonds": "♦"}.get(
+        suit, suit
+    )
     return f"{rank}{suit_sym}"
 
 
@@ -524,7 +543,10 @@ def _populate_joker_fields(d: dict[str, Any], j: Joker) -> None:
 
 def _enrich_joker(j: Joker, state: GameState) -> dict[str, Any]:
     d = _serialize_joker(j)
-    astronomer = any(jk.name == JokerName.ASTRONOMER and not jk.debuffed for jk in state.inventory.jokers)
+    astronomer = any(
+        jk.name == JokerName.ASTRONOMER and not jk.debuffed
+        for jk in state.inventory.jokers
+    )
     _populate_joker_fields(d, j)
     d["sell_value"] = j.get_sell_value(
         discount_percent=state.discount_percent,
@@ -536,7 +558,10 @@ def _enrich_joker(j: Joker, state: GameState) -> dict[str, Any]:
 
 def _enrich_card(card: Card, state: GameState) -> dict[str, Any]:
     d = _serialize_card(card)
-    astronomer = any(jk.name == JokerName.ASTRONOMER and not jk.debuffed for jk in state.inventory.jokers)
+    astronomer = any(
+        jk.name == JokerName.ASTRONOMER and not jk.debuffed
+        for jk in state.inventory.jokers
+    )
     d["edition"] = card.edition.value
     d["couponed"] = card.couponed
     d["rental"] = card.rental
@@ -582,19 +607,26 @@ def _enrich_hand_card(hc: HandCard) -> dict[str, Any]:
     d["resolved"] = True
     if hc.bounds is not None:
         d["resolved"] = hc.bounds.is_resolved
-        d["candidate_count"] = len(hc.bounds.candidate_cards or hc.bounds.candidate_card_ids)
+        d["candidate_count"] = len(
+            hc.bounds.candidate_cards or hc.bounds.candidate_card_ids
+        )
     return d
 
 
 def _enrich_voucher(v: Voucher, state: GameState) -> dict[str, Any]:
     d = _serialize_voucher(v)
-    d["buy_cost"] = v.get_cost(discount_percent=state.discount_percent, inflation=state.inflation)
+    d["buy_cost"] = v.get_cost(
+        discount_percent=state.discount_percent, inflation=state.inflation
+    )
     return d
 
 
 def _enrich_pack(bp: BoosterPack, state: GameState) -> dict[str, Any]:
     d = _serialize_booster_pack(bp)
-    astronomer = any(jk.name == JokerName.ASTRONOMER and not jk.debuffed for jk in state.inventory.jokers)
+    astronomer = any(
+        jk.name == JokerName.ASTRONOMER and not jk.debuffed
+        for jk in state.inventory.jokers
+    )
     d["buy_cost"] = bp.get_cost(
         discount_percent=state.discount_percent,
         inflation=state.inflation,
@@ -617,7 +649,9 @@ def _pop_matching_card(target: PlayingCard, pool: list[PlayingCard]) -> bool:
     return False
 
 
-def _serialize_playing_card_full(pc: PlayingCard, zone: str | None = None) -> dict[str, Any]:
+def _serialize_playing_card_full(
+    pc: PlayingCard, zone: str | None = None
+) -> dict[str, Any]:
     d: dict[str, Any] = {
         "id": pc.id,
         "rank": pc.rank.value,
@@ -662,10 +696,20 @@ def _serialize_state_snapshot(state: GameState) -> dict[str, Any]:
             zone = "in_draw_pile"
         full_deck_list.append(_serialize_playing_card_full(pc, zone=zone))
 
-    draw_pile = [_serialize_playing_card_full(c, zone="in_draw_pile") for c in (state.remaining_deck if state.full_deck is not None else [])]
-    discard_pile = [_serialize_playing_card_full(c, zone="discarded") for c in state.discard_pile]
-    played_round = [_serialize_playing_card_full(c, zone="played_round") for c in state.played_cards_this_round]
-    played_ante = [_serialize_playing_card_full(c) for c in state.played_cards_this_ante]
+    draw_pile = [
+        _serialize_playing_card_full(c, zone="in_draw_pile")
+        for c in (state.remaining_deck if state.full_deck is not None else [])
+    ]
+    discard_pile = [
+        _serialize_playing_card_full(c, zone="discarded") for c in state.discard_pile
+    ]
+    played_round = [
+        _serialize_playing_card_full(c, zone="played_round")
+        for c in state.played_cards_this_round
+    ]
+    played_ante = [
+        _serialize_playing_card_full(c) for c in state.played_cards_this_ante
+    ]
 
     poker_hands: list[dict[str, Any]] = []
     for hand_enum, defaults in POKER_HAND_DEFAULTS.items():
@@ -715,10 +759,14 @@ def _serialize_state_snapshot(state: GameState) -> dict[str, Any]:
         "consumable_slots": state.inventory.consumable_slots,
         "max_consumables": state.inventory.max_consumables,
         "hand_max_size": state.hand.max_size,
-        "small_blind_tag": state.small_blind_tag.value if state.small_blind_tag else None,
+        "small_blind_tag": state.small_blind_tag.value
+        if state.small_blind_tag
+        else None,
         "big_blind_tag": state.big_blind_tag.value if state.big_blind_tag else None,
         "small_blind_orbital_hand": (
-            state.small_blind_orbital_hand.value if state.small_blind_orbital_hand else None
+            state.small_blind_orbital_hand.value
+            if state.small_blind_orbital_hand
+            else None
         ),
         "big_blind_orbital_hand": (
             state.big_blind_orbital_hand.value if state.big_blind_orbital_hand else None
@@ -727,7 +775,9 @@ def _serialize_state_snapshot(state: GameState) -> dict[str, Any]:
         "vouchers_redeemed": [v.value for v in state.vouchers_redeemed],
         "blinds_skipped": state.blinds_skipped,
         "temp_hand_size_bonus": state.temp_hand_size_bonus,
-        "last_tarot_planet": state.last_tarot_planet.value if state.last_tarot_planet else None,
+        "last_tarot_planet": state.last_tarot_planet.value
+        if state.last_tarot_planet
+        else None,
         "gros_michel_extinct": state.gros_michel_extinct,
         "tarots_used": state.tarots_used,
         "unused_discards": state.unused_discards,
@@ -749,9 +799,13 @@ def _serialize_state_snapshot(state: GameState) -> dict[str, Any]:
         "ancient_suit": state.ancient_suit.value,
         "castle_suit": state.castle_suit.value,
         "to_do_poker_hand": state.to_do_poker_hand.value,
-        "locked_hand_type": state.locked_hand_type.value if state.locked_hand_type else None,
+        "locked_hand_type": state.locked_hand_type.value
+        if state.locked_hand_type
+        else None,
         "ox_target_hand": state.ox_target_hand.value if state.ox_target_hand else None,
-        "hands_played_this_round_by_type": sorted(h.value for h in state.hands_played_this_round_by_type),
+        "hands_played_this_round_by_type": sorted(
+            h.value for h in state.hands_played_this_round_by_type
+        ),
         "pending_cv_checks": sorted(state.pending_cv_checks),
         "jokers": [_enrich_joker(j, state) for j in state.inventory.jokers],
         "consumables": [_enrich_card(c, state) for c in state.inventory.consumables],
@@ -759,9 +813,13 @@ def _serialize_state_snapshot(state: GameState) -> dict[str, Any]:
         "shop_cards": [_enrich_card(c, state) for c in state.shop_cards],
         "shop_vouchers": [_enrich_voucher(v, state) for v in state.shop_vouchers],
         "shop_packs": [_enrich_pack(bp, state) for bp in state.shop_packs],
-        "active_pack": _enrich_pack(state.active_pack, state) if state.active_pack else None,
+        "active_pack": _enrich_pack(state.active_pack, state)
+        if state.active_pack
+        else None,
         "pack_choices_remaining": state.pack_choices_remaining,
-        "pre_pack_location": state.pre_pack_location.value if state.pre_pack_location else None,
+        "pre_pack_location": state.pre_pack_location.value
+        if state.pre_pack_location
+        else None,
         "pending_packs": [_enrich_pack(bp, state) for bp in state.pending_packs],
         "pack_cards": [_enrich_card(c, state) for c in state.pack_cards],
         "poker_hands": poker_hands,
@@ -783,7 +841,12 @@ def _ordered_jokers_for_action(
     j_order: Sequence[int] | None,
 ) -> list[dict[str, Any]]:
     """Applies action joker reordering before resolving SELL_CARD indices, matching `rules.py`."""
-    if not j_order or not jokers or len(j_order) != len(jokers) or len(set(j_order)) != len(j_order):
+    if (
+        not j_order
+        or not jokers
+        or len(j_order) != len(jokers)
+        or len(set(j_order)) != len(j_order)
+    ):
         return jokers
     by_id = {j.get("id"): j for j in jokers if j.get("id")}
     if all(jid in by_id for jid in j_order):
@@ -798,13 +861,19 @@ def _enrich_observed_shop(raw_obs: Any, cost_state: GameState) -> dict[str, Any]
     if not isinstance(raw_obs, dict):
         return None
     return {
-        "cards": [_enrich_card(_deserialize_card(c), cost_state) for c in raw_obs.get("cards", ())],
+        "cards": [
+            _enrich_card(_deserialize_card(c), cost_state)
+            for c in raw_obs.get("cards", ())
+        ],
         "vouchers": [
             {"type": "voucher", **_enrich_voucher(_deserialize_voucher(v), cost_state)}
             for v in raw_obs.get("vouchers", ())
         ],
         "packs": [
-            {"type": "booster_pack", **_enrich_pack(_deserialize_booster_pack(p), cost_state)}
+            {
+                "type": "booster_pack",
+                **_enrich_pack(_deserialize_booster_pack(p), cost_state),
+            }
             for p in raw_obs.get("packs", ())
         ],
     }
@@ -840,7 +909,9 @@ def _attach_hand_exit_breakdown(
         selected = [hc["card"] for hc in prev_snap["hand"] if hc.get("selected")]
 
     newly_discarded: list[dict[str, Any]] = []
-    if len(curr_disc) >= len(prev_disc) and list(curr_disc[: len(prev_disc)]) == list(prev_disc):
+    if len(curr_disc) >= len(prev_disc) and list(curr_disc[: len(prev_disc)]) == list(
+        prev_disc
+    ):
         newly_discarded = list(curr_disc[len(prev_disc) :])
 
     if act_dict["type"] == ActionType.PLAY_HAND.value:
@@ -857,7 +928,9 @@ def _attach_hand_exit_breakdown(
                         break
             if matched_idx is None:
                 for pi, pc in enumerate(played_pool):
-                    if pc.get("rank") == card_d.get("rank") and pc.get("suit") == card_d.get("suit"):
+                    if pc.get("rank") == card_d.get("rank") and pc.get(
+                        "suit"
+                    ) == card_d.get("suit"):
                         matched_idx = pi
                         break
             if matched_idx is not None:
@@ -882,7 +955,9 @@ def _resolve_action_with_target(
     out = _serialize_action(act)
     # Keep selected cards clean and fully labeled even when compact
     if act.selected_cards:
-        out["selected_cards"] = [_serialize_playing_card_full(c) for c in act.selected_cards]
+        out["selected_cards"] = [
+            _serialize_playing_card_full(c) for c in act.selected_cards
+        ]
 
     obs_shop = (
         _enrich_observed_shop(act.metadata.get("observed_shop"), cost_state)
@@ -903,7 +978,11 @@ def _resolve_action_with_target(
         obs_cards = obs_shop["cards"] if obs_shop else []
         shop_items = obs_cards or ref.get("shop_cards", [])
         pack_items = ref.get("pack_cards", [])
-        if not obs_cards and ref.get("location") == "pack" and 0 <= idx < len(pack_items):
+        if (
+            not obs_cards
+            and ref.get("location") == "pack"
+            and 0 <= idx < len(pack_items)
+        ):
             item = pack_items[idx]
             target_item = {
                 "area": "pack_cards",
@@ -930,7 +1009,11 @@ def _resolve_action_with_target(
                     "item": item,
                 }
         else:
-            target_item = {"area": "shop_cards", "idx": idx, "label": meta_tc or f"Card Option #{idx}"}
+            target_item = {
+                "area": "shop_cards",
+                "idx": idx,
+                "label": meta_tc or f"Card Option #{idx}",
+            }
     elif act.type == ActionType.REDEEM_VOUCHER and idx is not None:
         obs_vouchers = obs_shop["vouchers"] if obs_shop else []
         items = obs_vouchers or ref.get("shop_vouchers", [])
@@ -974,7 +1057,11 @@ def _resolve_action_with_target(
                 "item": item,
             }
         else:
-            target_item = {"area": "pack_cards", "idx": idx, "label": meta_tc or f"Pack Option #{idx}"}
+            target_item = {
+                "area": "pack_cards",
+                "idx": idx,
+                "label": meta_tc or f"Pack Option #{idx}",
+            }
     elif act.type == ActionType.USE_CONSUMABLE and idx is not None:
         items = ref.get("consumables", [])
         if 0 <= idx < len(items):
@@ -1018,8 +1105,16 @@ def _resolve_action_with_target(
             }
     elif act.type == ActionType.SELECT_BLIND:
         blind = ref.get("current_blind", "Small Blind")
-        display = ref.get("boss_blind") if blind not in ("Small Blind", "Big Blind") else blind
-        target_item = {"area": "blind", "label": display or blind, "blind": display or blind}
+        display = (
+            ref.get("boss_blind")
+            if blind not in ("Small Blind", "Big Blind")
+            else blind
+        )
+        target_item = {
+            "area": "blind",
+            "label": display or blind,
+            "blind": display or blind,
+        }
     elif act.type == ActionType.SKIP_BLIND:
         blind = ref.get("current_blind", "Blind")
         tag = (
@@ -1038,7 +1133,9 @@ def _resolve_action_with_target(
     return out
 
 
-def _diff_jokers(prev_list: list[dict[str, Any]], curr_list: list[dict[str, Any]]) -> dict[str, Any]:
+def _diff_jokers(
+    prev_list: list[dict[str, Any]], curr_list: list[dict[str, Any]]
+) -> dict[str, Any]:
     prev_by_id = {j["id"]: j for j in prev_list if j.get("id")}
     curr_by_id = {j["id"]: j for j in curr_list if j.get("id")}
 
@@ -1047,7 +1144,13 @@ def _diff_jokers(prev_list: list[dict[str, Any]], curr_list: list[dict[str, Any]
         changed = prev_list != curr_list
         added = [i for i, j in enumerate(curr_list) if j not in prev_list]
         removed = [j for j in prev_list if j not in curr_list]
-        return {"added_indices": added, "removed": removed, "updated": {}, "reordered": False, "changed": changed}
+        return {
+            "added_indices": added,
+            "removed": removed,
+            "updated": {},
+            "reordered": False,
+            "changed": changed,
+        }
 
     added_ids = [j["id"] for j in curr_list if j["id"] not in prev_by_id]
     removed = [j for j in prev_list if j["id"] not in curr_by_id]
@@ -1141,14 +1244,23 @@ def _diff_simple_items(
     }
 
 
-def _diff_hand(prev_hand: list[dict[str, Any]], curr_hand: list[dict[str, Any]]) -> dict[str, Any]:
+def _diff_hand(
+    prev_hand: list[dict[str, Any]], curr_hand: list[dict[str, Any]]
+) -> dict[str, Any]:
     def _hand_id(hc: dict[str, Any]) -> Any:
         if hc.get("slot_uid"):
             return ("uid", hc["slot_uid"])
         c = hc.get("card", {})
         if c.get("id"):
             return ("card_id", c["id"])
-        return ("rs", c.get("rank"), c.get("suit"), c.get("enhancement"), c.get("seal"), c.get("edition"))
+        return (
+            "rs",
+            c.get("rank"),
+            c.get("suit"),
+            c.get("enhancement"),
+            c.get("seal"),
+            c.get("edition"),
+        )
 
     prev_used = [False] * len(prev_hand)
     added_indices: list[int] = []
@@ -1173,7 +1285,15 @@ def _diff_hand(prev_hand: list[dict[str, Any]], curr_hand: list[dict[str, Any]])
                 if phc.get(f) != chc.get(f):
                     diffs[f] = {"prev": phc.get(f), "curr": chc.get(f)}
             pc, cc = phc.get("card", {}), chc.get("card", {})
-            for cf in ("rank", "suit", "enhancement", "seal", "edition", "bonus_chips", "debuffed"):
+            for cf in (
+                "rank",
+                "suit",
+                "enhancement",
+                "seal",
+                "edition",
+                "bonus_chips",
+                "debuffed",
+            ):
                 if pc.get(cf) != cc.get(cf):
                     diffs[f"card.{cf}"] = {"prev": pc.get(cf), "curr": cc.get(cf)}
             if diffs:
@@ -1219,17 +1339,25 @@ def _diff_full_deck(
             mods: dict[str, Any] = {}
             for f, default_val in deck_field_defaults.items():
                 if pc.get(f, default_val) != cc.get(f, default_val):
-                    mods[f] = {"prev": pc.get(f, default_val), "curr": cc.get(f, default_val)}
+                    mods[f] = {
+                        "prev": pc.get(f, default_val),
+                        "curr": cc.get(f, default_val),
+                    }
             if mods:
                 modified[str(cid)] = mods
             if pc.get("zone") != cc.get("zone"):
-                zone_changed[str(cid)] = {"prev": pc.get("zone", ""), "curr": cc.get("zone", "")}
+                zone_changed[str(cid)] = {
+                    "prev": pc.get("zone", ""),
+                    "curr": cc.get("zone", ""),
+                }
         for cid, pc in prev_by_id.items():
             if cid not in curr_by_id:
                 removed.append(pc)
     else:
         if prev_deck != curr_deck:
-            added_ids = [c.get("id", i) for i, c in enumerate(curr_deck) if c not in prev_deck]
+            added_ids = [
+                c.get("id", i) for i, c in enumerate(curr_deck) if c not in prev_deck
+            ]
             removed = [c for c in prev_deck if c not in curr_deck]
 
     return {
@@ -1249,17 +1377,53 @@ def _compute_step_diff(
         return {
             "has_changes": False,
             "changed_fields": {},
-            "jokers": {"added_ids": [], "removed": [], "updated": {}, "reordered": False, "changed": False},
-            "consumables": {"added_indices": [], "removed": [], "updated": {}, "reordered": False, "changed": False},
-            "hand": {"added_indices": [], "removed": [], "updated": {}, "reordered": False, "changed": False},
-            "shop_cards": {"added_indices": [], "removed": [], "updated": {}, "reordered": False, "changed": False},
+            "jokers": {
+                "added_ids": [],
+                "removed": [],
+                "updated": {},
+                "reordered": False,
+                "changed": False,
+            },
+            "consumables": {
+                "added_indices": [],
+                "removed": [],
+                "updated": {},
+                "reordered": False,
+                "changed": False,
+            },
+            "hand": {
+                "added_indices": [],
+                "removed": [],
+                "updated": {},
+                "reordered": False,
+                "changed": False,
+            },
+            "shop_cards": {
+                "added_indices": [],
+                "removed": [],
+                "updated": {},
+                "reordered": False,
+                "changed": False,
+            },
             "shop_vouchers": {"added": [], "removed": [], "changed": False},
             "shop_packs": {"added": [], "removed": [], "changed": False},
-            "pack_cards": {"added_indices": [], "removed": [], "updated": {}, "reordered": False, "changed": False},
+            "pack_cards": {
+                "added_indices": [],
+                "removed": [],
+                "updated": {},
+                "reordered": False,
+                "changed": False,
+            },
             "active_tags": {"added": [], "removed": [], "changed": False},
             "vouchers_redeemed": {"added": [], "removed": [], "changed": False},
             "poker_hands": {},
-            "full_deck": {"added_ids": [], "removed": [], "modified": {}, "zone_changed": {}, "changed": False},
+            "full_deck": {
+                "added_ids": [],
+                "removed": [],
+                "modified": {},
+                "zone_changed": {},
+                "changed": False,
+            },
             "badges": [],
             "summary_items": [],
         }
@@ -1282,13 +1446,32 @@ def _compute_step_diff(
     shop_cards_diff = _diff_simple_items(
         prev_snap["shop_cards"],
         curr_snap["shop_cards"],
-        identity_fn=lambda c: (c.get("type"), c.get("name"), c.get("rank"), c.get("suit"), c.get("id")),
-        compare_fields=("buy_cost", "edition", "couponed", "rental", "eternal", "perishable"),
+        identity_fn=lambda c: (
+            c.get("type"),
+            c.get("name"),
+            c.get("rank"),
+            c.get("suit"),
+            c.get("id"),
+        ),
+        compare_fields=(
+            "buy_cost",
+            "edition",
+            "couponed",
+            "rental",
+            "eternal",
+            "perishable",
+        ),
     )
     pack_cards_diff = _diff_simple_items(
         prev_snap["pack_cards"],
         curr_snap["pack_cards"],
-        identity_fn=lambda c: (c.get("type"), c.get("name"), c.get("rank"), c.get("suit"), c.get("id")),
+        identity_fn=lambda c: (
+            c.get("type"),
+            c.get("name"),
+            c.get("rank"),
+            c.get("suit"),
+            c.get("id"),
+        ),
         compare_fields=("edition", "enhancement", "seal"),
     )
 
@@ -1357,7 +1540,9 @@ def _compute_step_diff(
         )
     if "money" in changed_fields:
         badges.append("money")
-        summary.append(f"Money: ${changed_fields['money']['prev']} -> ${changed_fields['money']['curr']}")
+        summary.append(
+            f"Money: ${changed_fields['money']['prev']} -> ${changed_fields['money']['curr']}"
+        )
     if "current_chips" in changed_fields:
         badges.append("score")
         summary.append(
@@ -1380,10 +1565,16 @@ def _compute_step_diff(
         for rj in jokers_diff.get("removed", []):
             summary.append(f"-Joker: {rj['name']}")
         for jid, udiffs in jokers_diff.get("updated", {}).items():
-            jname = curr_j_by_id.get(int(jid), {}).get("name", f"Joker #{jid}") if jid.isdigit() else f"Joker #{jid}"
+            jname = (
+                curr_j_by_id.get(int(jid), {}).get("name", f"Joker #{jid}")
+                if jid.isdigit()
+                else f"Joker #{jid}"
+            )
             summary.append(f"~Joker {jname}: {', '.join(udiffs.keys())}")
         if jokers_diff.get("reordered") and not (
-            jokers_diff.get("added_ids") or jokers_diff.get("removed") or jokers_diff.get("updated")
+            jokers_diff.get("added_ids")
+            or jokers_diff.get("removed")
+            or jokers_diff.get("updated")
         ):
             summary.append("Jokers reordered")
     if consumables_diff["changed"]:
@@ -1394,7 +1585,11 @@ def _compute_step_diff(
             summary.append(f"-Consumable: {rc.get('name')}")
     if hand_diff["changed"]:
         badges.append("hand")
-    if shop_cards_diff["changed"] or shop_vouchers_diff["changed"] or shop_packs_diff["changed"]:
+    if (
+        shop_cards_diff["changed"]
+        or shop_vouchers_diff["changed"]
+        or shop_packs_diff["changed"]
+    ):
         badges.append("shop")
     if pack_cards_diff["changed"] or "active_pack" in changed_fields:
         badges.append("pack")
@@ -1412,7 +1607,9 @@ def _compute_step_diff(
         badges.append("poker_hands")
         for hname, hdiff in poker_hands_diff.items():
             if "level" in hdiff:
-                summary.append(f"{hname}: Lvl {hdiff['level']['prev']} -> {hdiff['level']['curr']}")
+                summary.append(
+                    f"{hname}: Lvl {hdiff['level']['prev']} -> {hdiff['level']['curr']}"
+                )
             if "play_count" in hdiff:
                 summary.append(
                     f"{hname}: Played {hdiff['play_count']['prev']} -> {hdiff['play_count']['curr']}"
@@ -1563,7 +1760,9 @@ def find_matching_video(
 
     # Fallback prefix match against videos in `video_dir`
     if video_dir.is_dir():
-        videos = [p for p in video_dir.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS]
+        videos = [
+            p for p in video_dir.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS
+        ]
         videos.sort(key=lambda p: len(p.stem), reverse=True)
         for vp in videos:
             if stripped_ts.startswith(vp.stem) or vp.stem.startswith(stripped_ts):
@@ -1609,7 +1808,9 @@ def discover_telemetry_sources(
     for tdir in DEFAULT_TELEMETRY_DIRS:
         if tdir.is_dir():
             candidates.extend(
-                p for p in tdir.iterdir() if p.is_file() and p.suffix.lower() == ".jsonl"
+                p
+                for p in tdir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".jsonl"
             )
     if traj_dir.is_dir():
         candidates.extend(
@@ -1686,7 +1887,10 @@ class VideoFrameCache:
             return
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            self.meta = {"available": False, "error": f"Failed to open {video_path.name}"}
+            self.meta = {
+                "available": False,
+                "error": f"Failed to open {video_path.name}",
+            }
             return
         self._cap = cap
         self.meta = {
@@ -1701,12 +1905,18 @@ class VideoFrameCache:
 
     def _clamp_frame(self, frame_idx: int) -> int:
         total = self.meta.get("total_frames") or 0
-        return max(0, min(int(frame_idx), total - 1)) if total > 0 else max(0, int(frame_idx))
+        return (
+            max(0, min(int(frame_idx), total - 1))
+            if total > 0
+            else max(0, int(frame_idx))
+        )
 
     def _evict_if_needed(self) -> None:
         """Evicts oldest non-pinned cached frame while over `max_items` (caller holds `_lock`)."""
         while len(self._cache) > self.max_items:
-            evict_key = next((k for k in self._cache if k not in self._pinned_frames), None)
+            evict_key = next(
+                (k for k in self._cache if k not in self._pinned_frames), None
+            )
             if evict_key is None:
                 self._cache.popitem(last=False)
             else:
@@ -1735,7 +1945,9 @@ class VideoFrameCache:
                     self._last_pos = None
                     return None
             self._last_pos = clamped + 1
-            ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            ok_enc, buf = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+            )
             if not ok_enc:
                 return None
             jpg_bytes = buf.tobytes()
@@ -1852,7 +2064,9 @@ class VideoFrameCache:
                     continue
 
                 last_pos = clamped + 1
-                ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                ok_enc, buf = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+                )
                 if not ok_enc:
                     continue
                 jpg_bytes = buf.tobytes()
@@ -1870,7 +2084,9 @@ class VideoFrameCache:
     def preload_status(self) -> dict[str, Any]:
         with self._lock:
             p_total = len(self._preload_priority_targets)
-            p_cached = sum(1 for f in self._preload_priority_targets if f in self._cache)
+            p_cached = sum(
+                1 for f in self._preload_priority_targets if f in self._cache
+            )
             a_total = len(self._preload_all_targets)
             a_cached = sum(1 for f in self._preload_all_targets if f in self._cache)
             return {
@@ -1964,7 +2180,9 @@ class _VisualizerState:
             "comparison": None,
         }
         if trajectory_path is not None and trajectory_path.is_file():
-            should_compare = self.telemetry_path is not None and self.telemetry_path.is_file()
+            should_compare = (
+                self.telemetry_path is not None and self.telemetry_path.is_file()
+            )
             self.load_trajectory(
                 trajectory_path,
                 explicit_video=video_path,
@@ -1984,11 +2202,17 @@ class _VisualizerState:
             comp = self.comparison
         if cache is None or not cache.meta.get("available"):
             return
-        err_indices = set(comp.get("summary", {}).get("error_step_indices", [])) if comp else set()
+        err_indices = (
+            set(comp.get("summary", {}).get("error_step_indices", []))
+            if comp
+            else set()
+        )
         priority: list[int] = []
         secondary: list[int] = []
         for idx, st in enumerate(steps):
-            frame_idx = int(st.get("frame_idx") or st.get("state", {}).get("frame_idx") or 0)
+            frame_idx = int(
+                st.get("frame_idx") or st.get("state", {}).get("frame_idx") or 0
+            )
             if idx in err_indices:
                 priority.append(frame_idx)
             else:
@@ -2004,7 +2228,9 @@ class _VisualizerState:
     ) -> dict[str, Any]:
         traj_path = traj_path.resolve()
         data = json.loads(traj_path.read_text(encoding="utf-8"))
-        matched_video = find_matching_video(traj_path, explicit_video, video_dir=self.video_dir)
+        matched_video = find_matching_video(
+            traj_path, explicit_video, video_dir=self.video_dir
+        )
         new_cache = VideoFrameCache(matched_video)
         new_payload = build_visualization_payload(data, video_info=new_cache.meta)
         new_payload["trajectory_name"] = traj_path.name
@@ -2178,12 +2404,15 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
             *,
             cache_control: str = "no-store",
         ) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", cache_control)
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
 
         def _send_json(self, status: int, obj: Any) -> None:
             raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
@@ -2193,7 +2422,9 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
             video_path = app_state.get_video_path()
             if video_path is None or not video_path.is_file():
                 if send_body:
-                    self._send_json(404, {"error": "No video loaded for active trajectory"})
+                    self._send_json(
+                        404, {"error": "No video loaded for active trajectory"}
+                    )
                 else:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")
@@ -2284,10 +2515,14 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
                 raw_src = qs.get("source", [""])[0]
                 seed_arg = qs.get("seed", [None])[0]
                 run_idx_raw = qs.get("run_index", [None])[0]
-                run_idx_arg = int(run_idx_raw) if run_idx_raw and run_idx_raw.isdigit() else None
+                run_idx_arg = (
+                    int(run_idx_raw) if run_idx_raw and run_idx_raw.isdigit() else None
+                )
                 resolved, status, err_msg = _resolve_compare_source(raw_src, app_state)
                 if status != 200:
-                    self._send_json(status, {"error": err_msg or "Invalid comparison request"})
+                    self._send_json(
+                        status, {"error": err_msg or "Invalid comparison request"}
+                    )
                     return
                 try:
                     report = app_state.run_comparison(
@@ -2332,7 +2567,9 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
                     if not candidate.is_file():
                         candidate = app_state.traj_dir / Path(req_name).name
                     if not candidate.is_file():
-                        self._send_json(404, {"error": f"Trajectory not found: {req_name}"})
+                        self._send_json(
+                            404, {"error": f"Trajectory not found: {req_name}"}
+                        )
                         return
                     try:
                         payload = app_state.load_trajectory(candidate)
@@ -2357,13 +2594,19 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
                 with app_state.lock:
                     cache = app_state.frame_cache
                 if cache is None or not cache.meta.get("available"):
-                    self._send_json(404, {"error": "No video loaded for active trajectory"})
+                    self._send_json(
+                        404, {"error": "No video loaded for active trajectory"}
+                    )
                     return
                 jpg = cache.get_frame_jpeg(frame_idx)
                 if jpg is None:
-                    self._send_json(404, {"error": f"Failed to decode frame {frame_idx}"})
+                    self._send_json(
+                        404, {"error": f"Failed to decode frame {frame_idx}"}
+                    )
                     return
-                self._send_bytes(200, "image/jpeg", jpg, cache_control="public, max-age=3600")
+                self._send_bytes(
+                    200, "image/jpeg", jpg, cache_control="public, max-age=3600"
+                )
                 return
 
             if path.startswith("/textures/"):
@@ -2395,6 +2638,18 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
     return VisualizerHandler
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that suppresses noisy client-disconnect socket errors."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        _, exc, _ = sys.exc_info()
+        if isinstance(
+            exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+
 class TrajectoryVisualizerServer:
     """Wrapper around `ThreadingHTTPServer` for programmatic / CLI lifecycle control."""
 
@@ -2422,7 +2677,7 @@ class TrajectoryVisualizerServer:
             telemetry_run_index=telemetry_run_index,
         )
         handler = _make_request_handler(self.app_state, verbose=verbose)
-        self.httpd = ThreadingHTTPServer((host, port), handler)
+        self.httpd = _QuietThreadingHTTPServer((host, port), handler)
         self.httpd.daemon_threads = True
         self.host, self.port = self.httpd.server_address[:2]
 
@@ -4402,7 +4657,9 @@ def _resolve_default_trajectory(traj_dir: Path) -> Path | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interactive Balatro Run Trajectory Visualizer")
+    parser = argparse.ArgumentParser(
+        description="Interactive Balatro Run Trajectory Visualizer"
+    )
     parser.add_argument(
         "--trajectory",
         "-t",
@@ -4437,8 +4694,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional MP4 path (auto-discovered from assets/sample_inputs/videos/ if omitted)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="HTTP bind host (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8765, help="HTTP port (default: 8765)"
+    )
     parser.add_argument(
         "--no-browser",
         action="store_true",
@@ -4473,8 +4734,12 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[TrajectoryVisualizer] Serving at {server.url}")
     if traj_path:
         print(f"[TrajectoryVisualizer] Loaded trajectory: {traj_path}")
-    if server.app_state.frame_cache and server.app_state.frame_cache.meta.get("available"):
-        print(f"[TrajectoryVisualizer] Matched video: {server.app_state.frame_cache.meta['filename']}")
+    if server.app_state.frame_cache and server.app_state.frame_cache.meta.get(
+        "available"
+    ):
+        print(
+            f"[TrajectoryVisualizer] Matched video: {server.app_state.frame_cache.meta['filename']}"
+        )
     if server.app_state.comparison is not None:
         sm = server.app_state.comparison["summary"]
         print(

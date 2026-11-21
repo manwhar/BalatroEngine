@@ -441,14 +441,14 @@ class TestNewRoundTargetJokers(unittest.TestCase):
         hands = run.predict_to_do_list_hands(rounds=10)
         self.assertEqual(len(hands), 10)
         self.assertIsInstance(hands[0], PokerHand)
-        self.assertEqual(hands[0], PokerHand.STRAIGHT)
+        self.assertEqual(hands[0], PokerHand.STRAIGHT_FLUSH)
         self.assertEqual(
             hands[:4],
             [
+                PokerHand.STRAIGHT_FLUSH,
+                PokerHand.HIGH_CARD,
                 PokerHand.STRAIGHT,
                 PokerHand.FLUSH,
-                PokerHand.THREE_OF_A_KIND,
-                PokerHand.FOUR_OF_A_KIND,
             ],
         )
         for i in range(1, len(hands)):
@@ -461,12 +461,50 @@ class TestNewRoundTargetJokers(unittest.TestCase):
         self.assertEqual(
             hands_with_secret,
             [
-                PokerHand.STRAIGHT,
-                PokerHand.FLUSH,
-                PokerHand.THREE_OF_A_KIND,
                 PokerHand.STRAIGHT_FLUSH,
+                PokerHand.HIGH_CARD,
+                PokerHand.FLUSH_FIVE,
+                PokerHand.PAIR,
             ],
         )
+
+    def test_to_do_list_matches_real_telemetry_seeds(self) -> None:
+        """Verify LuaJIT pairs(G.GAME.hands) iteration order matches recorded Balatro runs."""
+        # Seed LX6LFV2Q: initial Buffoon/Shop To Do List spawn rolls High Card
+        lx_run = BalatroRun(seed="LX6LFV2Q")
+        self.assertEqual(
+            lx_run.get_to_do_list_hand(is_initial_spawn=True),
+            PokerHand.HIGH_CARD,
+        )
+
+        # Seed DMF1SJ5Y: two concurrent To Do List instances sharing the `'to_do'` stream
+        # across secret hand unlocks (Five of a Kind unlocked at round 3).
+        dmf_run = BalatroRun(seed="DMF1SJ5Y")
+        j1 = dmf_run.get_to_do_list_hand(is_initial_spawn=True)  # call 1: step 0
+        self.assertEqual(j1, PokerHand.FLUSH)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 2: round 1
+        self.assertEqual(j1, PokerHand.HIGH_CARD)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 3: round 2
+        self.assertEqual(j1, PokerHand.TWO_PAIR)
+        dmf_run.unlock_secret_hand(PokerHand.FIVE_OF_A_KIND)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 4: round 3
+        self.assertEqual(j1, PokerHand.PAIR)
+        j2 = dmf_run.get_to_do_list_hand(is_initial_spawn=True)  # call 5: second To Do List
+        self.assertEqual(j2, PokerHand.TWO_PAIR)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 6: round 4
+        self.assertEqual(j1, PokerHand.THREE_OF_A_KIND)
+        j2 = dmf_run.get_to_do_list_hand(current_hand=j2)  # call 7: round 4
+        self.assertEqual(j2, PokerHand.THREE_OF_A_KIND)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 8: round 5
+        self.assertEqual(j1, PokerHand.TWO_PAIR)
+        j2 = dmf_run.get_to_do_list_hand(current_hand=j2)  # call 9: round 5
+        self.assertEqual(j2, PokerHand.FOUR_OF_A_KIND)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 10: round 6
+        self.assertEqual(j1, PokerHand.FIVE_OF_A_KIND)
+        j2 = dmf_run.get_to_do_list_hand(current_hand=j2)  # call 11: round 6
+        self.assertEqual(j2, PokerHand.STRAIGHT)
+        j1 = dmf_run.get_to_do_list_hand(current_hand=j1)  # call 12: round 7
+        self.assertEqual(j1, PokerHand.HIGH_CARD)
 
 
 class TestMidAnteDeckChanges(unittest.TestCase):

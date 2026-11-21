@@ -70,7 +70,7 @@ try:
         predict_vagabond_tarot,
         state_has_showman,
     )
-    from game.engine.rng_sim.state import SimDeck
+    from game.engine.rng_sim.state import DEFAULT_VISIBLE_POKER_HANDS, SimDeck
     from game.balatro_models import Spectral, SpectralName, Tarot
 except ImportError:
     from engine.rng_sim.events import (
@@ -94,7 +94,7 @@ except ImportError:
         predict_vagabond_tarot,
         state_has_showman,
     )
-    from engine.rng_sim.state import SimDeck
+    from engine.rng_sim.state import DEFAULT_VISIBLE_POKER_HANDS, SimDeck
     from balatro_models import Spectral, SpectralName, Tarot
 
 
@@ -191,6 +191,16 @@ def get_card_repetitions(card: PlayingCard, scoring_idx: int, state) -> int:
     return triggers
 
 
+def _get_visible_poker_hands(state) -> list[PokerHand]:
+    """Returns currently visible poker hands (default 9 plus any unlocked secret hands)."""
+    visible = list(DEFAULT_VISIBLE_POKER_HANDS)
+    counts = getattr(state, "hand_play_counts", None) or {}
+    for secret in (PokerHand.FIVE_OF_A_KIND, PokerHand.FLUSH_HOUSE, PokerHand.FLUSH_FIVE):
+        if counts.get(secret, 0) > 0 and secret not in visible:
+            visible.append(secret)
+    return visible
+
+
 def init_joker_default_state(state, joker: Joker) -> None:
     """Populates default keys in joker.state if not already initialized."""
     match joker.name:
@@ -201,13 +211,19 @@ def init_joker_default_state(state, joker: Joker) -> None:
                 if getattr(state, "rng", None):
                     hand = get_to_do_list_hand(
                         state.rng,
-                        current_hand=state.to_do_poker_hand,
+                        current_hand=None,
+                        visible_hands=_get_visible_poker_hands(state),
                         is_initial_spawn=True,
                     )
-                    state.to_do_poker_hand = hand
                 else:
                     hand = state.to_do_poker_hand
                 joker.state["target_hand"] = hand
+            else:
+                hand = joker.state["target_hand"]
+                if not isinstance(hand, PokerHand):
+                    hand = PokerHand(str(hand))
+                    joker.state["target_hand"] = hand
+            state.to_do_poker_hand = hand
         case JokerName.THE_IDOL:
             joker.state.setdefault("target_rank", state.idol_card[0])
             joker.state.setdefault("target_suit", state.idol_card[1])
@@ -432,6 +448,7 @@ def handle_to_do_list(joker: Joker, ctx: TriggerContext):
             next_hand = get_to_do_list_hand(
                 ctx.state.rng,
                 current_hand=joker.state.get("target_hand", ctx.state.to_do_poker_hand),
+                visible_hands=_get_visible_poker_hands(ctx.state),
             )
         else:
             next_hand = joker.state.get("target_hand", ctx.state.to_do_poker_hand)

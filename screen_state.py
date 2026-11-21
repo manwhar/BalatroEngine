@@ -199,7 +199,7 @@ class ScreenStateTracker:
         if self.allow_play_game:
             allowed = allowed | {"Play Game"}
         if (
-            self.state == CoarseScreenState.SHOP
+            self.state in (CoarseScreenState.SHOP, CoarseScreenState.PACK_OR_SHOP)
             and frame_idx is not None
             and self.last_cash_out_frame is not None
             and 0 <= (frame_idx - self.last_cash_out_frame) < self.shop_next_round_cooldown_frames
@@ -289,6 +289,8 @@ class ScreenStateTracker:
             self.pre_pack_location = return_loc
             # Mega packs (choose=2) or Double-Tagged Skip Packs keep the player in PACK,
             # while single-choice packs return immediately to return_loc.
+            if return_loc == Location.SHOP and frame_idx is not None:
+                self.last_cash_out_frame = frame_idx
             self.state = (
                 CoarseScreenState.PACK_OR_SELECT
                 if return_loc == Location.SELECT
@@ -303,6 +305,8 @@ class ScreenStateTracker:
             else:
                 self.state = CoarseScreenState.SHOP
                 self.pre_pack_location = None
+                if frame_idx is not None:
+                    self.last_cash_out_frame = frame_idx
         elif template_name in _HELD_ITEM_ACTIONS:
             # Selling or using a held consumable never leaves the current screen.
             pass

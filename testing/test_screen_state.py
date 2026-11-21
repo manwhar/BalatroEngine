@@ -127,6 +127,24 @@ class TestScreenStateTracker(unittest.TestCase):
         self.assertNotIn("Play Hand", tracker.allowed_template_names())
         self.assertIn("Cash Out", tracker.allowed_template_names())
 
+    def test_shop_pack_exit_triggers_next_round_cooldown(self):
+        tracker = ScreenStateTracker()
+        tracker.on_template_clicked("Select Blind", frame_idx=100)
+        tracker.on_template_clicked("Cash Out", frame_idx=200)
+        self.assertNotIn("Next Round", tracker.allowed_template_names(frame_idx=230))
+        self.assertIn("Next Round", tracker.allowed_template_names(frame_idx=265))
+
+        # Closing a booster pack slides the Shop back up and also suppresses premature Next Round
+        tracker.on_template_clicked("Open Pack", frame_idx=400)
+        tracker.on_template_clicked("Use In Pack", frame_idx=500)
+        self.assertNotIn("Next Round", tracker.allowed_template_names(frame_idx=532))
+        self.assertIn("Next Round", tracker.allowed_template_names(frame_idx=565))
+
+        tracker.on_template_clicked("Open Pack", frame_idx=700)
+        tracker.on_template_clicked("Skip Pack", frame_idx=800)
+        self.assertNotIn("Next Round", tracker.allowed_template_names(frame_idx=850))
+        self.assertIn("Next Round", tracker.allowed_template_names(frame_idx=865))
+
     def test_consistency_with_gamestate(self):
         s_blind = GameState(location=Location.BLIND, hands_left=4, discards_left=3)
         for tmpl in ("Play Hand", "Discard", "Sort by Rank", "Sort by Suit", "Sell Card", "Use Consumable"):

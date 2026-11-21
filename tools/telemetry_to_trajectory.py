@@ -138,7 +138,11 @@ def split_telemetry_runs(entries: list[dict[str, Any]]) -> list[list[dict[str, A
         ps = prev.get("state", {})
         cs = entry.get("state", {})
         is_new = False
-        if entry.get("run_id") and prev.get("run_id") and entry["run_id"] != prev["run_id"]:
+        if (
+            entry.get("run_id")
+            and prev.get("run_id")
+            and entry["run_id"] != prev["run_id"]
+        ):
             is_new = True
         elif int(entry.get("step", 0)) <= int(prev.get("step", 0)):
             is_new = True
@@ -150,6 +154,13 @@ def split_telemetry_runs(entries: list[dict[str, Any]]) -> list[list[dict[str, A
             is_new = True
         elif entry.get("action") == "Setup Test Suite":
             is_new = True
+        elif (
+            entry.get("run_id")
+            and prev.get("run_id")
+            and entry["run_id"] == prev["run_id"]
+        ):
+            # Same live run_id with strictly increasing step (e.g. Hieroglyph/Petroglyph ante -1)
+            is_new = False
         else:
             p_ante = int(ps.get("ante", 1))
             c_ante = int(cs.get("ante", 1))
@@ -157,9 +168,9 @@ def split_telemetry_runs(entries: list[dict[str, Any]]) -> list[list[dict[str, A
             c_base_h = int(cs.get("base_hands", 4))
             c_disc = int(cs.get("discards_left", 0))
             c_base_d = int(cs.get("base_discards", 3))
-            # Catch dataset-generator contamination (e.g., ante jump >1, backward ante, or synthetic hands/money)
+            # Catch dataset-generator contamination (allow -1 ante for Hieroglyph/Petroglyph)
             if (
-                c_ante < p_ante
+                c_ante < p_ante - 1
                 or c_ante > p_ante + 1
                 or c_hands > c_base_h + 8
                 or c_disc > c_base_d + 8
@@ -184,23 +195,30 @@ def select_run(
     candidates = runs
     if seed:
         candidates = [
-            r for r in runs if str(r[0].get("state", {}).get("seed", "")).upper() == seed.upper()
+            r
+            for r in runs
+            if str(r[0].get("state", {}).get("seed", "")).upper() == seed.upper()
         ]
         if not candidates:
             raise ValueError(f"No telemetry run found matching seed {seed!r}.")
     if run_index is not None:
         return candidates[run_index]
+
     # Auto-pick the longest run starting from step 1 at ante 1 (prefer real starts over leftover generator fragments)
     def _score(run: list[dict[str, Any]]) -> tuple[int, int, int]:
         s0 = run[0].get("state", {})
         starts_at_ante1 = 1 if int(s0.get("ante", 1)) == 1 else 0
-        non_synthetic = 1 if int(s0.get("hands_left", 4)) <= int(s0.get("base_hands", 4)) + 4 else 0
+        non_synthetic = (
+            1 if int(s0.get("hands_left", 4)) <= int(s0.get("base_hands", 4)) + 4 else 0
+        )
         return (non_synthetic, starts_at_ante1, len(run))
 
     return max(candidates, key=_score)
 
 
-def _sync_extra_lua_fields(state: gs.GameState, lua_state: dict[str, Any], *, is_mid_setup: bool = False) -> None:
+def _sync_extra_lua_fields(
+    state: gs.GameState, lua_state: dict[str, Any], *, is_mid_setup: bool = False
+) -> None:
     """Syncs screen-visible & pack/shop/tag metadata that `sync_cv_observations_before_action` skips."""
     if "round_won" in lua_state:
         state.round_won = bool(lua_state["round_won"])
@@ -235,14 +253,30 @@ def _sync_extra_lua_fields(state: gs.GameState, lua_state: dict[str, Any], *, is
     if "hand_max_size" in lua_state:
         state.hand.max_size = int(lua_state["hand_max_size"])
 
-    if "ox_target_hand" in lua_state and lua_state["ox_target_hand"] in POKER_HAND_BY_STR:
+    if (
+        "ox_target_hand" in lua_state
+        and lua_state["ox_target_hand"] in POKER_HAND_BY_STR
+    ):
         state.ox_target_hand = POKER_HAND_BY_STR[lua_state["ox_target_hand"]]
-    if "locked_hand_type" in lua_state and lua_state["locked_hand_type"] in POKER_HAND_BY_STR:
+    if (
+        "locked_hand_type" in lua_state
+        and lua_state["locked_hand_type"] in POKER_HAND_BY_STR
+    ):
         state.locked_hand_type = POKER_HAND_BY_STR[lua_state["locked_hand_type"]]
-    if "small_blind_orbital_hand" in lua_state and lua_state["small_blind_orbital_hand"] in POKER_HAND_BY_STR:
-        state.small_blind_orbital_hand = POKER_HAND_BY_STR[lua_state["small_blind_orbital_hand"]]
-    if "big_blind_orbital_hand" in lua_state and lua_state["big_blind_orbital_hand"] in POKER_HAND_BY_STR:
-        state.big_blind_orbital_hand = POKER_HAND_BY_STR[lua_state["big_blind_orbital_hand"]]
+    if (
+        "small_blind_orbital_hand" in lua_state
+        and lua_state["small_blind_orbital_hand"] in POKER_HAND_BY_STR
+    ):
+        state.small_blind_orbital_hand = POKER_HAND_BY_STR[
+            lua_state["small_blind_orbital_hand"]
+        ]
+    if (
+        "big_blind_orbital_hand" in lua_state
+        and lua_state["big_blind_orbital_hand"] in POKER_HAND_BY_STR
+    ):
+        state.big_blind_orbital_hand = POKER_HAND_BY_STR[
+            lua_state["big_blind_orbital_hand"]
+        ]
 
     if "ante_scaling" in lua_state:
         state.ante_scaling = float(lua_state["ante_scaling"])
@@ -252,7 +286,11 @@ def _sync_extra_lua_fields(state: gs.GameState, lua_state: dict[str, Any], *, is
         state.gros_michel_extinct = bool(lua_state["gros_michel_extinct"])
 
     if is_mid_setup and "vouchers" in lua_state:
-        v_list = [vn for v in lua_state["vouchers"] if (vn := _parse_voucher_name(v)) is not None]
+        v_list = [
+            vn
+            for v in lua_state["vouchers"]
+            if (vn := _parse_voucher_name(v)) is not None
+        ]
         if v_list:
             state.vouchers_redeemed = v_list
 
@@ -297,29 +335,51 @@ def _check_post_step_parity(
 ) -> list[str]:
     warnings: list[str] = []
     if "money" in next_lua and sim_state.money != int(next_lua["money"]):
-        warnings.append(f"{step_label} money: sim={sim_state.money} vs lua={next_lua['money']}")
+        warnings.append(
+            f"{step_label} money: sim={sim_state.money} vs lua={next_lua['money']}"
+        )
         if reconcile_truth:
             sim_state.money = int(next_lua["money"])
     # Python keeps hands_left/discards_left until CASH_OUT & resets on SELECT_BLIND,
     # whereas Lua resets them immediately during ROUND_EVAL / SHOP.
     next_loc = next_lua.get("location")
-    if next_loc == "blind" and not next_lua.get("round_won") and next_lua.get("blind", "") != "":
-        if "hands_left" in next_lua and sim_state.hands_left != int(next_lua["hands_left"]):
-            warnings.append(f"{step_label} hands_left: sim={sim_state.hands_left} vs lua={next_lua['hands_left']}")
+    if (
+        next_loc == "blind"
+        and not next_lua.get("round_won")
+        and next_lua.get("blind", "") != ""
+    ):
+        if "hands_left" in next_lua and sim_state.hands_left != int(
+            next_lua["hands_left"]
+        ):
+            warnings.append(
+                f"{step_label} hands_left: sim={sim_state.hands_left} vs lua={next_lua['hands_left']}"
+            )
             if reconcile_truth:
                 sim_state.hands_left = int(next_lua["hands_left"])
-        if "discards_left" in next_lua and sim_state.discards_left != int(next_lua["discards_left"]):
-            warnings.append(f"{step_label} discards_left: sim={sim_state.discards_left} vs lua={next_lua['discards_left']}")
+        if "discards_left" in next_lua and sim_state.discards_left != int(
+            next_lua["discards_left"]
+        ):
+            warnings.append(
+                f"{step_label} discards_left: sim={sim_state.discards_left} vs lua={next_lua['discards_left']}"
+            )
             if reconcile_truth:
                 sim_state.discards_left = int(next_lua["discards_left"])
-    if act_name in ("Reroll Shop", "Cash Out") and "reroll_cost" in next_lua and sim_state.reroll_cost != int(next_lua["reroll_cost"]):
-        warnings.append(f"{step_label} reroll_cost: sim={sim_state.reroll_cost} vs lua={next_lua['reroll_cost']}")
+    if (
+        act_name in ("Reroll Shop", "Cash Out")
+        and "reroll_cost" in next_lua
+        and sim_state.reroll_cost != int(next_lua["reroll_cost"])
+    ):
+        warnings.append(
+            f"{step_label} reroll_cost: sim={sim_state.reroll_cost} vs lua={next_lua['reroll_cost']}"
+        )
         if reconcile_truth:
             sim_state.reroll_cost = int(next_lua["reroll_cost"])
     if "deck" in next_lua and next_lua["deck"] is not None:
         lua_deck_len = len(next_lua["deck"])
         if len(sim_state.full_deck) != lua_deck_len:
-            warnings.append(f"{step_label} full_deck count: sim={len(sim_state.full_deck)} vs lua={lua_deck_len}")
+            warnings.append(
+                f"{step_label} full_deck count: sim={len(sim_state.full_deck)} vs lua={lua_deck_len}"
+            )
             if reconcile_truth:
                 sim_state.full_deck = [parse_playing_card(c) for c in next_lua["deck"]]
                 sim_state.deck_cards_count = len(sim_state.full_deck)
@@ -330,17 +390,25 @@ def _check_post_step_parity(
             sim_state.deck_cards_count = len(lua_cards)
 
     if reconcile_truth and "jokers" in next_lua:
-        parsed_j = [pj for d in next_lua["jokers"] if (pj := parse_joker(d)) is not None]
+        parsed_j = [
+            pj for d in next_lua["jokers"] if (pj := parse_joker(d)) is not None
+        ]
         if [j.name for j in sim_state.inventory.jokers] != [j.name for j in parsed_j]:
             warnings.append(
                 f"{step_label} jokers: sim={[j.name.value for j in sim_state.inventory.jokers]} vs lua={[j.name.value for j in parsed_j]}"
             )
         sim_state.inventory.jokers = parsed_j
     if reconcile_truth and "consumables" in next_lua:
-        parsed_c = [pc for d in next_lua["consumables"] if (pc := parse_any_card(d)) is not None]
+        parsed_c = [
+            pc for d in next_lua["consumables"] if (pc := parse_any_card(d)) is not None
+        ]
         sim_state.inventory.consumables = parsed_c
     if reconcile_truth and "vouchers" in next_lua:
-        parsed_v = [vn for v in next_lua["vouchers"] if (vn := _parse_voucher_name(v)) is not None]
+        parsed_v = [
+            vn
+            for v in next_lua["vouchers"]
+            if (vn := _parse_voucher_name(v)) is not None
+        ]
         if parsed_v:
             sim_state.vouchers_redeemed = parsed_v
     return warnings
@@ -391,12 +459,16 @@ def build_trajectory_from_telemetry(
             state.full_deck = [parse_playing_card(c) for c in first_state["deck"]]
             state.deck_cards_count = len(state.full_deck)
             state.starting_deck_size = len(state.full_deck)
-        sync_cv_observations_before_action(state, first_state, act_name=first_entry.get("action", ""))
+        sync_cv_observations_before_action(
+            state, first_state, act_name=first_entry.get("action", "")
+        )
         _sync_extra_lua_fields(state, first_state, is_mid_setup=True)
     else:
         # Step 0 matches post_processing.py baseline initial state (before first blind selection).
         saved_target = state.target_chips
-        sync_cv_observations_before_action(state, first_state, act_name=first_entry.get("action", ""))
+        sync_cv_observations_before_action(
+            state, first_state, act_name=first_entry.get("action", "")
+        )
         _sync_extra_lua_fields(state, first_state, is_mid_setup=False)
         if state.target_chips == 0 and saved_target > 0:
             state.target_chips = saved_target
@@ -407,7 +479,9 @@ def build_trajectory_from_telemetry(
     base_ts = float(first_entry.get("timestamp", 0.0))
     warnings: list[str] = []
 
-    for i, entry in enumerate(entries):
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
         act_name = entry.get("action", "Play Hand")
         meta = dict(entry.get("action_metadata") or {})
         lua_state = entry.get("state", {})
@@ -415,27 +489,53 @@ def build_trajectory_from_telemetry(
         rel_ts = max(0.0, float(entry.get("timestamp", 0.0)) - base_ts)
 
         saved_target = state.target_chips
+        prev_boss_blind = state.boss_blind
+        prev_reroll_cost = state.reroll_cost
         sync_cv_observations_before_action(state, lua_state, act_name=act_name)
-        _sync_extra_lua_fields(state, lua_state, is_mid_setup=(act_name == "Setup Test Suite"))
+        _sync_extra_lua_fields(
+            state, lua_state, is_mid_setup=(act_name == "Setup Test Suite")
+        )
+        lua_ante = int(lua_state.get("ante", state.ante))
+        # In post-boss shop/pack screens, Lua has already rolled the next ante's boss while Python waits for Next Round.
+        if prev_boss_blind is not None and lua_ante != state.ante:
+            state.boss_blind = prev_boss_blind
+        if state.location != bm.Location.SHOP and prev_reroll_cost is not None:
+            state.reroll_cost = prev_reroll_cost
         if state.target_chips == 0 and saved_target > 0:
             state.target_chips = saved_target
 
         action = parse_lua_action(act_name, meta, frame_idx=step_num, timestamp=rel_ts)
-        is_face_down_boss = state.current_blind in FACE_DOWN_BOSS_BLINDS and not state.boss_disabled
+        is_face_down_boss = (
+            state.current_blind in FACE_DOWN_BOSS_BLINDS and not state.boss_disabled
+        )
         if (
             not keep_all_sorts
             and action.type in (bm.ActionType.SORT_RANK, bm.ActionType.SORT_SUIT)
             and not is_face_down_boss
         ):
+            i += 1
             continue
 
         # Clear stale hands on blind/cash-out transitions identically to post_processing.py:1886
-        if action.type in (bm.ActionType.SELECT_BLIND, bm.ActionType.SKIP_BLIND, bm.ActionType.CASH_OUT):
+        if action.type in (
+            bm.ActionType.SELECT_BLIND,
+            bm.ActionType.SKIP_BLIND,
+            bm.ActionType.CASH_OUT,
+        ):
             state.hand.cards.clear()
 
         if lua_state.get("hand"):
             action.hand_order = [hc.card.id for hc in state.hand.cards]
-        action.selected_cards = [copy.deepcopy(hc.card) for hc in state.hand.cards if hc.selected]
+        if action.type == bm.ActionType.PLAY_HAND:
+            action.selected_cards = [
+                copy.deepcopy(hc._real_card if hc._real_card is not None else hc.card)
+                for hc in state.hand.cards
+                if hc.selected
+            ]
+        else:
+            action.selected_cards = [
+                copy.deepcopy(hc.card) for hc in state.hand.cards if hc.selected
+            ]
 
         if "target_card" not in action.metadata:
             tname = _resolve_target_card_name(state, action)
@@ -448,49 +548,107 @@ def build_trajectory_from_telemetry(
             action.metadata["observed_shop"] = _serialize_shop_shelves(state)
         elif state.location == bm.Location.PACK and state.pack_cards:
             from game.trajectory_codec import _serialize_card
-            action.metadata["observed_pack"] = [_serialize_card(c) for c in state.pack_cards]
+
+            action.metadata["observed_pack"] = [
+                _serialize_card(c) for c in state.pack_cards
+            ]
         action.metadata["hud_ocr"] = _build_hud_ocr_meta(lua_state, state.location)
 
         next_lua = entries[i + 1].get("state", {}) if i + 1 < len(entries) else None
         next_act = entries[i + 1].get("action", "") if i + 1 < len(entries) else ""
 
-        won_round = False
-        if next_lua is not None:
-            if (
-                act_name == "Play Hand"
-                and state.current_blind == bm.BlindName.THE_HOOK
-                and not state.boss_disabled
-                and next_act == "Discard"
-                and int(next_lua.get("hands_left", 0)) == state.hands_left - 1
-            ):
-                action.metadata["defer_play_for_hook"] = True
-            elif act_name == "Discard" and getattr(state, "_hook_pending_cards", None) is not None:
-                action.metadata["hook"] = True
+        fold_hook_callback = (
+            act_name == "Play Hand"
+            and state.current_blind == bm.BlindName.THE_HOOK
+            and not state.boss_disabled
+            and next_act == "Discard"
+            and next_lua is not None
+            and int(next_lua.get("hands_left", 0)) == (state.hands_left or 0) - 1
+        )
+        if fold_hook_callback:
+            action.metadata["defer_play_for_hook"] = True
+        elif (
+            act_name == "Discard"
+            and getattr(state, "_hook_pending_cards", None) is not None
+        ):
+            action.metadata["hook"] = True
 
-            if act_name == "Select Blind" and "jokers" in next_lua:
-                curr_ids = {int(d.get("id", 0)) for d in lua_state.get("jokers", []) if d.get("id")}
-                spawned = [
-                    pj for d in next_lua["jokers"]
-                    if int(d.get("id", 0)) not in curr_ids and (pj := parse_joker(d)) is not None
-                ]
-                if spawned:
-                    action.metadata["riff_raff_spawned"] = spawned
-
-            if (
-                (act_name == "Play Hand" and not action.metadata.get("defer_play_for_hook"))
-                or (act_name == "Discard" and action.metadata.get("hook"))
-            ) and lua_state.get("blind", "") != "" and next_lua.get("blind", "") == "":
-                won_round = True
-                if not inject_end_round:
-                    action.metadata["won_round"] = True
+        if act_name == "Select Blind" and next_lua is not None and "jokers" in next_lua:
+            curr_ids = {
+                int(d.get("id", 0))
+                for d in lua_state.get("jokers", [])
+                if d.get("id")
+            }
+            spawned = [
+                pj
+                for d in next_lua["jokers"]
+                if int(d.get("id", 0)) not in curr_ids
+                and (pj := parse_joker(d)) is not None
+            ]
+            if spawned:
+                action.metadata["riff_raff_spawned"] = spawned
 
         state.frame_idx = action.frame_idx
         state.timestamp = action.timestamp
         prev_loc = state.location
         on_action(state, action)
 
+        if fold_hook_callback:
+            action.metadata.pop("defer_play_for_hook", None)
+            hook_entry = entries[i + 1]
+            hook_lua = hook_entry.get("state", {})
+            hook_meta = dict(hook_entry.get("action_metadata") or {})
+            hook_step_num = int(hook_entry.get("frame_idx") or step_num)
+            hook_rel_ts = max(0.0, float(hook_entry.get("timestamp", 0.0)) - base_ts)
+
+            saved_boss_h = state.boss_blind
+            saved_reroll_h = state.reroll_cost
+            sync_cv_observations_before_action(state, hook_lua, act_name="Discard")
+            _sync_extra_lua_fields(state, hook_lua, is_mid_setup=False)
+            if saved_boss_h is not None:
+                state.boss_blind = saved_boss_h
+            if saved_reroll_h is not None:
+                state.reroll_cost = saved_reroll_h
+
+            hook_action = parse_lua_action(
+                "Discard",
+                hook_meta,
+                frame_idx=hook_step_num,
+                timestamp=hook_rel_ts,
+            )
+            hook_action.metadata["hook"] = True
+            hook_action.selected_cards = [
+                copy.deepcopy(hc.card) for hc in state.hand.cards if hc.selected
+            ]
+            on_action(state, hook_action)
+            i += 1
+            next_lua = entries[i + 1].get("state", {}) if i + 1 < len(entries) else None
+
+        if action.type == bm.ActionType.NEXT_ROUND or int(lua_state.get("ante", state.ante)) == state.ante:
+            boss_str = lua_state.get("boss_blind", "") or (
+                next_lua.get("boss_blind", "") if next_lua is not None else ""
+            )
+            if boss_str in BLIND_BY_STR:
+                state.boss_blind = BLIND_BY_STR[boss_str]
+
+        won_round = (
+            next_lua is not None
+            and lua_state.get("blind", "") != ""
+            and next_lua.get("blind", "") == ""
+            and (
+                act_name == "Play Hand"
+                or (act_name == "Discard" and action.metadata.get("hook"))
+            )
+        )
+        if won_round and not inject_end_round:
+            action.metadata["won_round"] = True
+
         # Match post_processing.py:2213-2216 temporary hand cleanup
-        if action.type in (bm.ActionType.END_ROUND, bm.ActionType.CASH_OUT, bm.ActionType.OPEN_PACK):
+        if action.type in (
+            bm.ActionType.END_ROUND,
+            bm.ActionType.CASH_OUT,
+            bm.ActionType.OPEN_PACK,
+        ):
             state.hand.cards.clear()
         elif prev_loc == bm.Location.PACK and state.location != bm.Location.PACK:
             state.hand.cards.clear()
@@ -517,7 +675,7 @@ def build_trajectory_from_telemetry(
                 )
             trajectory.record_step(state, end_action)
         else:
-            if next_lua is not None and not action.metadata.get("defer_play_for_hook"):
+            if next_lua is not None:
                 warnings.extend(
                     _check_post_step_parity(
                         f"step {entry.get('step', i + 1)} ({act_name})",
@@ -528,6 +686,8 @@ def build_trajectory_from_telemetry(
                     )
                 )
             trajectory.record_step(state, copy.deepcopy(action))
+
+        i += 1
 
     trajectory.impute_retroactive_boss_blinds()
     return state, trajectory, warnings
@@ -544,18 +704,34 @@ def main() -> None:
         default="assets/local/run_telemetry.jsonl",
         help="Path to run_telemetry.jsonl",
     )
-    parser.add_argument("--out", type=str, default=None, help="Output trajectory JSON path")
-    parser.add_argument("--seed", type=str, default=None, help="Select run matching this seed")
+    parser.add_argument(
+        "--out", type=str, default=None, help="Output trajectory JSON path"
+    )
+    parser.add_argument(
+        "--seed", type=str, default=None, help="Select run matching this seed"
+    )
     parser.add_argument(
         "--run-index",
         type=int,
         default=None,
         help="0-based index of run segment to extract (default: longest non-synthetic run)",
     )
-    parser.add_argument("--list-runs", action="store_true", help="List detected run segments and exit")
-    parser.add_argument("--keep-all-sorts", action="store_true", help="Keep non-face-down Sort steps")
-    parser.add_argument("--no-inject-end-round", action="store_true", help="Do not inject END_ROUND before CASH_OUT")
-    parser.add_argument("--strict-sim", action="store_true", help="Do not reconcile RNG/hidden post-step diffs against Lua")
+    parser.add_argument(
+        "--list-runs", action="store_true", help="List detected run segments and exit"
+    )
+    parser.add_argument(
+        "--keep-all-sorts", action="store_true", help="Keep non-face-down Sort steps"
+    )
+    parser.add_argument(
+        "--no-inject-end-round",
+        action="store_true",
+        help="Do not inject END_ROUND before CASH_OUT",
+    )
+    parser.add_argument(
+        "--strict-sim",
+        action="store_true",
+        help="Do not reconcile RNG/hidden post-step diffs against Lua",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print all parity notes")
     args = parser.parse_args()
 
@@ -584,8 +760,15 @@ def main() -> None:
     )
     payload = serialize_trajectory(state, traj)
 
-    out_path = Path(args.out) if args.out else (
-        REPO_ROOT / "output" / "trajectories" / f"run_{state.seed}_{len(chosen)}steps_gt_trajectory.json"
+    out_path = (
+        Path(args.out)
+        if args.out
+        else (
+            REPO_ROOT
+            / "output"
+            / "trajectories"
+            / f"run_{state.seed}_{len(chosen)}steps_gt_trajectory.json"
+        )
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
@@ -599,7 +782,7 @@ def main() -> None:
     )
     if warnings:
         print(f"Parity notes ({len(warnings)}):")
-        for w in (warnings if args.verbose else warnings[:10]):
+        for w in warnings if args.verbose else warnings[:10]:
             print(f"  - {w}")
 
 

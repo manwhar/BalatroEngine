@@ -68,11 +68,43 @@ def load_cursor_asset(cursor_path=CURSOR_PATH):
     return rgba
 
 
+def _apply_yuv420_chroma_subsampling(norm_rgb: torch.Tensor) -> torch.Tensor:
+    """
+    Simulates YUV420p 4:2:0 chroma subsampling (H.264/AV1 streaming compression)
+    on a float32 tensor in [0, 1] of shape (N, 3, H, W).
+    """
+    _, _, orig_h, orig_w = norm_rgb.shape
+    r, g, b = norm_rgb[:, 0:1], norm_rgb[:, 1:2], norm_rgb[:, 2:3]
+
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b
+
+    chroma = torch.cat([cb, cr], dim=1)
+    half_h = max(4, orig_h // 2)
+    half_w = max(4, orig_w // 2)
+    chroma_down = F.interpolate(chroma, size=(half_h, half_w), mode="bilinear", align_corners=False)
+    # Coarser chroma quantization typical of low-bitrate 4:2:0 encoders
+    chroma_step = 1.0 / 24.0
+    chroma_down = torch.round(chroma_down / chroma_step) * chroma_step
+    chroma_up = F.interpolate(chroma_down, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+    cb_up, cr_up = chroma_up[:, 0:1], chroma_up[:, 1:2]
+
+    y_step = 1.0 / 48.0
+    y_q = torch.round(y / y_step) * y_step
+
+    r_out = y_q + 1.402 * cr_up
+    g_out = y_q - 0.344136 * cb_up - 0.714136 * cr_up
+    b_out = y_q + 1.772 * cb_up
+    return torch.clamp(torch.cat([r_out, g_out, b_out], dim=1), 0.0, 1.0)
+
+
 def apply_video_compression_noise(img_tensor: torch.Tensor, p: float = 0.5) -> torch.Tensor:
     """
-    Simulates realistic video compression artifacts on a batch (4D) or single (3D) tensor.
+    Simulates realistic video compression artifacts on a batch (4D) or single (3D) tensor:
+    - YUV420p 4:2:0 chroma subsampling & chroma quantization (red/gold smear)
     - Low-pass / bilinear down-sampling (loss of high frequency bitrate)
-    - Macroblock quantization (quantizes discrete color levels)
+    - Mild 3x3 box blur + macroblock quantization (discrete color levels)
     - High-frequency dithering / sensor noise along reconstructed edges
     """
     if not isinstance(img_tensor, torch.Tensor):
@@ -98,22 +130,75 @@ def apply_video_compression_noise(img_tensor: torch.Tensor, p: float = 0.5) -> t
     orig_h, orig_w = selected.shape[-2:]
 
     max_val = 255.0 if orig_dtype == torch.uint8 or selected.max() > 1.5 else 1.0
+    norm_sel = selected / max_val
 
-    scale = torch.empty(1, device=device).uniform_(0.35, 0.75).item()
+    # 1. YUV420p 4:2:0 chroma subsampling on ~80% of compressed samples
+    chroma_mask = torch.rand(norm_sel.shape[0], device=device) < 0.80
+    if chroma_mask.any():
+        norm_sel[chroma_mask] = _apply_yuv420_chroma_subsampling(norm_sel[chroma_mask])
+
+    # 2. Spatial bitrate downscale + level quantization
+    scale = torch.empty(1, device=device).uniform_(0.40, 0.85).item()
     down_h = max(8, int(orig_h * scale))
     down_w = max(8, int(orig_w * scale))
 
-    down = F.interpolate(selected, size=(down_h, down_w), mode="bilinear", align_corners=False)
-    step = max_val / 32.0
+    down = F.interpolate(norm_sel, size=(down_h, down_w), mode="bilinear", align_corners=False)
+    step = 1.0 / 32.0
     down = torch.round(down / step) * step
     up = F.interpolate(down, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
 
-    noise = (torch.rand_like(selected) - 0.5) * 0.04 * max_val
+    # 3. Mild 3x3 box blur mix on ~45% of compressed samples
+    blur_mask = torch.rand(norm_sel.shape[0], device=device) < 0.45
+    if blur_mask.any():
+        blurred = F.avg_pool2d(up[blur_mask], kernel_size=3, stride=1, padding=1)
+        up[blur_mask] = torch.lerp(up[blur_mask], blurred, 0.45)
 
-    selected_augmented = torch.clamp(up + noise, 0.0, max_val).to(orig_dtype)
+    noise = (torch.rand_like(selected) - 0.5) * 0.03 * max_val
+    selected_augmented = torch.clamp(up * max_val + noise, 0.0, max_val).to(orig_dtype)
     out[mask] = selected_augmented
 
     return out.squeeze(0) if is_single else out
+
+
+def apply_card_crop_jitter(img_tensor: torch.Tensor, p: float = 0.4) -> torch.Tensor:
+    """
+    Applies mild affine crop/scale/rotation jitter on GPU to simulate pack_hand
+    framing shifts and YOLO bounding-box tightness variation.
+    """
+    if not isinstance(img_tensor, torch.Tensor) or img_tensor.ndim != 4 or img_tensor.shape[0] == 0:
+        return img_tensor
+
+    batch_size, _, H, W = img_tensor.shape
+    device = img_tensor.device
+    mask = torch.rand(batch_size, device=device) < p
+    if not mask.any():
+        return img_tensor
+
+    out = img_tensor.clone()
+    orig_dtype = out.dtype
+    selected = out[mask].float()
+    n = selected.shape[0]
+
+    scales = torch.empty(n, device=device).uniform_(0.93, 1.06)
+    inv_s = 1.0 / scales
+    angles = torch.empty(n, device=device).uniform_(-2.5, 2.5) * (3.141592653589793 / 180.0)
+    cos_a = torch.cos(angles) * inv_s
+    sin_a = torch.sin(angles) * inv_s
+    tx = torch.empty(n, device=device).uniform_(-0.04, 0.04)
+    ty = torch.empty(n, device=device).uniform_(-0.04, 0.04)
+
+    theta = torch.zeros((n, 2, 3), device=device, dtype=torch.float32)
+    theta[:, 0, 0] = cos_a
+    theta[:, 0, 1] = -sin_a
+    theta[:, 0, 2] = tx
+    theta[:, 1, 0] = sin_a
+    theta[:, 1, 1] = cos_a
+    theta[:, 1, 2] = ty
+
+    grid = F.affine_grid(theta, size=list(selected.shape), align_corners=False)
+    warped = F.grid_sample(selected, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    out[mask] = warped.to(orig_dtype)
+    return out
 
 
 def overlay_cursor_noise(img_tensor: torch.Tensor, cursor_rgba: np.ndarray = None, p: float = 0.3) -> torch.Tensor:
@@ -176,10 +261,12 @@ def apply_gpu_batch_augmentations(
     compression_prob: float = 0.5,
     cursor_prob: float = 0.3,
     color_jitter: bool = True,
+    geom_prob: float = 0.0,
 ) -> torch.Tensor:
     """
     Converts uint8/float (B, 3, H, W) tensor batch on GPU to normalized float32,
-    applying vectorized ColorJitter, video compression, and cursor overlays on-device.
+    applying vectorized ColorJitter, optional affine crop jitter, video compression,
+    and cursor overlays on-device.
     """
     if images.dtype == torch.uint8:
         x = images.float().div_(255.0)
@@ -189,6 +276,8 @@ def apply_gpu_batch_augmentations(
     if is_train:
         b = x.shape[0]
         device = x.device
+        if geom_prob > 0.0 and b > 0:
+            x = apply_card_crop_jitter(x, p=geom_prob)
         if color_jitter and b > 0:
             # Vectorized brightness, contrast, and saturation jitter on GPU
             bright = torch.empty((b, 1, 1, 1), device=device).uniform_(0.85, 1.15)

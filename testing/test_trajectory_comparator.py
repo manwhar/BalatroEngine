@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from game.balatro_models import (
     Action,
     ActionType,
+    BlindName,
     Deck,
     Enhancement,
     Hand,
@@ -32,6 +33,7 @@ from game.balatro_models import (
 )
 from game.gamestate import GameState, RunTrajectory
 from tools.compare_trajectories import compare_trajectories
+from tools.telemetry_to_trajectory import build_trajectory_from_telemetry
 
 
 def _card(cid: int, rank: Rank, suit: Suit, **kwargs) -> PlayingCard:
@@ -463,6 +465,267 @@ class TestTrajectoryComparator(unittest.TestCase):
         mut_report = compare_trajectories(mutated_traj, tel_path)
         self.assertEqual(mut_report["summary"]["error_step_indices"], [3])
         self.assertEqual(mut_report["steps_by_actual_idx"]["3"][0]["category"], "deck")
+
+    def test_self_correction_and_hud_timing_convergences_are_suppressed(self) -> None:
+        def _build(*, actual_mode: bool) -> RunTrajectory:
+            st = _base_state(money=10)
+            st.location = Location.SHOP
+            traj = RunTrajectory()
+            traj.record_step(st)  # 0
+
+            # Step 1: GT buys Joker (-$4 -> $6); actual misses both money & Joker
+            st = st.copy()
+            st.frame_idx = 10
+            if not actual_mode:
+                st.money = 6
+                st.inventory.jokers.append(Joker(name=JokerName.JOKER, id=1))
+            traj.record_step(
+                st,
+                Action(type=ActionType.BUY_CARD, frame_idx=10, metadata={"target_card": "Joker"}),
+            )  # 1
+
+            # Step 2: Next Round -> actual HUD/bar CV reconciles money ($6) & Joker!
+            st = st.copy()
+            st.frame_idx = 20
+            st.location = Location.SELECT
+            st.money = 6
+            if actual_mode:
+                st.inventory.jokers.append(Joker(name=JokerName.JOKER, id=2))
+            traj.record_step(st, Action(type=ActionType.NEXT_ROUND, frame_idx=20))  # 2
+
+            # Step 3: Enter Blind
+            st = st.copy()
+            st.frame_idx = 30
+            st.location = Location.BLIND
+            traj.record_step(st, Action(type=ActionType.SELECT_BLIND, frame_idx=30))  # 3
+
+            # Step 4: Play Hand -> GT earns $2 ($8), actual misses pre-sync while step 5's hud_ocr observes $8!
+            st = st.copy()
+            st.frame_idx = 40
+            st.hands_left = 3
+            if not actual_mode:
+                st.money = 8
+            traj.record_step(
+                st,
+                Action(
+                    type=ActionType.PLAY_HAND,
+                    frame_idx=40,
+                    selected_cards=[_card(1, Rank.ACE, Suit.SPADES)],
+                ),
+            )  # 4
+
+            # Step 5: Next Play Hand has hud_money=8 (matching GT step 4) and reconciles money to $8
+            st = st.copy()
+            st.frame_idx = 50
+            st.hands_left = 2
+            st.money = 8
+            traj.record_step(
+                st,
+                Action(
+                    type=ActionType.PLAY_HAND,
+                    frame_idx=50,
+                    selected_cards=[_card(2, Rank.KING, Suit.CLUBS)],
+                    metadata={"hud_ocr": {"hud_money": 8}},
+                ),
+            )  # 5
+            return traj
+
+        report = compare_trajectories(_build(actual_mode=True), _build(actual_mode=False))
+        self.assertEqual(report["summary"]["error_step_indices"], [1])
+        self.assertGreaterEqual(report["summary"]["suppressed_cascades"], 2)
+
+    def test_contiguous_ante_boss_imputation_with_hieroglyph(self) -> None:
+        st = _base_state()
+        st.ante = 6
+        st.current_blind = BlindName.SMALL
+        st.location = Location.SELECT
+        st.boss_blind = None
+        traj = RunTrajectory()
+        traj.record_step(st)  # 0 (Visit 1 Ante 6)
+
+        st = st.copy()
+        st.location = Location.BLIND
+        st.current_blind = BlindName.THE_WHEEL
+        st.boss_blind = BlindName.THE_WHEEL
+        traj.record_step(st, Action(type=ActionType.SELECT_BLIND, frame_idx=10))  # 1
+
+        st = st.copy()
+        st.location = Location.SHOP
+        traj.record_step(st, Action(type=ActionType.CASH_OUT, frame_idx=20))  # 2
+
+        # Hieroglyph drops ante 6 -> 5, then Next Round re-enters Ante 6 Visit 2
+        st = st.copy()
+        st.ante = 5
+        traj.record_step(
+            st,
+            Action(type=ActionType.REDEEM_VOUCHER, frame_idx=30, metadata={"target_card": "Hieroglyph"}),
+        )  # 3
+
+        st = st.copy()
+        st.ante = 6
+        st.location = Location.SELECT
+        st.current_blind = BlindName.SMALL
+        st.boss_blind = None
+        traj.record_step(st, Action(type=ActionType.NEXT_ROUND, frame_idx=40))  # 4 (Visit 2 Ante 6)
+
+        st = st.copy()
+        st.location = Location.BLIND
+        st.current_blind = BlindName.THE_FLINT
+        st.boss_blind = BlindName.THE_FLINT
+        traj.record_step(st, Action(type=ActionType.SELECT_BLIND, frame_idx=50))  # 5
+
+        traj.impute_retroactive_boss_blinds()
+        self.assertEqual(traj.get_state(0).boss_blind, BlindName.THE_WHEEL)
+        self.assertEqual(traj.get_state(4).boss_blind, BlindName.THE_FLINT)
+        self.assertEqual(traj.get_state(5).boss_blind, BlindName.THE_FLINT)
+
+    def test_telemetry_the_hook_folds_into_single_play_hand_step(self) -> None:
+        def _lua_card(cid: int, val: str, suit: str, selected: bool = False) -> dict:
+            return {
+                "id": cid,
+                "value": val,
+                "suit": suit,
+                "enhancement": "none",
+                "edition": "none",
+                "seal": "none",
+                "bonus_chips": 0,
+                "debuffed": False,
+                "facing_back": False,
+                "selected": selected,
+            }
+
+        hand_pre = [
+            _lua_card(1, "Ace", "Spades", selected=True),
+            _lua_card(2, "2", "Clubs"),
+            _lua_card(3, "3", "Hearts"),
+            _lua_card(4, "4", "Diamonds"),
+        ]
+        hand_hook = [
+            _lua_card(2, "2", "Clubs", selected=True),
+            _lua_card(3, "3", "Hearts", selected=True),
+            _lua_card(4, "4", "Diamonds", selected=False),
+        ]
+        base_state = {
+            "seed": "HOOKTST",
+            "deck_name": "Red Deck",
+            "stake": 1,
+            "ante": 1,
+            "round": 1,
+            "location": "blind",
+            "blind": "The Hook",
+            "boss_blind": "bl_hook",
+            "money": 4,
+            "hands_left": 4,
+            "discards_left": 3,
+            "reroll_cost": 5,
+            "target_chips": 600,
+            "current_chips": 0,
+            "jokers": [],
+            "consumables": [],
+            "vouchers": [],
+            "shop": [],
+            "shop_packs": [],
+            "shop_vouchers": [],
+            "pack_cards": [],
+            "active_tags": [],
+        }
+        entries = [
+            {
+                "run_id": "HOOKTST_1",
+                "step": 1,
+                "action": "Play Hand",
+                "action_metadata": {},
+                "state": {**base_state, "hand": hand_pre, "hands_left": 4},
+                "timestamp": 1.0,
+            },
+            {
+                "run_id": "HOOKTST_1",
+                "step": 2,
+                "action": "Discard",
+                "action_metadata": {},
+                "state": {**base_state, "hand": hand_hook, "hands_left": 3},
+                "timestamp": 1.1,
+            },
+            {
+                "run_id": "HOOKTST_1",
+                "step": 3,
+                "action": "Play Hand",
+                "action_metadata": {},
+                "state": {**base_state, "hand": [_lua_card(4, "4", "Diamonds", selected=True)], "hands_left": 3, "discards_left": 3},
+                "timestamp": 2.0,
+            },
+        ]
+        _, traj, _ = build_trajectory_from_telemetry(entries)
+        actions = [d.action.type for d in traj.deltas[1:] if d.action is not None]
+        self.assertEqual(actions, [ActionType.PLAY_HAND, ActionType.PLAY_HAND])
+        self.assertEqual(traj.get_state(1).discards_left, 3)
+
+    def test_telemetry_face_down_play_records_real_selected_cards_while_discard_stays_hidden(self) -> None:
+        from tools.telemetry_to_trajectory import build_trajectory_from_telemetry
+
+        def _lua_card(cid: int, val: str, suit: str, *, facing_back: bool = False, selected: bool = False) -> dict:
+            return {
+                "id": cid,
+                "value": val,
+                "suit": suit,
+                "enhancement": "none",
+                "edition": "none",
+                "seal": "none",
+                "bonus_chips": 0,
+                "debuffed": False,
+                "facing_back": facing_back,
+                "selected": selected,
+            }
+
+        base_state = {
+            "seed": "FISHTST",
+            "deck_name": "Red Deck",
+            "stake": 1,
+            "ante": 1,
+            "round": 1,
+            "location": "blind",
+            "blind": "The Fish",
+            "boss_blind": "bl_fish",
+            "money": 4,
+            "hands_left": 4,
+            "discards_left": 3,
+            "reroll_cost": 5,
+            "target_chips": 600,
+            "current_chips": 0,
+            "jokers": [],
+            "consumables": [],
+            "vouchers": [],
+            "shop": [],
+            "shop_packs": [],
+            "shop_vouchers": [],
+            "pack_cards": [],
+            "active_tags": [],
+        }
+        entries = [
+            {
+                "run_id": "FISHTST_1",
+                "step": 1,
+                "action": "Discard",
+                "action_metadata": {},
+                "state": {**base_state, "hand": [_lua_card(1, "7", "Clubs", facing_back=True, selected=True)], "discards_left": 3},
+                "timestamp": 1.0,
+            },
+            {
+                "run_id": "FISHTST_1",
+                "step": 2,
+                "action": "Play Hand",
+                "action_metadata": {},
+                "state": {**base_state, "hand": [_lua_card(2, "Queen", "Hearts", facing_back=True, selected=True)], "discards_left": 2},
+                "timestamp": 2.0,
+            },
+        ]
+        _, traj, _ = build_trajectory_from_telemetry(entries)
+        disc_sel = traj.deltas[1].action.selected_cards
+        play_sel = traj.deltas[2].action.selected_cards
+        self.assertEqual(len(disc_sel), 1)
+        self.assertEqual((disc_sel[0].rank, disc_sel[0].suit), (Rank.NONE, Suit.NONE))
+        self.assertEqual(len(play_sel), 1)
+        self.assertEqual((play_sel[0].rank, play_sel[0].suit), (Rank.QUEEN, Suit.HEARTS))
 
 
 if __name__ == "__main__":
