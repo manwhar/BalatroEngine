@@ -47,6 +47,7 @@ class PipelineConfig:
     keep_videos: bool = False
     resume: bool = True
     dry_run: bool = False
+    allow_deck_template_fallback: bool = True
     allow_ocr_seed_fallback: bool = False
     skip_frames: int = 1
     batch_size: int = 32
@@ -255,6 +256,21 @@ def process_downloaded_video(
     }
 
 
+_DECK_RECOVERABLE_SKIP_REASONS = frozenset(
+    {"missing_deck", "ambiguous_multiple_decks", "ambiguous_deck_conflict"}
+)
+
+
+def _try_deck_template_fallback(video_path: Path, cfg: PipelineConfig) -> Any | None:
+    """Samples a few frames of `video_path` to identify the deck back when metadata lacks it."""
+    try:
+        from vod_pipeline.deck_matcher import detect_deck_from_video
+
+        return detect_deck_from_video(video_path)
+    except Exception:
+        return None
+
+
 def _try_ocr_seed_fallback(video_path: Path, cfg: PipelineConfig) -> tuple[str, float] | None:
     """Attempts end-of-run Seed OCR recovery when `--allow-ocr-seed-fallback` is enabled."""
     try:
@@ -302,8 +318,8 @@ def _print_batch_summary(report: dict[str, Any]) -> None:
         print("\n[Processed]")
         for row in report["processed"]:
             print(
-                f"  - {row['video_id']} | {row['deck']} | {row['stake']} | "
-                f"Seed={row['seed']} ({row.get('seed_source', '')}) | "
+                f"  - {row['video_id']} | {row['deck']} ({row.get('deck_source', '')}) | "
+                f"{row['stake']} | Seed={row['seed']} ({row.get('seed_source', '')}) | "
                 f"steps={row.get('num_steps')} -> {row.get('trajectory_json')}"
             )
     if report["skipped"]:
@@ -330,6 +346,7 @@ def run_batch_pipeline(
     fetch_metadata_fn: Callable[[Sequence[str], PipelineConfig], list[tuple[dict[str, Any], ExtractedRunMetadata]]] | None = None,
     download_fn: Callable[[str, str, Path, PipelineConfig, threading.Event], Path] | None = None,
     process_fn: Callable[[Path, ExtractedRunMetadata, PipelineConfig], dict[str, Any]] | None = None,
+    deck_matcher_fn: Callable[[Path, PipelineConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Executes metadata gating + overlapped bounded-backlog download & VOD processing."""
     t_start = time.perf_counter()
@@ -358,6 +375,7 @@ def run_batch_pipeline(
         )
     )
     processor = process_fn or process_downloaded_video
+    deck_matcher = deck_matcher_fn or _try_deck_template_fallback
 
     fetched = fetcher(urls, cfg)
     # Persist metadata if caller injected a custom fetcher
@@ -397,6 +415,17 @@ def run_batch_pipeline(
             eligible.append(meta)
             continue
 
+        # Recover missing/ambiguous deck via sparse video frame template matching when enabled
+        if (
+            cfg.allow_deck_template_fallback
+            and meta.skip_reason in _DECK_RECOVERABLE_SKIP_REASONS
+            and meta.seed
+        ):
+            meta.deck = None
+            meta.deck_source = "pending_deck_template_match"
+            eligible.append(meta)
+            continue
+
         # Optional OCR fallback ONLY if deck is valid, missing_seed is the sole gap, and weights exist
         if (
             cfg.allow_ocr_seed_fallback
@@ -404,6 +433,19 @@ def run_batch_pipeline(
             and meta.skip_reason == "missing_seed"
             and meta.deck is not None
         ):
+            meta.seed_source = "pending_ocr_end_of_run"
+            eligible.append(meta)
+            continue
+
+        if (
+            cfg.allow_deck_template_fallback
+            and cfg.allow_ocr_seed_fallback
+            and seed_ocr_weights_available
+            and (meta.skip_reason == "missing_deck_and_seed" or meta.skip_reason in _DECK_RECOVERABLE_SKIP_REASONS)
+            and not meta.seed
+        ):
+            meta.deck = None
+            meta.deck_source = "pending_deck_template_match"
             meta.seed_source = "pending_ocr_end_of_run"
             eligible.append(meta)
             continue
@@ -494,6 +536,31 @@ def run_batch_pipeline(
 
                 item, vpath, dl_sec = pkt
                 try:
+                    if item.deck is None and cfg.allow_deck_template_fallback:
+                        deck_match = deck_matcher(vpath, cfg)
+                        if deck_match is None:
+                            skip_row = {
+                                **item.to_dict(),
+                                "skip_reason": "deck_template_not_found",
+                            }
+                            skipped.append(skip_row)
+                            _append_manifest_row(
+                                manifest_path, {"status": "skipped", **skip_row}
+                            )
+                            continue
+                        if hasattr(deck_match, "deck"):
+                            item.deck = deck_match.deck
+                            item.deck_source = (
+                                f"deck_template_match(conf={deck_match.confidence:.2f},"
+                                f"{deck_match.matched_frames}/{deck_match.sampled_frames})"
+                            )
+                        else:
+                            item.deck = deck_match
+                            item.deck_source = "deck_template_match"
+                        if item.seed:
+                            item.skip_reason = None
+                            item.ready = True
+
                     if not item.seed and cfg.allow_ocr_seed_fallback:
                         ocr_res = _try_ocr_seed_fallback(vpath, cfg)
                         if ocr_res is None:
@@ -503,6 +570,7 @@ def run_batch_pipeline(
                             continue
                         item.seed, conf = ocr_res
                         item.seed_source = f"seed_ocr(conf={conf:.2f})"
+                        item.skip_reason = None
                         item.ready = True
 
                     stats = processor(vpath, item, cfg)

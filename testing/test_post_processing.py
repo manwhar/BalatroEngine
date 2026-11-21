@@ -2424,6 +2424,142 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         self.assertEqual(state_3b.ante, 8)
         self.assertEqual(traj_3b.deltas[-1].action.type, bm.ActionType.PLAY_HAND)
 
+    def test_cancelled_play_hand_with_ocr_score_jitter_is_dropped(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        d = {
+            "key": {"Select Blind": 0, "Play Hand": 1},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [705, 907, 912, 1032]},  # Cancelled Play Hand drag-off
+                "270": {"action": 1, "box": [705, 907, 912, 1032]},  # Real Play Hand 1.17s later
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 270)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            return [ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode) for _, f_idx, ts in frames]
+
+        hand_cards = [
+            _make_card_res("5", "Spades", selected=True),
+            _make_card_res("5", "Hearts", selected=True),
+            _make_card_res("5", "Diamonds", selected=True),
+            _make_card_res("3", "Spades", selected=True),
+            _make_card_res("3", "Hearts", selected=True),
+            _make_card_res("Ace", "Clubs", selected=False),
+            _make_card_res("King", "Clubs", selected=False),
+            _make_card_res("Queen", "Clubs", selected=False),
+        ]
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=list(hand_cards) if f_idx in (200, 270) else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx == 200:
+                    vals.update({"hud_hands": 3, "hud_round": 1, "hud_round_score": 294})
+                elif f_idx == 270:
+                    vals.update({"hud_hands": 3, "hud_round": 1, "hud_round_score": 296})
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        play_steps = [dl for dl in traj.deltas[1:] if dl.action and dl.action.type == bm.ActionType.PLAY_HAND]
+        self.assertEqual(len(play_steps), 1)
+        self.assertEqual(play_steps[0].action.frame_idx, 270)
+        self.assertEqual(len(state.full_deck), 52)
+        self.assertEqual(plan["diagnostics"]["unexpected_deck_additions"], [])
+        self.assertFalse(any((dl.action.metadata or {}).get("corrupted") for dl in traj.deltas[1:]))
+
+    def test_cancelled_sell_card_immediately_before_use_consumable_is_dropped(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Buy Card": 4,
+                "Sell Card": 5,
+                "Use Consumable": 6,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand -> 200
+                "300": {"action": 2, "box": [500, 500, 600, 550]},  # End Round -> 298
+                "400": {"action": 3, "box": [400, 300, 600, 370]},  # Cash Out -> 398
+                "500": {"action": 4, "box": [420, 380, 520, 440]},  # Buy Pluto in Shop -> 498
+                "550": {"action": 5, "box": [1760, 68, 1835, 150]},  # Cancelled SELL_CARD hover/click -> 548
+                "560": {"action": 6, "box": [1747, 172, 1820, 238]},  # Actual USE_CONSUMABLE right below -> 558
+            },
+        }
+        all_f = {98, 200, 298, 398, 498, 548, 558}
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in all_f}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 498:
+                    out.shop_items = [_make_shop_item("c_pluto", "Planet", [400, 220, 540, 370])]
+                elif f_idx in (548, 558):
+                    out.consumeables = [_make_shop_item("c_pluto", "Planet", [1610, 40, 1745, 220])]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx in (548, 558) and "hud_money" in vals:
+                    vals["hud_money"] = 14
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            state, traj, _ = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, deck=bm.Deck.YELLOW_DECK, fps=60.0, expressive=True
+            )
+
+        act_types = [dl.action.type for dl in traj.deltas[1:] if dl.action]
+        self.assertNotIn(bm.ActionType.SELL_CARD, act_types)
+        self.assertIn(bm.ActionType.USE_CONSUMABLE, act_types)
+        self.assertEqual(state.hand_levels[bm.PokerHand.HIGH_CARD], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

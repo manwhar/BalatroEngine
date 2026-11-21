@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 import webbrowser
 from collections import OrderedDict
 from functools import lru_cache
@@ -1875,7 +1876,12 @@ class VideoFrameCache:
         self._preload_all_targets: list[int] = []
         self._preload_history: list[int] = []
         self._preload_done: bool = True
-        self.meta: dict[str, Any] = {"available": False, "path": None, "filename": None}
+        self.meta: dict[str, Any] = {
+            "available": False,
+            "path": None,
+            "filename": None,
+            "cache_key": uuid.uuid4().hex[:12],
+        }
         if video_path is not None and video_path.is_file():
             self._init_capture(video_path)
 
@@ -1897,6 +1903,7 @@ class VideoFrameCache:
             "available": True,
             "path": str(video_path),
             "filename": video_path.name,
+            "cache_key": uuid.uuid4().hex[:12],
             "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
             "fps": float(cap.get(cv2.CAP_PROP_FPS) or 60.0),
             "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
@@ -2605,7 +2612,7 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
                     )
                     return
                 self._send_bytes(
-                    200, "image/jpeg", jpg, cache_control="public, max-age=3600"
+                    200, "image/jpeg", jpg, cache_control="no-store"
                 )
                 return
 
@@ -2640,6 +2647,10 @@ def _make_request_handler(app_state: _VisualizerState, *, verbose: bool = False)
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that suppresses noisy client-disconnect socket errors."""
+
+    # On Windows, SO_REUSEADDR allows a second server to bind the same port concurrently;
+    # disabling it guarantees port-in-use detection so a new visualizer never collides on 8765.
+    allow_reuse_address = os.name != "nt"
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         _, exc, _ = sys.exc_info()
@@ -3246,6 +3257,7 @@ const APP = {
   activeTab: "diff",
   errorCategoryFilter: "all",
   videoMode: "frame",
+  activeVideoKey: "",
   playTimer: null,
   preloadTimer: null,
 };
@@ -4001,6 +4013,13 @@ function renderVideoFrame(baseFrameIdx, timestamp) {
   }
 
   phEl.style.display = "none";
+  const vKey = vMeta.cache_key || vMeta.filename || "active";
+  if (APP.activeVideoKey !== vKey) {
+    APP.activeVideoKey = vKey;
+    imgEl.dataset.srcUrl = "";
+    imgEl.removeAttribute("src");
+    document.getElementById("videoModalImg").removeAttribute("src");
+  }
   if (APP.videoMode === "video") {
     stageEl.classList.add("video-mode");
     stageEl.title = "";
@@ -4010,7 +4029,7 @@ function renderVideoFrame(baseFrameIdx, timestamp) {
     videoEl.style.display = "block";
     document.getElementById("videoCaption").textContent =
       `Video @ ${syncTime.toFixed(2)}s (Frame ${targetFrame})`;
-    const videoUrl = `/api/video?traj=${encodeURIComponent(APP.payload?.trajectory_name || "active")}`;
+    const videoUrl = `/api/video?traj=${encodeURIComponent(APP.payload?.trajectory_name || "active")}&v=${encodeURIComponent(vKey)}`;
     videoEl.dataset.pendingSeek = String(syncTime);
     if (videoEl.dataset.srcUrl !== videoUrl) {
       videoEl.dataset.srcUrl = videoUrl;
@@ -4030,9 +4049,10 @@ function renderVideoFrame(baseFrameIdx, timestamp) {
   document.getElementById("videoCaption").textContent =
     `Frame ${targetFrame}${offLabel} (click moment)  |  t = ${(timestamp || 0).toFixed(2)}s`;
 
-  const url = `/api/frame/${targetFrame}`;
+  const url = `/api/frame/${targetFrame}?v=${encodeURIComponent(vKey)}`;
   if (imgEl.dataset.srcUrl !== url) {
     imgEl.dataset.srcUrl = url;
+    imgEl.style.opacity = "0.55";
     imgEl.src = url;
   }
   imgEl.style.display = "block";
@@ -4482,6 +4502,11 @@ async function loadTrajectoryByName(name) {
   const videoEl = document.getElementById("videoPlayer");
   if (!videoEl.paused) videoEl.pause();
   videoEl.dataset.srcUrl = "";
+  const imgEl = document.getElementById("videoImg");
+  imgEl.dataset.srcUrl = "";
+  imgEl.removeAttribute("src");
+  document.getElementById("videoModalImg").removeAttribute("src");
+  APP.activeVideoKey = "";
   const q = name ? `?name=${encodeURIComponent(name)}` : "";
   const resp = await fetch(`/api/trajectory${q}`);
   APP.payload = await resp.json();
@@ -4516,6 +4541,10 @@ async function init() {
   const activeTel = APP.telemetrySources.active_source || APP.payload?.comparison?.source_path || "";
   telSel.innerHTML = `<option value="">Compare: None</option>`
     + telItems.map(it => `<option value="${esc(it.path)}" ${it.path === activeTel ? "selected" : ""}>${esc(it.label)} (${it.size_kb} KB)</option>`).join("");
+
+  const imgEl = document.getElementById("videoImg");
+  imgEl.onload = () => { imgEl.style.opacity = "1"; };
+  imgEl.onerror = () => { imgEl.style.opacity = "1"; };
 
   const videoEl = document.getElementById("videoPlayer");
   videoEl.addEventListener("loadedmetadata", () => {
@@ -4721,16 +4750,33 @@ def main(argv: list[str] | None = None) -> None:
     if args.telemetry is not None and not args.telemetry.is_file():
         raise FileNotFoundError(f"Telemetry/GT file not found: {args.telemetry}")
 
-    server = TrajectoryVisualizerServer(
-        trajectory_path=traj_path,
-        video_path=args.video,
-        telemetry_path=args.telemetry,
-        telemetry_seed=args.telemetry_seed,
-        telemetry_run_index=args.telemetry_run_index,
-        host=args.host,
-        port=args.port,
-        verbose=args.verbose,
+    server: TrajectoryVisualizerServer | None = None
+    candidate_ports = (
+        [args.port] if args.port == 0 else list(range(args.port, args.port + 21))
     )
+    last_err: OSError | None = None
+    for port_try in candidate_ports:
+        try:
+            server = TrajectoryVisualizerServer(
+                trajectory_path=traj_path,
+                video_path=args.video,
+                telemetry_path=args.telemetry,
+                telemetry_seed=args.telemetry_seed,
+                telemetry_run_index=args.telemetry_run_index,
+                host=args.host,
+                port=port_try,
+                verbose=args.verbose,
+            )
+            if args.port != 0 and port_try != args.port:
+                print(
+                    f"[TrajectoryVisualizer] Port {args.port} is already in use; serving on port {server.port} instead."
+                )
+            break
+        except OSError as exc:
+            last_err = exc
+    if server is None:
+        assert last_err is not None
+        raise last_err
     print(f"[TrajectoryVisualizer] Serving at {server.url}")
     if traj_path:
         print(f"[TrajectoryVisualizer] Loaded trajectory: {traj_path}")

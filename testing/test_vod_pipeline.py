@@ -10,6 +10,7 @@ import time
 import unittest
 
 from game.balatro_models import Deck, Stake
+from vod_pipeline.deck_matcher import DeckVideoMatch
 from vod_pipeline.metadata import extract_run_metadata, extract_video_id
 from vod_pipeline.runner import PipelineConfig, run_batch_pipeline
 
@@ -203,6 +204,7 @@ class TestVodMetadataAndBatchPipeline(unittest.TestCase):
                 max_backlog=2,
                 download_workers=2,
                 keep_videos=False,
+                allow_deck_template_fallback=False,
             )
             report = run_batch_pipeline(
                 urls,
@@ -239,6 +241,144 @@ class TestVodMetadataAndBatchPipeline(unittest.TestCase):
             )
             self.assertEqual(report_resume["counts"]["eligible"], 1)  # only previously failed vid5
             self.assertEqual(downloaded_vids, ["vid5"])
+
+    def test_batch_pipeline_deck_template_fallback_recovers_and_skips_unmatched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "batch_runs"
+            urls = [f"https://www.youtube.com/watch?v={vid}" for vid in ("miss_ok", "conflict_ok", "miss_fail", "noseed_skip")]
+
+            def fake_fetch(input_urls, _cfg):
+                raws = {
+                    "miss_ok": {"id": "miss_ok", "title": "Square over Telescope", "description": "Seed: BZTGPV12"},
+                    "conflict_ok": {"id": "conflict_ok", "title": "Checkered Deck", "description": "Yellow Deck:\n\n2P3Q4R5S"},
+                    "miss_fail": {"id": "miss_fail", "title": "Mystery Run", "description": "Seed: VUCDKYZ6"},
+                    "noseed_skip": {"id": "noseed_skip", "title": "Mystery Run", "description": "No seed and no deck"},
+                }
+                out = []
+                for u in input_urls:
+                    vid = extract_video_id(u)
+                    raw = raws[vid]
+                    out.append((raw, extract_run_metadata(raw, url=u)))
+                return out
+
+            downloaded: list[str] = []
+            processed: list[tuple[str, Deck | None, str]] = []
+
+            def fake_download(_url, video_id, downloads_dir, _cfg, _stop_event):
+                downloaded.append(video_id)
+                p = downloads_dir / f"{video_id}.mp4"
+                p.write_bytes(b"fake_mp4")
+                return p
+
+            def fake_deck_matcher(video_path: Path, _cfg):
+                stem = video_path.stem
+                if stem == "miss_ok":
+                    return DeckVideoMatch(
+                        deck=Deck.NEBULA_DECK,
+                        confidence=0.91,
+                        mean_margin=0.14,
+                        matched_frames=4,
+                        sampled_frames=6,
+                        votes={"Nebula Deck": 4},
+                        best_frame_idx=300,
+                    )
+                if stem == "conflict_ok":
+                    return DeckVideoMatch(
+                        deck=Deck.CHECKERED_DECK,
+                        confidence=0.87,
+                        mean_margin=0.36,
+                        matched_frames=3,
+                        sampled_frames=6,
+                        votes={"Checkered Deck": 3},
+                        best_frame_idx=400,
+                    )
+                return None
+
+            def fake_process(_video_path, meta, _cfg):
+                processed.append((meta.video_id, meta.deck, meta.deck_source))
+                traj_out = work_dir / "trajectories" / f"{meta.video_id}_trajectory.json"
+                traj_out.write_text("{}", encoding="utf-8")
+                return {
+                    "actions_json": str(work_dir / "actions" / f"{meta.video_id}_actions.json"),
+                    "trajectory_json": str(traj_out),
+                    "num_steps": 5,
+                    "final_ante": 8,
+                    "final_round": 24,
+                    "elapsed_sec": 0.01,
+                }
+
+            cfg = PipelineConfig(
+                work_dir=work_dir,
+                max_backlog=2,
+                download_workers=2,
+                keep_videos=False,
+                allow_deck_template_fallback=True,
+            )
+            report = run_batch_pipeline(
+                urls,
+                cfg,
+                fetch_metadata_fn=fake_fetch,
+                download_fn=fake_download,
+                process_fn=fake_process,
+                deck_matcher_fn=fake_deck_matcher,
+            )
+
+            self.assertEqual(report["counts"]["total"], 4)
+            self.assertEqual(report["counts"]["eligible"], 3)
+            self.assertEqual(report["counts"]["processed"], 2)
+            self.assertEqual(report["counts"]["skipped"], 2)
+            self.assertEqual(report["counts"]["failed"], 0)
+
+            self.assertEqual(set(downloaded), {"miss_ok", "conflict_ok", "miss_fail"})
+            self.assertEqual(
+                {vid: deck for vid, deck, _ in processed},
+                {"miss_ok": Deck.NEBULA_DECK, "conflict_ok": Deck.CHECKERED_DECK},
+            )
+            for _, _, src in processed:
+                self.assertTrue(src.startswith("deck_template_match("), src)
+            skip_reasons = {row["video_id"]: row["skip_reason"] for row in report["skipped"]}
+            self.assertEqual(
+                skip_reasons,
+                {"noseed_skip": "missing_deck_and_seed", "miss_fail": "deck_template_not_found"},
+            )
+            self.assertEqual(list((work_dir / "downloads").glob("*.mp4")), [])
+
+    def test_dry_run_19_saved_metadata_all_eligible_with_deck_template_fallback(self) -> None:
+        meta_dir = Path("assets/sample_inputs/metadata")
+        paths = sorted(p for p in meta_dir.glob("*.json") if p.name != "index.json")
+        self.assertEqual(len(paths), 19)
+
+        def load_saved(urls, _cfg):
+            out = []
+            for p in paths:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                out.append((raw, extract_run_metadata(raw)))
+            return out
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = PipelineConfig(
+                work_dir=Path(tmpdir) / "batch_runs",
+                dry_run=True,
+                allow_deck_template_fallback=True,
+            )
+            report = run_batch_pipeline(
+                ["https://www.youtube.com/watch?v=dummy"],
+                cfg,
+                fetch_metadata_fn=load_saved,
+            )
+
+        self.assertEqual(report["counts"]["total"], 19)
+        self.assertEqual(report["counts"]["eligible"], 19)
+        self.assertEqual(report["counts"]["skipped"], 0)
+        pending = {
+            row["video_id"]: row["deck_source"]
+            for row in report["eligible_preview"]
+            if row["deck_source"] == "pending_deck_template_match"
+        }
+        self.assertEqual(
+            set(pending.keys()),
+            {"_MDwyFmIo5s", "9vDE86eVa0Y", "KwcBB0pDDJo"},
+        )
 
 
 if __name__ == "__main__":

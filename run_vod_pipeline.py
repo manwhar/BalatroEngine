@@ -93,6 +93,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fetch metadata, validate deck/seed/stake gating, and print report without downloading",
     )
     p.add_argument(
+        "--deck-template-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When deck is missing/ambiguous in metadata, sample a few video frames to template-match the deck back (default: enabled)",
+    )
+    p.add_argument(
         "--allow-ocr-seed-fallback",
         action="store_true",
         help="When seed is absent from description, allow downloading if seed_ocr.pt exists to read end screen",
@@ -124,6 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         keep_videos=bool(args.keep_videos),
         resume=bool(args.resume),
         dry_run=bool(args.dry_run),
+        allow_deck_template_fallback=bool(args.deck_template_fallback),
         allow_ocr_seed_fallback=bool(args.allow_ocr_seed_fallback),
         skip_frames=int(args.skip_frames),
         batch_size=int(args.batch_size),

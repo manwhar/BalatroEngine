@@ -1100,6 +1100,27 @@ def _get_hud_val(hud_out: Any, field_name: str) -> Any:
     return getattr(hud_out, field_name, None)
 
 
+def _scores_indicate_no_hand_scored(
+    cur_score: Any, nxt_score: Any, frame_delta: int
+) -> bool:
+    """Returns True if consecutive round-score OCR reads show no hand scored between them."""
+    if cur_score is None or nxt_score is None:
+        return True
+    cur_i = int(cur_score)
+    nxt_i = int(nxt_score)
+    if nxt_i <= cur_i:
+        return True
+    # Minimum possible valid Balatro hand scores >= 5 chips (High Card); smaller delta is OCR jitter
+    if (nxt_i - cur_i) <= 4:
+        return True
+    if frame_delta <= 180:
+        s1 = str(cur_i)
+        s2 = str(nxt_i)
+        if len(s1) == len(s2) and sum(a != b for a, b in zip(s1, s2)) <= 1:
+            return True
+    return False
+
+
 _SOFTLOCKED_PLANET_HANDS: dict[str, PokerHand] = {
     "c_planet_x": PokerHand.FIVE_OF_A_KIND,
     "c_ceres": PokerHand.FLUSH_HOUSE,
@@ -3095,10 +3116,8 @@ def _build_run_trajectory_with_plan(
                                 or nxt_round is None
                                 or int(nxt_round) == int(cur_round)
                             )
-                            and (
-                                cur_score is None
-                                or nxt_score is None
-                                or cur_score == nxt_score
+                            and _scores_indicate_no_hand_scored(
+                                cur_score, nxt_score, nxt.frame_id - sa.frame_id
                             )
                         ):
                             cancelled_play = True
@@ -3107,6 +3126,27 @@ def _build_run_trajectory_with_plan(
                     for hc in state.hand.cards:
                         hc.selected = False
                     continue
+
+        # Drop cancelled SELL_CARD hover/click directly above an immediate USE_CONSUMABLE click
+        if sa.action_type == A.SELL_CARD and sa_idx + 1 < len(scheduled_actions):
+            nxt = scheduled_actions[sa_idx + 1]
+            if (
+                nxt.action_type == A.USE_CONSUMABLE
+                and 0 < (nxt.frame_id - sa.frame_id) <= 60
+                and sa.button_box
+                and nxt.button_box
+            ):
+                sx = (sa.button_box[0] + sa.button_box[2]) * 0.5
+                sy = (sa.button_box[1] + sa.button_box[3]) * 0.5
+                ux = (nxt.button_box[0] + nxt.button_box[2]) * 0.5
+                uy = (nxt.button_box[1] + nxt.button_box[3]) * 0.5
+                if abs(sx - ux) <= 80 and 0 < (uy - sy) <= 160:
+                    cur_m = _get_hud_val(hud_peek, "hud_money")
+                    nxt_m = _get_hud_val(
+                        hud_res_by_frame.get(nxt.target_frame), "hud_money"
+                    )
+                    if cur_m is None or nxt_m is None or int(nxt_m) <= int(cur_m):
+                        continue
 
         # Ensure blind transition leaves no stale hand cards from the prior round
         if sa.action_type in (A.SELECT_BLIND, A.SKIP_BLIND, A.CASH_OUT):

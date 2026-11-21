@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -52,6 +53,7 @@ from tools.visualize_trajectory import (
     TEXTURES_2X_DIR,
     TrajectoryVisualizerServer,
     VideoFrameCache,
+    _QuietThreadingHTTPServer,
     build_visualization_payload,
     find_matching_video,
     load_balatro_sprite_manifest,
@@ -718,6 +720,29 @@ class TestVisualizerComparisonAndVideo(unittest.TestCase):
                     r_416 = conn.getresponse()
                     r_416.read()
                     self.assertEqual(r_416.status, 416)
+
+                    # 6. Cache-key uniqueness, no-store on /api/frame, HTML ?v= cache-bust, Windows reuse guard
+                    cache_a = VideoFrameCache(vid_path, max_items=2)
+                    cache_b = VideoFrameCache(vid_path, max_items=2)
+                    try:
+                        key_a = cache_a.meta.get("cache_key")
+                        key_b = cache_b.meta.get("cache_key")
+                        self.assertTrue(key_a and key_b)
+                        self.assertNotEqual(key_a, key_b)
+                    finally:
+                        cache_a.close()
+                        cache_b.close()
+
+                    conn.request("GET", f"/api/frame/0?v={server.app_state.frame_cache.meta['cache_key']}")
+                    r_frame = conn.getresponse()
+                    frame_body = r_frame.read()
+                    self.assertEqual(r_frame.status, 200)
+                    self.assertEqual(r_frame.getheader("Cache-Control"), "no-store")
+                    self.assertGreater(len(frame_body), 100)
+
+                    self.assertIn(b"/api/frame/${targetFrame}?v=", html)
+                    self.assertIn(b'imgEl.removeAttribute("src")', html)
+                    self.assertEqual(_QuietThreadingHTTPServer.allow_reuse_address, os.name != "nt")
                 finally:
                     conn.close()
             finally:
