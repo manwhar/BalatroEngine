@@ -1,0 +1,45 @@
+{
+  "id": "_MDwyFmIo5s",
+  "webpage_url": "https://www.youtube.com/watch?v=_MDwyFmIo5s",
+  "original_url": "https://www.youtube.com/watch?v=_MDwyFmIo5s",
+  "title": "Square over Telescope, every time (Gold Stake Lessons)",
+  "description": "https://ko-fi.com/drspectred\nhttps://www.twitch.tv/drspectred\nSeed: \n\nBZTGPV12\n\nDaily Gold Stake gameplay with tips and other commentary. Learn to play Balatro at the highest level of difficulty. If you're able, try the seed yourself before watching what I do. \n\nPlaylists:\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcF55gYlGCQxU8ymTmgZwwOt\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcEx0WnRNCrRH6Ur7jPHYWeZ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcFnQ5pZnWw5rQHZWxS4dFU_\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHksPKzwm3N-6eK4ZG2zcdQ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHAsDctke2QWNmPiMqvMdKy\n\nBalatroU has a bunch of talented artists, but Kitty is the one who did most of the emotes you see in the video thumbnails. She does pixel art, too, including many of the Jokers for the Extra Credit Mod.\nCommission her here: https://bsky.app/profile/dottykitty.bsky.social\nhttps://www.instagram.com/dottykittyy/\n\nFor more information about the mods I use, you can join the Balatro University Discord either by one-time Twitch subscription or minimum Ko-Fi contribution. After signing up, go to your Discord Settings and look for \"Connections.\"\n\n\n(Version 1.0.1o)",
+  "upload_date": "20251126",
+  "timestamp": 1764132064,
+  "duration": 2542,
+  "channel": "Balatro University",
+  "uploader": "Balatro University",
+  "channel_id": "UCpAwXXH3rPmSIlWYwIOwlEA",
+  "playlist_index": null,
+  "tags": [
+    "Balatro",
+    "Gameplay",
+    "Chill",
+    "Strategy",
+    "High Score"
+  ],
+  "categories": [
+    "Gaming"
+  ],
+  "chapters": null,
+  "extracted": {
+    "url": "https://www.youtube.com/watch?v=_MDwyFmIo5s",
+    "video_id": "_MDwyFmIo5s",
+    "title": "Square over Telescope, every time (Gold Stake Lessons)",
+    "upload_date": "20251126",
+    "duration_seconds": 2542.0,
+    "channel": "Balatro University",
+    "balatro_version": "1.0.1o",
+    "deck": null,
+    "seed": "BZTGPV12",
+    "stake": "Gold Stake",
+    "deck_source": "",
+    "seed_source": "description_header_labeled",
+    "stake_source": "title",
+    "ready": false,
+    "skip_reason": "missing_deck",
+    "fetch_error": null,
+    "deck_cli": null,
+    "stake_cli": "gold"
+  }
+}

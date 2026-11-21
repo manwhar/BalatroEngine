@@ -22,6 +22,8 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'roi_hud_round' then return self.config.rois.hud_round, 'roi', "ROI: HUD Round"
     elseif t == 'roi_hud_reroll_cost' then return self.config.rois.hud_reroll_cost, 'roi', "ROI: Shop Reroll Cost"
     elseif t == 'roi_hud_blind_target' then return self.config.rois.hud_blind_target, 'roi', "ROI: HUD Blind Target"
+    elseif t == 'roi_seed_win' then return self.config.rois.seed_win, 'roi', "ROI: Seed (Win Modal)"
+    elseif t == 'roi_seed_game_over' then return self.config.rois.seed_game_over, 'roi', "ROI: Seed (Game Over Modal)"
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
     elseif t == 'box_item' then return self.config.boxes.item_card, 'box', "Box: Shop/Pack Item"
     elseif t == 'box_consumeable' then return self.config.boxes.consumeable_card, 'box', "Box: Consumable Card"
@@ -345,6 +347,7 @@ function UI.init_callbacks(mod)
             ['Shop Classifier'] = 'shop_classifier',
             ['End Round Classifier'] = 'end_round_classifier',
             ['HUD OCR'] = 'hud_ocr',
+            ['Seed OCR'] = 'seed_ocr',
         }
         local chosen = mode_map[args.to_val] or 'off'
         mod:set_mode(chosen)
@@ -359,6 +362,7 @@ function UI.init_callbacks(mod)
         mod.state = 'idle'
         if mod.config.calibration_mode ~= 'generation' then
             if mod.restore_joker_display_config then mod:restore_joker_display_config() end
+            if mod.cleanup_seed_overlay then mod:cleanup_seed_overlay() end
             if mod.EndRoundCapture and mod._active_end_round_clip then mod.EndRoundCapture.stop(mod) end
         end
     end
@@ -994,6 +998,7 @@ function UI.build_page_definition(mod)
         or (mod.config.mode == 'shop_classifier' and 3)
         or (mod.config.mode == 'end_round_classifier' and 4)
         or (mod.config.mode == 'hud_ocr' and 5)
+        or (mod.config.mode == 'seed_ocr' and 6)
         or 1
 
     local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
@@ -1029,7 +1034,7 @@ function UI.build_page_definition(mod)
         n = G.UIT.ROOT,
         config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
         nodes = {
-            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier', 'HUD OCR'}, current_mode_idx, 'gdcv_change_mode', 3.6),
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier', 'HUD OCR', 'Seed OCR'}, current_mode_idx, 'gdcv_change_mode', 3.6),
             make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
             make_cycle_row("End-Round Clip Cap", 'gdcv_mc_cycle', max_clips_options, current_mc_idx, 'gdcv_change_max_clips'),
             make_cycle_row("End-Round Sim Batch", 'gdcv_er_cycle', er_batch_options, current_er_idx, 'gdcv_change_er_batch'),
@@ -1209,6 +1214,10 @@ function G.DATASET_MOD:draw_debug()
         draw_roi_box(self.config.rois.hud_reroll_cost,  "[7: REROLL COST]",  sel == 'roi_hud_reroll_cost',  0.2, 1.0, 0.3)
         draw_roi_box(self.config.rois.hud_blind_target, "[8: BLIND TARGET]", sel == 'roi_hud_blind_target', 1.0, 0.6, 0.2)
         draw_roi_box(self.config.rois.pack_hand,        "[9: PACK HAND (CV)]", sel == 'roi_pack_hand',     1.0, 0.3, 0.85)
+    elseif self.config.mode == 'seed_ocr' then
+        local sel = self.selected_target
+        draw_roi_box(self.config.rois.seed_win,       "[1: SEED (WIN MODAL)]",       sel == 'roi_seed_win',       0.2, 1.0, 0.5)
+        draw_roi_box(self.config.rois.seed_game_over, "[2: SEED (GAME OVER MODAL)]", sel == 'roi_seed_game_over', 1.0, 0.45, 0.3)
     elseif self.config.mode == 'shop_classifier' then
         local sel = self.selected_target
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
@@ -1330,6 +1339,7 @@ function G.DATASET_MOD:draw_debug()
     local mode_str = (self.config.mode == 'card_classifier' and "CARD CLASSIFIER")
         or (self.config.mode == 'end_round_classifier' and "END ROUND CLASSIFIER")
         or (self.config.mode == 'hud_ocr' and "HUD OCR")
+        or (self.config.mode == 'seed_ocr' and "SEED OCR")
         or "SHOP & JOKER CLASSIFIER"
     love.graphics.setColor(1, 0.85, 0.2, 1)
     love.graphics.print(string.format("GAMESTATE CV CALIBRATION  -  [%s]", mode_str), 18, 14)
@@ -1354,6 +1364,8 @@ function G.DATASET_MOD:draw_debug()
         love.graphics.print("Keys: 3: ROI Play Area | R: Preview Scenario | C: Record 1 Test Clip | TAB: Auto-Generate Clips", 18, 58)
     elseif self.config.mode == 'hud_ocr' then
         love.graphics.print("Keys: 1:Score | 2:Money | 3:Hands | 4:Discards | 5:Ante | 6:Round | 7:Reroll | 8:BlindTarget | 9:PackHand", 18, 58)
+    elseif self.config.mode == 'seed_ocr' then
+        love.graphics.print("Keys: 1: Seed ROI (Win) | 2: Seed ROI (Game Over) | R: Spawn Seed Modal | P: Win/GameOver", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card | 3: ROI Play Area", 18, 58)
     end
@@ -1378,6 +1390,12 @@ function G.DATASET_MOD:draw_debug()
         local phase_str = string.upper(self.hud_phase or 'blind')
         love.graphics.print(string.format("Next HUD Frame: %05d / %d | Phase: %s (%d/%d) | P: Blind/Shop | Lua Mem: %.1f MB",
             cur_hud, max_frames, phase_str, self.hud_phase_step or 0, self.config.frames_per_phase or 100, collectgarbage("count") / 1024), 18, 146)
+    elseif self.config.mode == 'seed_ocr' then
+        local cur_seed = (self.frame_counts and self.frame_counts.seed_ocr) or 0
+        local max_frames = self.config.max_frames or 10000
+        local phase_str = string.upper(self.seed_phase or 'win')
+        love.graphics.print(string.format("Next Seed Frame: %05d / %d | Modal: %s (%d/%d) | P: Win/GameOver | Lua Mem: %.1f MB",
+            cur_seed, max_frames, phase_str, self.seed_phase_step or 0, self.config.frames_per_phase or 100, collectgarbage("count") / 1024), 18, 146)
     else
         local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
         local phase_extra = ""
@@ -1410,13 +1428,14 @@ end
 -- ==========================================
 -- KEYPRESS HANDLER
 -- ==========================================
-local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr' }
+local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr', 'seed_ocr' }
 local MODE_DISPLAY_NAMES = {
     off = 'OFF',
     card_classifier = 'CARD CLASSIFIER',
     shop_classifier = 'SHOP CLASSIFIER',
     end_round_classifier = 'END ROUND CLASSIFIER',
     hud_ocr = 'HUD OCR',
+    seed_ocr = 'SEED OCR',
 }
 
 local function cycle_classifier_mode(mod, step)
@@ -1468,9 +1487,9 @@ function G.DATASET_MOD:on_keypressed(key)
 
     if key == 'tab' then
         if self.config.calibration_mode == 'setup' then
-            if self.config.mode == 'hud_ocr' and not (G and G.GAME) then
+            if (self.config.mode == 'hud_ocr' or self.config.mode == 'seed_ocr') and not (G and G.GAME) then
                 self.capture_flash = 2.0
-                self.capture_flash_text = "START A RUN FIRST BEFORE GENERATING HUD OCR DATA!"
+                self.capture_flash_text = "START A RUN FIRST BEFORE GENERATING OCR DATA!"
                 return
             end
             self.config.calibration_mode = 'generation'
@@ -1483,6 +1502,9 @@ function G.DATASET_MOD:on_keypressed(key)
             self.state = 'idle'
             if self.EndRoundCapture and self.config.mode == 'end_round_classifier' then
                 self.EndRoundCapture.stop(self)
+            end
+            if self.cleanup_seed_overlay and self.config.mode == 'seed_ocr' then
+                self:cleanup_seed_overlay()
             end
             if self.restore_joker_display_config then self:restore_joker_display_config() end
             self.capture_flash = 2.0
@@ -1508,6 +1530,10 @@ function G.DATASET_MOD:on_keypressed(key)
             elseif key == '7' then self.selected_target = 'roi_hud_reroll_cost'
             elseif key == '8' then self.selected_target = 'roi_hud_blind_target'
             elseif key == '9' then self.selected_target = 'roi_pack_hand'
+            end
+        elseif self.config.mode == 'seed_ocr' then
+            if key == '1' then self.selected_target = 'roi_seed_win'
+            elseif key == '2' then self.selected_target = 'roi_seed_game_over'
             end
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'
@@ -1543,6 +1569,8 @@ function G.DATASET_MOD:on_keypressed(key)
                 end
             elseif self.config.mode == 'hud_ocr' then
                 self:generate_hud_step()
+            elseif self.config.mode == 'seed_ocr' then
+                self:generate_seed_step()
             else
                 if (self.shop_phase or 'shop') == 'shop' then
                     self:setup_shop_screen()
@@ -1560,6 +1588,8 @@ function G.DATASET_MOD:on_keypressed(key)
             self:toggle_shop_screen_mode()
         elseif key == 'p' and self.config.mode == 'hud_ocr' then
             self:toggle_hud_screen_mode()
+        elseif key == 'p' and self.config.mode == 'seed_ocr' then
+            self:toggle_seed_screen_mode()
         elseif key == 't' and self.config.mode == 'card_classifier' then
             self:randomize_hand_selection()
         elseif key == 'c' then
@@ -1658,6 +1688,7 @@ function G.DATASET_MOD:update(dt)
         end
         local cur_frame = (self.config.mode == 'shop_classifier' and self.frame_counts.shop)
             or (self.config.mode == 'hud_ocr' and self.frame_counts.hud_ocr)
+            or (self.config.mode == 'seed_ocr' and self.frame_counts.seed_ocr)
             or self.frame_counts.card
         local max_frames = self.config.max_frames or 10000
 
@@ -1665,6 +1696,7 @@ function G.DATASET_MOD:update(dt)
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
             if self.restore_joker_display_config then self:restore_joker_display_config() end
+            if self.cleanup_seed_overlay and self.config.mode == 'seed_ocr' then self:cleanup_seed_overlay() end
             self.capture_flash = 3.0
             self.capture_flash_text = string.format("REACHED TARGET CAP (%d FRAMES)! GENERATION STOPPED.", max_frames)
             print(string.format("DATASET: Reached threshold cap of %d frames. Stopped generation.", max_frames))
@@ -1679,6 +1711,12 @@ function G.DATASET_MOD:update(dt)
                 self:generate_shop_step()
             elseif self.config.mode == 'hud_ocr' then
                 local ok = self:generate_hud_step()
+                if not ok then
+                    self.config.calibration_mode = 'setup'
+                    return
+                end
+            elseif self.config.mode == 'seed_ocr' then
+                local ok = self:generate_seed_step()
                 if not ok then
                     self.config.calibration_mode = 'setup'
                     return

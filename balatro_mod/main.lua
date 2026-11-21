@@ -76,6 +76,7 @@ local CaptureModule         = load_submodule("src/capture.lua")
 local EndRoundGenModule     = load_submodule("src/end_round_gen.lua")
 local EndRoundCaptureModule = load_submodule("src/end_round_capture.lua")
 local HudGenModule          = load_submodule("src/hud_gen.lua")
+local SeedGenModule         = load_submodule("src/seed_gen.lua")
 local UIModule              = load_submodule("src/ui.lua")
 local RunTracker            = load_submodule("src/run_tracker.lua")
 
@@ -83,6 +84,7 @@ G.DATASET_MOD.ShopGen = ShopGenModule
 G.DATASET_MOD.EndRoundGen = EndRoundGenModule
 G.DATASET_MOD.EndRoundCapture = EndRoundCaptureModule
 G.DATASET_MOD.HudGen = HudGenModule
+G.DATASET_MOD.SeedGen = SeedGenModule
 G.DATASET_MOD.RunTracker = RunTracker
 
 -- Initialize configuration, counters, and directories

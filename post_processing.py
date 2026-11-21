@@ -8,6 +8,9 @@ sequence.
 Scope notes:
 - Starting mid-run is out of scope; replay reconstruction assumes a fresh run
   starting at Ante 1, Small Blind (`Location.SELECT`).
+- Endless mode is out of scope; once OCR and simulation agree the ante has
+  ticked over to Ante 9, processing stops immediately and truncates to the end
+  of Ante 8.
 - Exact chip/mult round score calculation is intentionally omitted; `current_chips`
   and HUD counters (money, hands, discards, round, ante, reroll cost) are left
   for OCR integration hooks.
@@ -66,7 +69,7 @@ from game.engine.cv_stubs import (
 )
 from game.engine.jokers import _get_visible_poker_hands, on_joker_added
 from game.engine.rng_sim.events import get_to_do_list_hand
-from game.engine.rules import on_action, trigger_end_of_round_effects
+from game.engine.rules import _effective_ante, on_action, trigger_end_of_round_effects
 from game.gamestate import GameState, RunTrajectory, _cards_match
 
 
@@ -875,6 +878,13 @@ def _init_diagnostics() -> dict[str, Any]:
         "cashout_without_round_won": [],
         "empty_hand_cv_actions": [],
         "missing_shop_cv_actions": [],
+        "hand_size_over_15_actions": [],
+        "unexpected_deck_additions": [],
+        "large_ocr_overrides": [],
+        "corrupted_actions": [],
+        "quarantine_watermark": None,
+        "quarantined_downstream_count": 0,
+        "stopped_at_ante_9": None,
         "deck_constrained_remaps": 0,
         "face_down_plays_resolved": 0,
         "inferred_cash_outs": 0,
@@ -900,6 +910,29 @@ def _record_ocr_override(
     samples = diag["ocr_override_samples"]
     if len(samples) < 12:
         samples.append((frame_id, action_type.value, field_name, prev_val, new_val))
+
+    is_large = False
+    if field_name == "ante":
+        is_large = True
+    elif (
+        field_name == "round"
+        and isinstance(prev_val, int)
+        and isinstance(new_val, int)
+        and abs(new_val - prev_val) >= 2
+    ):
+        is_large = True
+    elif (
+        field_name == "money"
+        and action_type != ActionType.CASH_OUT
+        and isinstance(prev_val, (int, float))
+        and isinstance(new_val, (int, float))
+        and abs(new_val - prev_val) >= 15
+    ):
+        is_large = True
+    if is_large:
+        diag["large_ocr_overrides"].append(
+            (frame_id, action_type.value, field_name, prev_val, new_val)
+        )
 
 
 def _print_expressive_report(diag: dict[str, Any]) -> None:
@@ -999,6 +1032,46 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
     if missing_shop:
         print(
             f"[WARN] SHOP/PACK actions missing CV output: {len(missing_shop)} time(s) (frames {missing_shop[:8]})"
+        )
+
+    over_15 = diag.get("hand_size_over_15_actions", [])
+    if over_15:
+        sample_str = ", ".join(
+            f"f={fid} (exp={exp}, det={det})" for fid, _, exp, det in over_15[:6]
+        )
+        print(
+            f"[WARN] Hand size > 15 (out-of-distribution CV): {len(over_15)} action(s) [{sample_str}]"
+        )
+
+    corrupted = diag.get("corrupted_actions", [])
+    if corrupted:
+        print(
+            f"[WARN] Corrupted step(s) flagged for training exclusion: {len(corrupted)} "
+            f"(frames {[fid for fid, _, _ in corrupted[:8]]})"
+        )
+
+    unexp_deck = diag.get("unexpected_deck_additions", [])
+    if unexp_deck:
+        total_adds = sum(cnt for _, _, cnt in unexp_deck)
+        print(
+            f"[WARN] Unexpected deck additions during hand sync: +{total_adds} card(s) "
+            f"across {len(unexp_deck)} step(s) (e.g. frames {[f for f, _, _ in unexp_deck[:6]]})"
+        )
+
+    wm = diag.get("quarantine_watermark")
+    if wm is not None:
+        print(
+            f"[WARN] Cascade quarantine triggered from step {wm} -> end "
+            f"(+{diag.get('quarantined_downstream_count', 0)} downstream tag(s))"
+        )
+
+    ante9_stop = diag.get("stopped_at_ante_9")
+    if ante9_stop:
+        print(
+            f"Ante 9 safeguard triggered at frame {ante9_stop['trigger_frame_id']} "
+            f"({ante9_stop['trigger_action']}): stopped Endless Mode and kept "
+            f"{ante9_stop['kept_steps']} step(s) up to end of Ante 8 "
+            f"(dropped {ante9_stop['dropped_steps']} post-Ante-8 step(s))"
         )
 
     remaps = diag.get("deck_constrained_remaps", 0)
@@ -1247,7 +1320,7 @@ def _sync_hud_into_state(
         and sa.ambient_location == Location.BLIND
         and not state.round_won
         and not getattr(state, "pending_blind_advance", False)
-        and 1 <= int(ante_val) <= 39
+        and 1 <= int(ante_val) <= 8
     ):
         new_ante = int(ante_val)
         _record_ocr_override(
@@ -1932,6 +2005,282 @@ def _raw_head_prob(raw_card: Any, head_name: str, target_label: str, top1_label:
     return 0.0
 
 
+def _flag_corrupted_action(
+    action: Action,
+    reason: str,
+    *,
+    diag: dict[str, Any] | None = None,
+) -> None:
+    """Marks an Action/step as corrupted so downstream training pipelines can exclude it."""
+    action.metadata["corrupted"] = True
+    reasons = action.metadata.setdefault("corruption_reasons", [])
+    if reason not in reasons:
+        reasons.append(reason)
+    if diag is not None:
+        entry = (action.frame_idx, action.type.value, reason)
+        if entry not in diag["corrupted_actions"]:
+            diag["corrupted_actions"].append(entry)
+
+
+def _check_over_15_hand_size(
+    state: GameState,
+    action: Action,
+    obs_cards: Sequence[HandCard],
+    *,
+    has_hand_cv: bool,
+    diag: dict[str, Any] | None = None,
+) -> bool:
+    """Flags hand-observing steps as corrupted when expected or observed hand size exceeds 15."""
+    expected_hand = (
+        min(
+            state.hand.max_size,
+            len(state.hand.cards) + len(state.remaining_deck),
+        )
+        if state.full_deck
+        else state.hand.max_size
+    )
+    in_hand_view = (
+        (state.location == Location.BLIND and not state.round_won and has_hand_cv)
+        or len(obs_cards) > 0
+    )
+    if not in_hand_view or (expected_hand <= 15 and len(obs_cards) <= 15):
+        return False
+
+    action.metadata["expected_hand_max_size"] = int(expected_hand)
+    action.metadata["detected_hand_cards"] = int(len(obs_cards))
+    _flag_corrupted_action(action, "hand_size_over_15", diag=diag)
+    if diag is not None:
+        diag["hand_size_over_15_actions"].append(
+            (action.frame_idx, action.type.value, int(expected_hand), int(len(obs_cards)))
+        )
+    return True
+
+
+def _scan_and_quarantine_corrupted_segments(
+    trajectory: RunTrajectory,
+    step_records: Sequence[dict[str, Any]],
+    *,
+    diag: dict[str, Any] | None = None,
+) -> int | None:
+    """Scans trajectory steps for local, round-scoped, and cascading permanent corruption.
+
+    Marks affected steps via `_flag_corrupted_action` so training datasets can exclude
+    poisoned states (such as corrupted `full_deck` / inventory after an anomalous segment).
+    Returns the earliest permanent-tail quarantine step index, or None if not triggered.
+    """
+    n_steps = len(trajectory.deltas)
+    if n_steps <= 1 or len(step_records) != n_steps:
+        return None
+
+    # 1. Identify & reconcile transient self-healing inventory flickers (within <= 2 steps)
+    unexp_joker_by_step: dict[int, list[tuple[list[str], list[str]]]] = {
+        s: list(rec.get("unexplained_joker", ())) for s, rec in enumerate(step_records)
+    }
+    unexp_cons_by_step: dict[int, list[tuple[list[str], list[str]]]] = {
+        s: list(rec.get("unexplained_cons", ())) for s, rec in enumerate(step_records)
+    }
+    transient_glitch_steps: set[int] = set()
+
+    def _reconcile_flickers(
+        by_step: dict[int, list[tuple[list[str], list[str]]]],
+    ) -> set[int]:
+        unresolved: set[int] = set()
+        reconciled_idxs: set[tuple[int, int]] = set()
+        for s in range(1, n_steps):
+            entries = by_step.get(s, [])
+            for idx_a, (lost_a, gained_a) in enumerate(entries):
+                if (s, idx_a) in reconciled_idxs:
+                    continue
+                if lost_a and not gained_a:
+                    matched = False
+                    for s2 in range(s + 1, min(n_steps, s + 3)):
+                        for idx_b, (lost_b, gained_b) in enumerate(by_step.get(s2, [])):
+                            if (s2, idx_b) in reconciled_idxs:
+                                continue
+                            if not lost_b and Counter(gained_b) == Counter(lost_a):
+                                reconciled_idxs.add((s, idx_a))
+                                reconciled_idxs.add((s2, idx_b))
+                                transient_glitch_steps.update(range(s, s2 + 1))
+                                matched = True
+                                break
+                        if matched:
+                            break
+                    if not matched:
+                        unresolved.add(s)
+                else:
+                    unresolved.add(s)
+        return unresolved
+
+    unresolved_joker_steps = _reconcile_flickers(unexp_joker_by_step)
+    unresolved_cons_steps = _reconcile_flickers(unexp_cons_by_step)
+
+    # 2. Build active anomaly categories per step
+    cats_by_step: list[set[str]] = [set() for _ in range(n_steps)]
+    u_adds_by_step: list[int] = [0] * n_steps
+    for s in range(1, n_steps):
+        rec = step_records[s]
+        u_adds = int(rec.get("unexpected_adds", 0))
+        u_adds_by_step[s] = u_adds
+        if rec.get("hand_over_15"):
+            cats_by_step[s].add("hand_size_over_15")
+        if u_adds > 0:
+            cats_by_step[s].add("unexpected_deck_addition")
+        if s in unresolved_joker_steps:
+            cats_by_step[s].add("unexplained_joker")
+        if s in unresolved_cons_steps:
+            cats_by_step[s].add("unexplained_cons")
+        if rec.get("location_mismatch"):
+            cats_by_step[s].add("location_mismatch")
+        if rec.get("unmatched_target"):
+            cats_by_step[s].add("unmatched_button_target")
+        if rec.get("empty_hand_cv"):
+            cats_by_step[s].add("empty_hand_cv")
+        if rec.get("missing_shop_cv"):
+            cats_by_step[s].add("missing_shop_cv")
+        if rec.get("cashout_no_round_won"):
+            cats_by_step[s].add("cashout_without_round_won")
+        if rec.get("large_ocr_override"):
+            cats_by_step[s].add("large_ocr_override")
+
+    # 3. Compute earliest permanent-tail quarantine watermark `t_perm`
+    t_perm: int | None = None
+
+    def _update_t_perm(cand: int) -> None:
+        nonlocal t_perm
+        if t_perm is None or cand < t_perm:
+            t_perm = cand
+
+    # Rule C1a: Deck discovery burst in any 5-step sliding window (>= 3 cards or >= 2 steps)
+    win_size = 5
+    for start in range(1, n_steps):
+        end = min(n_steps, start + win_size)
+        add_steps = [k for k in range(start, end) if u_adds_by_step[k] > 0]
+        if len(add_steps) >= 2 or sum(u_adds_by_step[k] for k in add_steps) >= 3:
+            _update_t_perm(add_steps[0])
+
+    # Group step indices into contiguous round segments (preserves order even if ante/round repeats)
+    round_groups: list[list[int]] = []
+    cur_group: list[int] = []
+    cur_rk: tuple[int, int] | None = None
+    for s in range(1, n_steps):
+        rk = step_records[s]["round_key"]
+        if cur_rk is None or rk != cur_rk:
+            if cur_group:
+                round_groups.append(cur_group)
+            cur_group = [s]
+            cur_rk = rk
+        else:
+            cur_group.append(s)
+    if cur_group:
+        round_groups.append(cur_group)
+
+    # Rule C1b: Consecutive rounds both experiencing unexpected deck additions
+    for idx in range(len(round_groups) - 1):
+        g_prev = round_groups[idx]
+        g_next = round_groups[idx + 1]
+        prev_adds = [k for k in g_prev if u_adds_by_step[k] > 0]
+        next_adds = [k for k in g_next if u_adds_by_step[k] > 0]
+        if prev_adds and next_adds:
+            _update_t_perm(prev_adds[0])
+
+    # Rule C2: hand_size_over_15 combined with deck mutation or hand/target failure in same round
+    for grp in round_groups:
+        h15_steps = [k for k in grp if "hand_size_over_15" in cats_by_step[k]]
+        if h15_steps and any(
+            u_adds_by_step[k] > 0
+            or "empty_hand_cv" in cats_by_step[k]
+            or "unmatched_button_target" in cats_by_step[k]
+            for k in grp
+        ):
+            _update_t_perm(h15_steps[0])
+
+    # Rule C3: Multi-signal anomaly co-occurrence (>= 2 distinct categories) in 5-step window or same round
+    for start in range(1, n_steps):
+        end = min(n_steps, start + win_size)
+        win_cats: set[str] = set()
+        first_anomalous: int | None = None
+        for k in range(start, end):
+            if cats_by_step[k]:
+                if first_anomalous is None:
+                    first_anomalous = k
+                win_cats.update(cats_by_step[k])
+        if len(win_cats) >= 2 and first_anomalous is not None:
+            _update_t_perm(first_anomalous)
+
+    for grp in round_groups:
+        grp_cats: set[str] = set()
+        first_anomalous = None
+        for k in grp:
+            if cats_by_step[k]:
+                if first_anomalous is None:
+                    first_anomalous = k
+                grp_cats.update(cats_by_step[k])
+        if len(grp_cats) >= 2 and first_anomalous is not None:
+            _update_t_perm(first_anomalous)
+
+    # Rule C4: Unresolved Joker drift or >= 2 consecutive location mismatches
+    if unresolved_joker_steps:
+        _update_t_perm(min(unresolved_joker_steps))
+    for s in range(1, n_steps - 1):
+        if (
+            "location_mismatch" in cats_by_step[s]
+            and "location_mismatch" in cats_by_step[s + 1]
+        ):
+            _update_t_perm(s)
+
+    # 4. Flag Scope A (transient), Scope B (round-scoped), and Scope C (permanent tail)
+    def _flag_step(s: int, reason: str) -> bool:
+        act = trajectory.deltas[s].action
+        if act is None:
+            return False
+        already = bool(act.metadata.get("corrupted"))
+        _flag_corrupted_action(act, reason, diag=diag)
+        return not already
+
+    # Scope A
+    for s in sorted(transient_glitch_steps):
+        _flag_step(s, "transient_inventory_glitch")
+    for s in range(1, n_steps):
+        if "large_ocr_override" in cats_by_step[s]:
+            _flag_step(s, "large_ocr_override")
+        if "location_mismatch" in cats_by_step[s]:
+            _flag_step(s, "location_mismatch")
+        if u_adds_by_step[s] >= 2:
+            _flag_step(s, "unexpected_deck_addition")
+
+    # Scope B (round-scoped through end of current round)
+    round_end_for_step: dict[int, int] = {}
+    for grp in round_groups:
+        grp_end = grp[-1]
+        for k in grp:
+            round_end_for_step[k] = grp_end
+
+    round_scoped_reasons = (
+        ("hand_size_over_15", "hand_size_over_15"),
+        ("empty_hand_cv", "empty_hand_cv"),
+        ("missing_shop_cv", "missing_shop_cv"),
+        ("cashout_without_round_won", "cashout_without_round_won"),
+    )
+    for s in range(1, n_steps):
+        end_r = round_end_for_step.get(s, s)
+        for cat, reason_label in round_scoped_reasons:
+            if cat in cats_by_step[s]:
+                for k in range(s, end_r + 1):
+                    _flag_step(k, reason_label if k == s else f"round_{reason_label}")
+
+    # Scope C (permanent tail watermark)
+    downstream_added = 0
+    if t_perm is not None:
+        for s in range(t_perm, n_steps):
+            if _flag_step(s, "downstream_cascade_quarantine"):
+                downstream_added += 1
+
+    if diag is not None:
+        diag["quarantine_watermark"] = t_perm
+        diag["quarantined_downstream_count"] = downstream_added
+    return t_perm
+
+
 def _resolve_hand_with_deck_constraints(
     state: GameState,
     raw_cards: Sequence[Any],
@@ -2338,6 +2687,95 @@ def _find_todo_relative_index(
     )
 
 
+def _read_valid_hud_ante(hud_out: Any) -> int | None:
+    """Returns parsed integer HUD ante in `[1, 39]`, or None if missing/invalid."""
+    raw = _get_hud_val(hud_out, "hud_ante")
+    if raw is None:
+        return None
+    try:
+        ante_int = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ante_int if 1 <= ante_int <= 39 else None
+
+
+def _sim_is_in_ante_9(state: GameState) -> bool:
+    """Returns True once the simulated run has reached Ante 9 / Endless Mode."""
+    return state.ante >= 9 or _effective_ante(state) >= 9
+
+
+def _snapshot_diag_state(diag: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Snapshots list lengths and counters in `diag` for clean Ante 9 rollback."""
+    if diag is None:
+        return None
+    list_lens: dict[str, int] = {}
+    scalars: dict[str, int] = {}
+    subdicts: dict[str, dict[Any, Any]] = {}
+    for k, v in diag.items():
+        if isinstance(v, list):
+            list_lens[k] = len(v)
+        elif isinstance(v, int) and not isinstance(v, bool):
+            scalars[k] = v
+        elif k in ("ocr_none_by_field", "ocr_overrides_by_field") and isinstance(
+            v, dict
+        ):
+            subdicts[k] = dict(v)
+    return {"list_lens": list_lens, "scalars": scalars, "subdicts": subdicts}
+
+
+def _restore_diag_snapshot(
+    diag: dict[str, Any] | None, snap: dict[str, Any] | None
+) -> None:
+    """Restores `diag` lists and counters to a prior snapshot."""
+    if diag is None or snap is None:
+        return
+    for k, n in snap["list_lens"].items():
+        if isinstance(diag.get(k), list):
+            del diag[k][n:]
+    for k, val in snap["scalars"].items():
+        diag[k] = val
+    for k, d_copy in snap["subdicts"].items():
+        diag[k] = dict(d_copy)
+
+
+def _halt_and_truncate_to_ante_8(
+    trajectory: RunTrajectory,
+    step_records: list[dict[str, Any]],
+    *,
+    ante_8_end_step_idx: int,
+    ante_8_diag_snap: dict[str, Any] | None,
+    diag: dict[str, Any] | None,
+    diag_cursor: dict[str, int],
+    tracked_diag_keys: Sequence[str],
+    trigger_sa: ScheduledAction,
+    trigger_sa_idx: int,
+    total_scheduled: int,
+) -> GameState:
+    """Truncates recorded steps/diag back to end of Ante 8 and returns that GameState."""
+    keep_len = ante_8_end_step_idx + 1
+    rolled_back = max(0, len(trajectory.deltas) - keep_len)
+    trajectory.deltas = trajectory.deltas[:keep_len]
+    trajectory.keyframes = {
+        k: kf for k, kf in trajectory.keyframes.items() if k < keep_len
+    }
+    del step_records[keep_len:]
+    _restore_diag_snapshot(diag, ante_8_diag_snap)
+    if diag is not None:
+        for k in tracked_diag_keys:
+            diag_cursor[k] = len(diag[k])
+        skipped = max(0, total_scheduled - trigger_sa_idx)
+        diag["stopped_at_ante_9"] = {
+            "trigger_frame_id": trigger_sa.frame_id,
+            "trigger_action": trigger_sa.action_type.value,
+            "ante_8_end_step_idx": ante_8_end_step_idx,
+            "kept_steps": keep_len,
+            "rolled_back_steps": rolled_back,
+            "skipped_actions": skipped,
+            "dropped_steps": rolled_back + skipped,
+        }
+    return trajectory.get_state(ante_8_end_step_idx)
+
+
 def _build_run_trajectory_with_plan(
     d: dict[str, Any],
     video_path: str | Path | None = None,
@@ -2357,18 +2795,17 @@ def _build_run_trajectory_with_plan(
 ) -> tuple[GameState, RunTrajectory, dict[str, Any]]:
     from classifiers.common.video_utils import extract_video_frames
 
-    diag = _init_diagnostics() if expressive else None
+    diag = _init_diagnostics()
     resolved_fps = _resolve_video_fps(video_path, fps)
     dedup_frames = remove_duplicates(d["frames"]) if deduplicate else d["frames"]
     cleaned_input = {
         "key": d["key"],
         "frames": filter_premature_next_rounds(dedup_frames, d["key"], diag=diag),
     }
-    if diag is not None:
-        diag["end_round_segments_checked"] = len(
-            find_missing_end_round_segments(cleaned_input)
-        )
-        pre_frames_count = len(cleaned_input["frames"])
+    diag["end_round_segments_checked"] = len(
+        find_missing_end_round_segments(cleaned_input)
+    )
+    pre_frames_count = len(cleaned_input["frames"])
 
     t0 = time.perf_counter()
     cleaned_input = inject_end_round_actions(
@@ -2460,7 +2897,91 @@ def _build_run_trajectory_with_plan(
         apply_deck_stake_on_init=True,
     )
     trajectory = RunTrajectory()
-    trajectory.record_step(state, action=None)
+    step_records: list[dict[str, Any]] = []
+    _tracked_diag_keys = (
+        "hand_size_over_15_actions",
+        "unexpected_deck_additions",
+        "unexplained_joker_changes",
+        "unexplained_consumable_changes",
+        "unmatched_button_targets",
+        "location_mismatches",
+        "cashout_without_round_won",
+        "empty_hand_cv_actions",
+        "missing_shop_cv_actions",
+        "large_ocr_overrides",
+    )
+    _diag_cursor: dict[str, int] = {k: len(diag[k]) for k in _tracked_diag_keys}
+    ante_8_end_step_idx = 0
+    ante_8_diag_snap = _snapshot_diag_state(diag)
+    ocr_saw_ante_9_in_sim9 = False
+
+    def _record_tracked_step(
+        st: GameState,
+        act: Action | None,
+        *,
+        unexpected_adds: int = 0,
+    ) -> None:
+        nonlocal ante_8_end_step_idx, ante_8_diag_snap, ocr_saw_ante_9_in_sim9
+        trajectory.record_step(st, act)
+        new_slices = {k: diag[k][_diag_cursor[k] :] for k in _tracked_diag_keys}
+        for k in _tracked_diag_keys:
+            _diag_cursor[k] = len(diag[k])
+        step_records.append(
+            {
+                "step_idx": len(trajectory.deltas) - 1,
+                "round_key": (st.ante, st.round),
+                "location": st.location,
+                "round_won": bool(st.round_won),
+                "hand_over_15": bool(new_slices["hand_size_over_15_actions"]),
+                "unexpected_adds": int(unexpected_adds),
+                "unexplained_joker": [
+                    (lost, gained)
+                    for _, _, lost, gained in new_slices["unexplained_joker_changes"]
+                ],
+                "unexplained_cons": [
+                    (lost, gained)
+                    for _, _, lost, gained in new_slices["unexplained_consumable_changes"]
+                ],
+                "unmatched_target": bool(new_slices["unmatched_button_targets"]),
+                "location_mismatch": bool(new_slices["location_mismatches"]),
+                "cashout_no_round_won": bool(new_slices["cashout_without_round_won"]),
+                "empty_hand_cv": bool(new_slices["empty_hand_cv_actions"]),
+                "missing_shop_cv": bool(new_slices["missing_shop_cv_actions"]),
+                "large_ocr_override": bool(new_slices["large_ocr_overrides"]),
+            }
+        )
+        if not _sim_is_in_ante_9(st):
+            ante_8_end_step_idx = len(trajectory.deltas) - 1
+            ante_8_diag_snap = _snapshot_diag_state(diag)
+            ocr_saw_ante_9_in_sim9 = False
+
+    def _maybe_halt_ante_9(
+        cur_sa_idx: int, cur_sa: ScheduledAction, hud_ante_val: int | None
+    ) -> bool:
+        nonlocal state, ocr_saw_ante_9_in_sim9
+        if not _sim_is_in_ante_9(state):
+            return False
+        if hud_ante_val is not None and hud_ante_val >= 9:
+            ocr_saw_ante_9_in_sim9 = True
+        if not ocr_saw_ante_9_in_sim9:
+            return False
+        if expressive and hasattr(action_iter, "close"):
+            action_iter.close()
+        state = _halt_and_truncate_to_ante_8(
+            trajectory,
+            step_records,
+            ante_8_end_step_idx=ante_8_end_step_idx,
+            ante_8_diag_snap=ante_8_diag_snap,
+            diag=diag,
+            diag_cursor=_diag_cursor,
+            tracked_diag_keys=_tracked_diag_keys,
+            trigger_sa=cur_sa,
+            trigger_sa_idx=cur_sa_idx,
+            total_scheduled=len(scheduled_actions),
+        )
+        return True
+
+    _record_tracked_step(state, None)
 
     t3 = time.perf_counter()
     A = ActionType
@@ -2513,6 +3034,11 @@ def _build_run_trajectory_with_plan(
         else enumerate(scheduled_actions)
     )
     for sa_idx, sa in action_iter:
+        hud_peek = hud_res_by_frame.get(sa.target_frame)
+        cur_hud_ante = _read_valid_hud_ante(hud_peek)
+        if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
+            break
+
         is_face_down_boss = (
             state.current_blind in FACE_DOWN_BOSS_BLINDS and not state.boss_disabled
         )
@@ -2534,7 +3060,6 @@ def _build_run_trajectory_with_plan(
 
         # Drop false-positive Discard (0 discards left, e.g. Burglar) and cancelled Play Hand
         # drag-offs BEFORE mutating hand/bars/deck/HUD.
-        hud_peek = hud_res_by_frame.get(sa.target_frame)
         if sa.action_type == A.DISCARD:
             hud_disc = _get_hud_val(hud_peek, "hud_discards")
             if (state.discards_left or 0) <= 0 and hud_disc in (None, 0):
@@ -2611,12 +3136,14 @@ def _build_run_trajectory_with_plan(
             if not state.round_won:
                 trigger_end_of_round_effects(state, synth_co)
             on_action(state, synth_co)
-            trajectory.record_step(state, synth_co)
+            _record_tracked_step(state, synth_co)
             shop_reroll_seq = 0
             shop_todo_ctx = None
             shop_todo_unbought.clear()
             if diag is not None:
                 diag["inferred_cash_outs"] += 1
+            if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
+                break
 
         shop_out = shop_res_by_frame.get(sa.target_frame)
         if state.location == Location.PACK and sa.ambient_location in (
@@ -2683,7 +3210,7 @@ def _build_run_trajectory_with_plan(
                     state.frame_idx = skip_action.frame_idx
                     state.timestamp = skip_action.timestamp
                     on_action(state, skip_action)
-                    trajectory.record_step(state, skip_action)
+                    _record_tracked_step(state, skip_action)
                     skips_done += 1
                     if diag is not None:
                         diag["inferred_skip_packs"] += 1
@@ -2765,7 +3292,7 @@ def _build_run_trajectory_with_plan(
                         state.frame_idx = inferred_action.frame_idx
                         state.timestamp = inferred_action.timestamp
                         on_action(state, inferred_action)
-                        trajectory.record_step(state, inferred_action)
+                        _record_tracked_step(state, inferred_action)
                     else:
                         idx_cursor += 1
 
@@ -2886,6 +3413,7 @@ def _build_run_trajectory_with_plan(
 
         # Hand synchronization & sort handling
         pre_selected_uid: int | None = None
+        step_unexpected_adds = 0
         if sa.action_type in (A.SORT_RANK, A.SORT_SUIT):
             pre_hand = (
                 hand_res_by_frame.get(sa.pre_sort_frame)
@@ -2894,7 +3422,20 @@ def _build_run_trajectory_with_plan(
             )
             if pre_hand is not None:
                 obs_pre = [_convert_card_result_to_hand_card(c) for c in pre_hand.cards]
+                _check_over_15_hand_size(
+                    state, action, obs_pre, has_hand_cv=True, diag=diag
+                )
+                pre_sync_deck_len = (
+                    len(state.full_deck) if state.full_deck is not None else 0
+                )
                 pre_selected_uid = _sync_hand_into_state(state, obs_pre, action=action)
+                if state.full_deck is not None:
+                    added_now = max(0, len(state.full_deck) - pre_sync_deck_len)
+                    if added_now > 0:
+                        step_unexpected_adds += added_now
+                        diag["unexpected_deck_additions"].append(
+                            (action.frame_idx, action.type.value, added_now)
+                        )
                 if pre_selected_uid is not None:
                     action.metadata["selected_slot_uid"] = pre_selected_uid
         else:
@@ -2914,12 +3455,26 @@ def _build_run_trajectory_with_plan(
                 state.played_cards_this_round.clear()
                 state.clear_boss_round_modifiers()
             hand_out = hand_res_by_frame.get(sa.target_frame)
+            obs_cards = (
+                [_convert_card_result_to_hand_card(c) for c in hand_out.cards]
+                if hand_out is not None
+                else []
+            )
+            _check_over_15_hand_size(
+                state,
+                action,
+                obs_cards,
+                has_hand_cv=(
+                    hand_out is not None or sa.action_type in (A.PLAY_HAND, A.DISCARD)
+                ),
+                diag=diag,
+            )
             if hand_out is not None:
-                obs_cards = [
-                    _convert_card_result_to_hand_card(c) for c in hand_out.cards
-                ]
                 _resolve_hand_with_deck_constraints(
                     state, hand_out.cards, obs_cards, diag=diag
+                )
+                pre_sync_deck_len = (
+                    len(state.full_deck) if state.full_deck is not None else 0
                 )
                 _sync_hand_into_state(state, obs_cards, action=action)
                 if (
@@ -2934,6 +3489,13 @@ def _build_run_trajectory_with_plan(
                     if consensus_raw is not None:
                         _resolve_played_face_down_cards(
                             state, action, consensus_raw, diag=diag
+                        )
+                if state.full_deck is not None:
+                    added_now = max(0, len(state.full_deck) - pre_sync_deck_len)
+                    if added_now > 0:
+                        step_unexpected_adds += added_now
+                        diag["unexpected_deck_additions"].append(
+                            (action.frame_idx, action.type.value, added_now)
                         )
             if diag is not None and sa.action_type in (A.PLAY_HAND, A.DISCARD):
                 if hand_out is None or not getattr(hand_out, "cards", None):
@@ -3017,6 +3579,8 @@ def _build_run_trajectory_with_plan(
         prev_loc = state.location
         prev_cons_len = len(state.inventory.consumables) if state.inventory else 0
         on_action(state, action)
+        if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
+            break
         if bought_shop_td_k is not None and 0 <= bought_shop_td_k < len(shop_todo_unbought):
             shop_todo_unbought.pop(bought_shop_td_k)
         if bought_pack_td_k is not None and 0 <= bought_pack_td_k < len(pack_todo_unbought):
@@ -3087,10 +3651,11 @@ def _build_run_trajectory_with_plan(
         elif prev_loc == Location.PACK and state.location != Location.PACK:
             state.hand.cards.clear()
 
-        trajectory.record_step(state, action)
+        _record_tracked_step(state, action, unexpected_adds=step_unexpected_adds)
 
+    _scan_and_quarantine_corrupted_segments(trajectory, step_records, diag=diag)
     trajectory.impute_retroactive_boss_blinds()
-    if diag is not None:
+    if expressive:
         diag["timings"]["simulation"] = time.perf_counter() - t3
         plan["diagnostics"] = diag
         _print_expressive_report(diag)

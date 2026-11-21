@@ -2083,6 +2083,347 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         self.assertEqual(state.to_do_poker_hand, exp_roll2)
         self.assertEqual(state.rng.get_channel_call_count("to_do"), 2)
 
+    def test_hand_size_over_15_flags_corrupted_steps(self):
+        # 1. Direct helper guard: max_size <= 15 OR deck remaining + hand <= 15 stays uncorrupted
+        small_state = gs.GameState(location=bm.Location.BLIND, apply_deck_stake_on_init=True)
+        small_state.hand.max_size = 8
+        act_ok = bm.Action(type=bm.ActionType.PLAY_HAND, frame_idx=10)
+        self.assertFalse(pp._check_over_15_hand_size(small_state, act_ok, [], has_hand_cv=True))
+        self.assertNotIn("corrupted", act_ok.metadata)
+
+        # Even if max_size > 15, if only 12 cards remain in the entire deck, <= 15 can appear on screen
+        tiny_deck_state = gs.GameState(
+            location=bm.Location.BLIND,
+            full_deck=[bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.HEARTS, id=i + 1) for i in range(12)],
+            apply_deck_stake_on_init=False,
+        )
+        tiny_deck_state.hand.max_size = 18
+        act_tiny = bm.Action(type=bm.ActionType.PLAY_HAND, frame_idx=20)
+        self.assertFalse(pp._check_over_15_hand_size(tiny_deck_state, act_tiny, [], has_hand_cv=True))
+        self.assertNotIn("corrupted", act_tiny.metadata)
+
+        # 2. End-to-end orchestration: Play Hand with expected hand > 15 (e.g. stacked Juggle Tags)
+        # flags step metadata with corrupted=True and corruption_reasons=["hand_size_over_15"]
+        d = {
+            "key": {"Select Blind": 0, "Play Hand": 1},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand with max_size=17
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            return [ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode) for _, f_idx, ts in frames]
+
+        def fake_hands(frames, **kwargs):
+            # YOLO only detects 10 distinct cards out of 17+ in hand
+            sample_ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "Ace"]
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res(sample_ranks[i], "Spades", selected=(i == 0)) for i in range(10)]
+                    if f_idx == 200
+                    else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        orig_game_state = pp.GameState
+
+        class JuggledInitState(orig_game_state):
+            def __post_init__(self):
+                super().__post_init__()
+                self.hand.max_size = 17
+
+        with (
+            patch.object(pp, "GameState", JuggledInitState),
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            _, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        diag = plan["diagnostics"]
+        self.assertEqual(diag["hand_size_over_15_actions"], [(200, "Play Hand", 17, 10)])
+        self.assertEqual(diag["corrupted_actions"], [(200, "Play Hand", "hand_size_over_15")])
+        play_meta = traj.deltas[-1].action.metadata
+        self.assertTrue(play_meta.get("corrupted"))
+        self.assertEqual(play_meta.get("corruption_reasons"), ["hand_size_over_15"])
+        self.assertEqual(play_meta.get("expected_hand_max_size"), 17)
+        self.assertEqual(play_meta.get("detected_hand_cards"), 10)
+
+    def test_cascade_quarantine_scanner(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        # 1. Isolated single unexpected deck addition (+1 missed Standard Pack card)
+        # must NOT quarantine downstream steps.
+        d_ok = {
+            "key": {"Select Blind": 0, "Play Hand": 1, "End Round": 2, "Cash Out": 3, "Next Round": 4},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Play Hand (+1 Holographic A♠) -> 200
+                "300": {"action": 2, "box": [500, 500, 600, 550]},  # End Round -> 298
+                "400": {"action": 3, "box": [400, 300, 600, 370]},  # Cash Out -> 398
+                "500": {"action": 4, "box": [100, 100, 200, 150]},  # Next Round -> 498
+            },
+        }
+        frames_ok = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 298, 398, 498)}
+
+        def fake_shops_empty(frames, mode="shop", **kwargs):
+            return [ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode) for _, f_idx, ts in frames]
+
+        def fake_hands_single_new(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", edition="Holo", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops_empty),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands_single_new),
+        ):
+            _, traj_ok, plan_ok = pp._build_run_trajectory_with_plan(
+                d_ok, preloaded_frames=frames_ok, fps=60.0, expressive=True
+            )
+
+        self.assertIsNone(plan_ok["diagnostics"]["quarantine_watermark"])
+        self.assertFalse(any((d.action.metadata or {}).get("corrupted") for d in traj_ok.deltas[1:]))
+
+        # 2. Deck discovery burst (+2 then +2 unexpected adds in Blind) followed by clean Shop/Next Round:
+        # watermark must quarantine Blind burst AND all downstream Shop steps!
+        d_burst = {
+            "key": {"Select Blind": 0, "Play Hand": 1, "End Round": 2, "Cash Out": 3, "Next Round": 4},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},  # Step 1: Select Blind (clean)
+                "200": {"action": 1, "box": [780, 900, 880, 950]},  # Step 2: Play Hand (+2 Holo A♠)
+                "250": {"action": 1, "box": [780, 900, 880, 950]},  # Step 3: Play Hand (+2 Holo K♠)
+                "300": {"action": 2, "box": [500, 500, 600, 550]},  # Step 4: End Round
+                "400": {"action": 3, "box": [400, 300, 600, 370]},  # Step 5: Cash Out
+                "500": {"action": 4, "box": [100, 100, 200, 150]},  # Step 6: Next Round (clean screen, poisoned deck!)
+            },
+        }
+        frames_burst = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 250, 298, 398, 498)}
+
+        def fake_hands_burst(frames, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                if f_idx == 200:
+                    cards = [
+                        _make_card_res("Ace", "Spades", edition="Holo", selected=True),
+                        _make_card_res("Ace", "Hearts", edition="Holo", selected=False),
+                    ]
+                elif f_idx == 250:
+                    cards = [
+                        _make_card_res("King", "Spades", edition="Holo", selected=True),
+                        _make_card_res("King", "Hearts", edition="Holo", selected=False),
+                    ]
+                else:
+                    cards = []
+                outs.append(HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=cards))
+            return outs
+
+        def fake_hud_ok(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx in (200, 250):
+                    vals["hud_hands"] = 4 if f_idx == 200 else 3
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops_empty),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands_burst),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud_ok),
+        ):
+            _, traj_burst, plan_burst = pp._build_run_trajectory_with_plan(
+                d_burst, preloaded_frames=frames_burst, fps=60.0, expressive=True
+            )
+
+        self.assertEqual(plan_burst["diagnostics"]["quarantine_watermark"], 2)
+        self.assertFalse((traj_burst.deltas[1].action.metadata or {}).get("corrupted", False))
+        for s in range(2, len(traj_burst.deltas)):
+            meta = traj_burst.deltas[s].action.metadata
+            self.assertTrue(meta.get("corrupted"), f"Expected step {s} quarantined")
+            self.assertIn("downstream_cascade_quarantine", meta.get("corruption_reasons", []))
+
+    def test_ante_9_endless_safeguard_halts_and_requires_agreement(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        key = {
+            "Select Blind": 0,
+            "End Round": 1,
+            "Cash Out": 2,
+            "Next Round": 3,
+            "Buy Card": 4,
+            "Play Hand": 5,
+        }
+
+        def _build_blind_cycle(
+            frames_dict: dict[str, dict[str, Any]],
+            ante_by_frame: dict[int, int],
+            *,
+            t_start: int,
+            ante: int,
+            include_next_round_after_boss: bool = True,
+        ) -> int:
+            t = t_start
+            for b_idx in range(3):
+                frames_dict[str(t)] = {"action": key["Select Blind"], "box": [100, 100, 180, 140]}
+                ante_by_frame[t - 2] = ante
+                t += 100
+                frames_dict[str(t)] = {"action": key["End Round"], "box": [100, 100, 180, 140]}
+                ante_by_frame[t - 2] = ante
+                t += 100
+                if b_idx == 2 and not include_next_round_after_boss:
+                    break
+                frames_dict[str(t)] = {"action": key["Cash Out"], "box": [400, 300, 600, 370]}
+                ante_by_frame[t - 2] = ante + 1 if b_idx == 2 else ante
+                t += 100
+                frames_dict[str(t)] = {"action": key["Next Round"], "box": [100, 100, 200, 150]}
+                ante_by_frame[t - 2] = ante + 1 if b_idx == 2 else ante
+                t += 100
+            return t
+
+        def _make_run_through_ante_8_boss() -> tuple[dict[str, Any], dict[int, int], int]:
+            fd: dict[str, dict[str, Any]] = {}
+            ante_map: dict[int, int] = {}
+            t = 100
+            for a in range(1, 8):
+                t = _build_blind_cycle(fd, ante_map, t_start=t, ante=a)
+            t = _build_blind_cycle(
+                fd, ante_map, t_start=t, ante=8, include_next_round_after_boss=False
+            )
+            return fd, ante_map, t
+
+        def _run_with_hud(fd: dict[str, dict[str, Any]], hud_overrides: dict[int, int | None]):
+            all_frames = {0: np.zeros((10, 10, 3), dtype=np.uint8)}
+            for k_str in fd:
+                fid = int(k_str)
+                all_frames[fid] = np.zeros((10, 10, 3), dtype=np.uint8)
+                all_frames[max(0, fid - 2)] = np.zeros((10, 10, 3), dtype=np.uint8)
+                all_frames[max(0, fid - 10)] = np.zeros((10, 10, 3), dtype=np.uint8)
+
+            def fake_shops(frames, **kwargs):
+                return [
+                    ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts)
+                    for _, f_idx, ts in frames
+                ]
+
+            def fake_hands(frames, **kwargs):
+                return [
+                    HandRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, cards=[])
+                    for _, f_idx, ts in frames
+                ]
+
+            def fake_hud(frames, fields_by_frame=None, **kwargs):
+                outs = []
+                for _, f_idx, ts in frames:
+                    flds = list((fields_by_frame or {}).get(f_idx, ()))
+                    vals: dict[str, Any] = {f: None for f in flds}
+                    if "hud_ante" in vals and f_idx in hud_overrides:
+                        vals["hud_ante"] = hud_overrides[f_idx]
+                    outs.append(
+                        HudRecognitionOutput(
+                            frame_index=f_idx, timestamp_seconds=ts, values=vals
+                        )
+                    )
+                return outs
+
+            with (
+                patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+                patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+                patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+            ):
+                return pp._build_run_trajectory_with_plan(
+                    {"key": key, "frames": fd},
+                    preloaded_frames=all_frames,
+                    fps=60.0,
+                    expressive=True,
+                )
+
+        # 1. Endless Cash Out immediately agrees (OCR=9, sim _effective_ante=9):
+        # drops Endless Cash Out, Buy Card, Next Round, and Ante 9 Play Hand.
+        fd_1, hud_1, t_end = _make_run_through_ante_8_boss()
+        endless_cashout_f = t_end
+        fd_1[str(endless_cashout_f)] = {"action": key["Cash Out"], "box": [400, 300, 600, 370]}
+        hud_1[endless_cashout_f - 2] = 9
+        fd_1[str(t_end + 100)] = {"action": key["Buy Card"], "box": [300, 300, 400, 400]}
+        hud_1[t_end + 98] = 9
+        fd_1[str(t_end + 200)] = {"action": key["Next Round"], "box": [100, 100, 200, 150]}
+        hud_1[t_end + 198] = 9
+        fd_1[str(t_end + 300)] = {"action": key["Select Blind"], "box": [100, 100, 180, 140]}
+        hud_1[t_end + 298] = 9
+        fd_1[str(t_end + 400)] = {"action": key["Play Hand"], "box": [780, 900, 880, 950]}
+        hud_1[t_end + 398] = 9
+
+        state_1, traj_1, plan_1 = _run_with_hud(fd_1, hud_1)
+        stop_1 = plan_1["diagnostics"]["stopped_at_ante_9"]
+        self.assertIsNotNone(stop_1)
+        self.assertEqual(stop_1["trigger_frame_id"], endless_cashout_f)
+        self.assertEqual(state_1.ante, 8)
+        self.assertEqual(pp._effective_ante(state_1), 8)
+        self.assertEqual(traj_1.deltas[-1].action.type, bm.ActionType.END_ROUND)
+        self.assertEqual(len(traj_1.deltas), stop_1["kept_steps"])
+        self.assertEqual(stop_1["skipped_actions"], 5)
+
+        # 2. Delayed OCR confirmation (None across Cash Out / Next Round, then 9 at Select Blind):
+        # halts on Select Blind and rolls back tentative post-Ante-8 steps cleanly to End Round.
+        fd_2, hud_2, t_end2 = _make_run_through_ante_8_boss()
+        fd_2[str(t_end2)] = {"action": key["Cash Out"], "box": [400, 300, 600, 370]}
+        hud_2[t_end2 - 2] = None
+        fd_2[str(t_end2 + 100)] = {"action": key["Next Round"], "box": [100, 100, 200, 150]}
+        hud_2[t_end2 + 98] = None
+        ante9_select_f = t_end2 + 200
+        fd_2[str(ante9_select_f)] = {"action": key["Select Blind"], "box": [100, 100, 180, 140]}
+        hud_2[ante9_select_f - 2] = 9
+        fd_2[str(t_end2 + 300)] = {"action": key["Play Hand"], "box": [780, 900, 880, 950]}
+        hud_2[t_end2 + 298] = 9
+
+        state_2, traj_2, plan_2 = _run_with_hud(fd_2, hud_2)
+        stop_2 = plan_2["diagnostics"]["stopped_at_ante_9"]
+        self.assertIsNotNone(stop_2)
+        self.assertEqual(stop_2["trigger_frame_id"], ante9_select_f)
+        self.assertEqual(stop_2["rolled_back_steps"], 2)
+        self.assertEqual(state_2.ante, 8)
+        self.assertEqual(pp._effective_ante(state_2), 8)
+        self.assertEqual(traj_2.deltas[-1].action.type, bm.ActionType.END_ROUND)
+        self.assertEqual(len(traj_2.deltas), len(traj_1.deltas))
+
+        # 3a. Disagreement: noisy OCR spike (hud_ante=9 in Ante 1 Blind) must NOT halt or poison state.ante.
+        fd_3a = {
+            "100": {"action": key["Select Blind"], "box": [100, 100, 180, 140]},
+            "200": {"action": key["Play Hand"], "box": [780, 900, 880, 950]},
+            "300": {"action": key["End Round"], "box": [100, 100, 180, 140]},
+        }
+        state_3a, traj_3a, plan_3a = _run_with_hud(fd_3a, {98: 1, 200: 9, 298: 1})
+        self.assertIsNone(plan_3a["diagnostics"]["stopped_at_ante_9"])
+        self.assertEqual(state_3a.ante, 1)
+        self.assertEqual(len(traj_3a.deltas), 4)
+
+        # 3b. Disagreement: sim reaching 9 while OCR reports 8 must NOT halt.
+        fd_3b, hud_3b, t_end3b = _make_run_through_ante_8_boss()
+        fd_3b[str(t_end3b)] = {"action": key["Cash Out"], "box": [400, 300, 600, 370]}
+        hud_3b[t_end3b - 2] = 8
+        fd_3b[str(t_end3b + 100)] = {"action": key["Next Round"], "box": [100, 100, 200, 150]}
+        hud_3b[t_end3b + 98] = 8
+        fd_3b[str(t_end3b + 200)] = {"action": key["Select Blind"], "box": [100, 100, 180, 140]}
+        hud_3b[t_end3b + 198] = 8
+        fd_3b[str(t_end3b + 300)] = {"action": key["Play Hand"], "box": [780, 900, 880, 950]}
+        hud_3b[t_end3b + 300] = 8
+        state_3b, traj_3b, plan_3b = _run_with_hud(fd_3b, hud_3b)
+        self.assertIsNone(plan_3b["diagnostics"]["stopped_at_ante_9"])
+        self.assertEqual(state_3b.ante, 8)
+        self.assertEqual(traj_3b.deltas[-1].action.type, bm.ActionType.PLAY_HAND)
+
 
 if __name__ == "__main__":
     unittest.main()

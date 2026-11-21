@@ -1,0 +1,45 @@
+{
+  "id": "zqINP6NEwkQ",
+  "webpage_url": "https://www.youtube.com/watch?v=zqINP6NEwkQ",
+  "original_url": "https://www.youtube.com/watch?v=zqINP6NEwkQ",
+  "title": "Think, Zaino, think (Gold Stake Lessons)",
+  "description": "https://ko-fi.com/drspectred\nhttps://www.twitch.tv/drspectred\nBlue Deck: \n\nPMLR4BVQ\n\nDaily Gold Stake gameplay with tips and other commentary. Learn to play Balatro at the highest level of difficulty. If you're able, try the seed yourself before watching what I do. \n\nPlaylists:\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcF55gYlGCQxU8ymTmgZwwOt\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcEx0WnRNCrRH6Ur7jPHYWeZ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcFnQ5pZnWw5rQHZWxS4dFU_\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHksPKzwm3N-6eK4ZG2zcdQ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHAsDctke2QWNmPiMqvMdKy\n\nBalatroU has a bunch of talented people, but Kitty is the one who did most of the emotes you see in the video thumbnails. She does pixel art, too, including many of the Jokers for the Extra Credit Mod.\nCommission her here: https://bsky.app/profile/dottykitty.bsky.social\nhttps://www.instagram.com/dottykittyy/\n\nYou can get the BalatroU \"art pack\" (and text changes) here: \nhttps://github.com/OceanRamen/BUMod/releases \nOriginally coded by Djynasty, now maintained by SleepyG11 (creator of the Handy Mod). \nMore than half of the artwork by Omega:\nhttps://www.instagram.com/omegaflowey18 \n\nFor more information about the mods I use, there's a chat command on Twitch. Alternatively, consider joining the \"supporters only\" Balatro University Discord either by any one-time Twitch subscription or minimum Ko-Fi contribution. After signing up, go to your Discord Settings and look for \"Connections.\"\n\n\n(Balatro Version 1.0.1o)",
+  "upload_date": "20260530",
+  "timestamp": 1780116313,
+  "duration": 2731,
+  "channel": "Balatro University",
+  "uploader": "Balatro University",
+  "channel_id": "UCpAwXXH3rPmSIlWYwIOwlEA",
+  "playlist_index": null,
+  "tags": [
+    "Balatro",
+    "Gameplay",
+    "Chill",
+    "Strategy",
+    "High Score"
+  ],
+  "categories": [
+    "Gaming"
+  ],
+  "chapters": null,
+  "extracted": {
+    "url": "https://www.youtube.com/watch?v=zqINP6NEwkQ",
+    "video_id": "zqINP6NEwkQ",
+    "title": "Think, Zaino, think (Gold Stake Lessons)",
+    "upload_date": "20260530",
+    "duration_seconds": 2731.0,
+    "channel": "Balatro University",
+    "balatro_version": "1.0.1o",
+    "deck": "Blue Deck",
+    "seed": "PMLR4BVQ",
+    "stake": "Gold Stake",
+    "deck_source": "description_header",
+    "seed_source": "description_header_labeled",
+    "stake_source": "title",
+    "ready": true,
+    "skip_reason": null,
+    "fetch_error": null,
+    "deck_cli": "blue",
+    "stake_cli": "gold"
+  }
+}

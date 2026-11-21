@@ -612,6 +612,72 @@ function G.DATASET_MOD:capture_frame_hud()
     end)
 end
 
+-- ==========================================
+-- SEED OCR CAPTURE & EXPORT
+-- ==========================================
+function G.DATASET_MOD:capture_frame_seed()
+    if not G or not G.GAME then
+        self.state = 'idle'
+        self.capture_flash = 1.5
+        self.capture_flash_text = "START A RUN FIRST!"
+        return
+    end
+
+    self.frame_counts = self.frame_counts or {card = 0, shop = 0, end_round = 0, hud_ocr = 0, seed_ocr = 0}
+    local current_frame = self.frame_counts.seed_ocr or 0
+    local phase = self.seed_phase or 'win'
+    local roi_key = (phase == 'game_over') and 'seed_game_over' or 'seed_win'
+    local base_roi = (self.config and self.config.rois and self.config.rois[roi_key])
+        or (self.config and self.config.rois and self.config.rois.seed_win)
+    if not base_roi then
+        self.state = 'idle'
+        return
+    end
+
+    local jitter_px = (self.config and self.config.seed_capture_jitter_px) or 5
+    local jx = (jitter_px > 0) and math.random(-jitter_px, jitter_px) or 0
+    local jy = (jitter_px > 0) and math.random(-jitter_px, jitter_px) or 0
+    local crop_roi = {x = base_roi.x + jx, y = base_roi.y + jy, w = base_roi.w, h = base_roi.h}
+
+    local seed_label = ""
+    local is_seeded = not not G.GAME.seeded
+    if not self.seed_corrupted then
+        seed_label = tostring((G.GAME.pseudorandom and G.GAME.pseudorandom.seed) or "")
+    end
+
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_seed_ocr/images")
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_seed_ocr/labels")
+
+    love.graphics.captureScreenshot(function(img)
+        local rw, rh = math.max(1, math.floor(crop_roi.w)), math.max(1, math.floor(crop_roi.h))
+        local rx, ry = math.floor(crop_roi.x), math.floor(crop_roi.y)
+        local cropped = paste_clamped_region(img, rx, ry, rw, rh)
+        local filedata = cropped:encode("png")
+        local img_path = string.format("Mods/gamestate_dataset_cv/dataset_seed_ocr/images/frame_%05d_seed.png", current_frame)
+        love.filesystem.write(img_path, filedata)
+        if filedata and filedata.release then filedata:release() end
+        if cropped and cropped.release then cropped:release() end
+        if img and img.release then img:release() end
+
+        local json_content = string.format(
+            '{\n  "frame_index": %d,\n  "phase": "%s",\n  "seeded": %s,\n  "seed": "%s"\n}\n',
+            current_frame,
+            json_escape(phase),
+            is_seeded and "true" or "false",
+            json_escape(seed_label)
+        )
+        local json_path = string.format("Mods/gamestate_dataset_cv/dataset_seed_ocr/labels/frame_%05d.json", current_frame)
+        love.filesystem.write(json_path, json_content)
+
+        self.frame_counts.seed_ocr = current_frame + 1
+        self.frame_count = self.frame_counts.seed_ocr
+        self.state = 'idle'
+        self.capture_flash = 0.5
+        self.capture_flash_text = string.format("SEED FRAME %05d SAVED (%s | %s)!", current_frame, string.upper(phase), seed_label ~= "" and seed_label or "<EMPTY>")
+        collectgarbage("step", 200)
+    end)
+end
+
 -- Top-level capture dispatcher
 function G.DATASET_MOD:capture_frame()
     if self.config.mode == 'card_classifier' then
@@ -620,6 +686,8 @@ function G.DATASET_MOD:capture_frame()
         self:capture_frame_shop()
     elseif self.config.mode == 'hud_ocr' then
         self:capture_frame_hud()
+    elseif self.config.mode == 'seed_ocr' then
+        self:capture_frame_seed()
     end
 end
 

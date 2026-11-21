@@ -1,0 +1,45 @@
+{
+  "id": "sVuPmDmTyL4",
+  "webpage_url": "https://www.youtube.com/watch?v=sVuPmDmTyL4",
+  "original_url": "https://www.youtube.com/watch?v=sVuPmDmTyL4",
+  "title": "This guy isn't just for show (Lossless C++, Zodiac Deck)",
+  "description": "https://ko-fi.com/drspectred\nhttps://www.twitch.tv/drspectred\nZodiac Deck: \n\nFNSD85BC\n\nIn Balatro, when you complete a Gold Stake run (the highest level of difficulty), your Jokers earn Gold Stickers. In this video series, we earned all 150 Gold Stickers without losing a single run, playing only the Zodiac Deck. I put the seeds in the video descriptions so you can try the runs yourself. In the interest of learning, I encourage you to play the seed(s) first before watching what I might do differently.\n\nMod list/info: https://bit.ly/4qXxtdN\n\nPlaylists:\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHelx6N4B_lEH7iHoC4XX9l\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcF55gYlGCQxU8ymTmgZwwOt\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcEx0WnRNCrRH6Ur7jPHYWeZ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcFnQ5pZnWw5rQHZWxS4dFU_\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHksPKzwm3N-6eK4ZG2zcdQ\nhttps://www.youtube.com/playlist?list=PLdNGt-ihEAcHAsDctke2QWNmPiMqvMdKy\n\nBalatroU has a bunch of talented people, but Kitty is the one who did most of the emotes you see in the video thumbnails. She does pixel art, too, including many of the Jokers for the Extra Credit Mod.\nCommission her here: https://bsky.app/profile/dottykitty.bsky.social\nhttps://www.instagram.com/dottykittyy/\n\nYou can get the BalatroU \"art pack\" (and text changes) here: \nhttps://github.com/OceanRamen/BUMod/releases \nOriginally coded by Djynasty, now maintained by SleepyG11 (creator of the Handy Mod). \nMore than half of the artwork by Omega:\nhttps://www.instagram.com/omegaflowey18 \n\nFor more information, consider joining the \"supporters only\" Balatro University Discord either by any one-time Twitch subscription or minimum Ko-Fi contribution. After signing up, go to your Discord Settings and look for \"Connections.\"\n\n\n(Balatro Version 1.0.1o)",
+  "upload_date": "20260517",
+  "timestamp": 1778990306,
+  "duration": 3012,
+  "channel": "Balatro University",
+  "uploader": "Balatro University",
+  "channel_id": "UCpAwXXH3rPmSIlWYwIOwlEA",
+  "playlist_index": null,
+  "tags": [
+    "Balatro",
+    "Gameplay",
+    "Chill",
+    "Strategy",
+    "High Score"
+  ],
+  "categories": [
+    "Gaming"
+  ],
+  "chapters": null,
+  "extracted": {
+    "url": "https://www.youtube.com/watch?v=sVuPmDmTyL4",
+    "video_id": "sVuPmDmTyL4",
+    "title": "This guy isn't just for show (Lossless C++, Zodiac Deck)",
+    "upload_date": "20260517",
+    "duration_seconds": 3012.0,
+    "channel": "Balatro University",
+    "balatro_version": "1.0.1o",
+    "deck": "Zodiac Deck",
+    "seed": "FNSD85BC",
+    "stake": "Gold Stake",
+    "deck_source": "description_header",
+    "seed_source": "description_header_labeled",
+    "stake_source": "title_c_plus_plus",
+    "ready": true,
+    "skip_reason": null,
+    "fetch_error": null,
+    "deck_cli": "zodiac",
+    "stake_cli": "gold"
+  }
+}

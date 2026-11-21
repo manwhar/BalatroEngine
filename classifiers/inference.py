@@ -188,6 +188,7 @@ _CARD_PIPELINE: CardRecognitionPipeline | None = None
 _SHOP_PIPELINE: ShopRecognitionPipeline | None = None
 _END_ROUND_PIPELINE: EndRoundRecognitionPipeline | None = None
 _HUD_OCR_PIPELINE: HudOcrPipeline | None = None
+_SEED_OCR_PIPELINE: Any = None
 
 
 def get_card_pipeline(device: str | None = None) -> CardRecognitionPipeline:
@@ -262,6 +263,24 @@ def get_hud_ocr_pipeline(device: str | None = None) -> HudOcrPipeline:
             device=device,
         )
     return _HUD_OCR_PIPELINE
+
+
+def get_seed_ocr_pipeline(device: str | None = None):
+    """Returns singleton SeedOcrPipeline loaded from classifiers/prod_weights/seed_ocr.pt."""
+    global _SEED_OCR_PIPELINE
+    if _SEED_OCR_PIPELINE is None:
+        from classifiers.seed_ocr.pipeline import SeedOcrPipeline
+
+        ckpt_path = PROD_WEIGHTS_DIR / "seed_ocr.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Missing production Seed OCR weights at {ckpt_path}"
+            )
+        _SEED_OCR_PIPELINE = SeedOcrPipeline(
+            weights_path=ckpt_path,
+            device=device,
+        )
+    return _SEED_OCR_PIPELINE
 
 
 def _extract_frame_image_and_meta(video_frame: Any) -> tuple[np.ndarray, int, float]:
