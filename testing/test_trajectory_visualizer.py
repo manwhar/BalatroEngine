@@ -742,6 +742,10 @@ class TestVisualizerComparisonAndVideo(unittest.TestCase):
 
                     self.assertIn(b"/api/frame/${targetFrame}?v=", html)
                     self.assertIn(b'imgEl.removeAttribute("src")', html)
+                    self.assertIn(b'id="diagTrack"', html)
+                    self.assertIn(b'diag-seg-err', html)
+                    self.assertIn(b'diag-seg-warn', html)
+                    self.assertIn(b'warning_reasons', html)
                     self.assertEqual(_QuietThreadingHTTPServer.allow_reuse_address, os.name != "nt")
                 finally:
                     conn.close()

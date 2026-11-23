@@ -97,7 +97,8 @@ def run_train_classifier(
     backbone="mobilenet_v3_small",
     run_name="card_classifier",
     exist_ok=False,
-    num_workers=4
+    num_workers=4,
+    max_deck_crops_per_frame: int | None = 16,
 ):
     print("\n" + "=" * 60)
     print("Stage 2: Multi-Head Card Attribute Classifier Training")
@@ -131,8 +132,23 @@ def run_train_classifier(
     print("=" * 60 + "\n")
 
     # Load datasets
-    train_dataset = CardCropDataset(DATASET_DIR, split="train", val_ratio=0.20)
-    val_dataset = CardCropDataset(DATASET_DIR, split="val", val_ratio=0.20)
+    train_dataset = CardCropDataset(
+        DATASET_DIR,
+        split="train",
+        val_ratio=0.20,
+        max_deck_crops_per_frame=max_deck_crops_per_frame,
+    )
+    val_dataset = CardCropDataset(
+        DATASET_DIR,
+        split="val",
+        val_ratio=0.20,
+        max_deck_crops_per_frame=max_deck_crops_per_frame,
+    )
+    val_sources = getattr(val_dataset, "sample_sources", ["hand"] * len(val_dataset))
+    val_is_hand = torch.tensor([s == "hand" for s in val_sources], dtype=torch.bool)
+    val_is_deck = torch.tensor([s == "deck" for s in val_sources], dtype=torch.bool)
+    has_val_deck = bool(val_is_deck.any().item())
+    has_val_hand = bool(val_is_hand.any().item())
 
     def _make_loader(ds, shuffle):
         if getattr(ds, "uses_ram_cache", False):
@@ -228,6 +244,11 @@ def run_train_classifier(
         val_loss = 0.0
         correct_counts = {"rank": 0, "suit": 0, "edition": 0, "enhancement": 0, "seal": 0, "debuffed": 0, "face_down": 0}
         exact_matches = 0
+        hand_exact = 0
+        hand_total = 0
+        deck_exact = 0
+        deck_total = 0
+        val_offset = 0
         total_val = len(val_dataset)
 
         # Confusion matrix accumulators
@@ -241,6 +262,7 @@ def run_train_classifier(
 
         with torch.no_grad():
             for images, targets in _iter_batches(val_dataset, val_loader, shuffle=False):
+                bsz = len(images)
                 images = images.to(device, non_blocking=True)
                 if val_dataset.raw_tensor_mode:
                     images = apply_gpu_batch_augmentations(images, is_train=False)
@@ -260,7 +282,7 @@ def run_train_classifier(
                     l_fd = criterion_bce(logits["face_down"], targets["face_down"])
 
                     loss = l_rank + l_suit + l_edition + l_enh + l_seal + 0.5 * l_deb + 0.5 * l_fd
-                val_loss += loss.item() * len(images)
+                val_loss += loss.item() * bsz
 
                 p_rank = logits["rank"].argmax(dim=-1)
                 p_suit = logits["suit"].argmax(dim=-1)
@@ -291,6 +313,16 @@ def run_train_classifier(
                 exact = m_rank & m_suit & m_ed & m_enh & m_seal & m_deb & m_fd
                 exact_matches += exact.sum().item()
 
+                if has_val_deck or has_val_hand:
+                    exact_cpu = exact.cpu()
+                    hand_mask = val_is_hand[val_offset:val_offset + bsz]
+                    deck_mask = val_is_deck[val_offset:val_offset + bsz]
+                    hand_total += int(hand_mask.sum().item())
+                    hand_exact += int((exact_cpu & hand_mask).sum().item())
+                    deck_total += int(deck_mask.sum().item())
+                    deck_exact += int((exact_cpu & deck_mask).sum().item())
+                val_offset += bsz
+
                 # Vectorized confusion matrix accumulation
                 for name, t_tensor, p_tensor, n_cls in (
                     ("rank", targets["rank"], p_rank, len(RANKS)),
@@ -319,12 +351,19 @@ def run_train_classifier(
             "debuffed_acc": accs["debuffed"],
             "face_down_acc": accs["face_down"]
         }
+        source_log = ""
+        if deck_total > 0:
+            hand_acc = (hand_exact / hand_total) if hand_total > 0 else 0.0
+            deck_acc = deck_exact / deck_total
+            epoch_stats["hand_exact_match_acc"] = hand_acc
+            epoch_stats["deck_exact_match_acc"] = deck_acc
+            source_log = f" | Hand: {hand_acc * 100:.1f}% | Deck: {deck_acc * 100:.1f}%"
         history.append(epoch_stats)
 
         print(
             f"Epoch {epoch:2d}/{epochs} | "
             f"Train Loss: {train_loss:.3f} | Val Loss: {val_loss:.3f} | "
-            f"Exact Match: {exact_match_acc * 100:.1f}% | "
+            f"Exact Match: {exact_match_acc * 100:.1f}%{source_log} | "
             f"Rank: {accs['rank'] * 100:.1f}% | Suit: {accs['suit'] * 100:.1f}% | "
             f"Ed: {accs['edition'] * 100:.1f}% | Enh: {accs['enhancement'] * 100:.1f}% | "
             f"Seal: {accs['seal'] * 100:.1f}% | Deb: {accs['debuffed'] * 100:.1f}% | FD: {accs['face_down'] * 100:.1f}%"
@@ -392,6 +431,7 @@ if __name__ == "__main__":
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Backbone model")
     parser.add_argument("--name", type=str, default="card_classifier", help="Run directory name")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing run")
+    parser.add_argument("--max-deck-crops-per-frame", type=int, default=16, help="Max crops sampled per View Deck frame (0 = all)")
     args = parser.parse_args()
 
     run_train_classifier(
@@ -400,5 +440,6 @@ if __name__ == "__main__":
         lr=args.lr,
         backbone=args.backbone,
         run_name=args.name,
-        exist_ok=args.exist_ok
+        exist_ok=args.exist_ok,
+        max_deck_crops_per_frame=(None if args.max_deck_crops_per_frame <= 0 else args.max_deck_crops_per_frame),
     )

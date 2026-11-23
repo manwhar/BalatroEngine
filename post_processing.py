@@ -26,7 +26,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
@@ -873,6 +873,7 @@ def _init_diagnostics() -> dict[str, Any]:
         "ocr_override_samples": [],
         "unexplained_joker_changes": [],
         "unexplained_consumable_changes": [],
+        "unexpected_shop_transitions": [],
         "unmatched_button_targets": [],
         "location_mismatches": [],
         "cashout_without_round_won": [],
@@ -1006,6 +1007,18 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
         )
         for fid, act, loc in unmatched[:8]:
             print(f"  - frame {fid} ({act} @ {loc})")
+
+    unexp_shop = diag.get("unexpected_shop_transitions", [])
+    if unexp_shop:
+        print(
+            f"[WARN] Unexpected shop transitions: {len(unexp_shop)} time(s)"
+        )
+        for item in unexp_shop[:12]:
+            reasons_str = "; ".join(item["reasons"])
+            print(
+                f"  - frame {item['prev_frame']} ({item['prev_action']}) -> "
+                f"frame {item['frame']} ({item['action']}): {reasons_str}"
+            )
 
     loc_mismatches = diag.get("location_mismatches", [])
     if loc_mismatches:
@@ -1197,6 +1210,7 @@ def _sync_hud_into_state(
     *,
     has_end_round_after: bool = False,
     next_hud_money: int | None = None,
+    stale_money_drop_guard: bool = False,
     diag: dict[str, Any] | None = None,
 ) -> int | float | None:
     """Applies validated HUD OCR readings into `state`, falling back cleanly on `None`.
@@ -1252,6 +1266,13 @@ def _sync_hud_into_state(
             and abs(next_hud_money - state.money) <= 10
         ):
             # Guard against single-frame rolling-digit OCR truncations (e.g. $58 -> $5 -> $55).
+            new_money = state.money
+        elif (
+            stale_money_drop_guard
+            and new_money < state.money
+            and (next_hud_money is None or next_hud_money >= state.money)
+        ):
+            # Ignore stale pre-animation money OCR right after Temperance/Hermit.
             new_money = state.money
         else:
             _record_ocr_override(
@@ -1342,6 +1363,7 @@ def _sync_hud_into_state(
         and not state.round_won
         and not getattr(state, "pending_blind_advance", False)
         and 1 <= int(ante_val) <= 8
+        and int(ante_val) >= state.ante - 1
     ):
         new_ante = int(ante_val)
         _record_ocr_override(
@@ -1361,6 +1383,7 @@ def _sync_hud_into_state(
         and sa.action_type != ActionType.END_ROUND
         and not getattr(state, "round_advanced", False)
         and int(round_val) >= 1
+        and int(round_val) >= state.round
     ):
         new_round = int(round_val)
         _record_ocr_override(
@@ -1454,6 +1477,106 @@ def _counter_diff_names(
     return lost, gained
 
 
+def _is_high_conf_bar_det(raw_item: Any) -> bool:
+    """Returns True when a top-bar raw CV item meets minimum detection and class confidence."""
+    confs = getattr(raw_item, "confidences", None) or {}
+    return float(confs.get("detection", 1.0)) >= 0.60 and float(confs.get("key", 1.0)) >= 0.85
+
+
+def _pack_item_sig(item: Any) -> tuple[Any, ...] | None:
+    """Canonical signature for booster pack items, ignoring corrupt rank/suit NONE crops."""
+    if isinstance(item, PlayingCard):
+        if item.enhancement != Enhancement.STONE and (
+            item.rank == Rank.NONE or item.suit == Suit.NONE
+        ):
+            return None
+        return (
+            "card",
+            item.rank,
+            item.suit,
+            item.enhancement,
+            item.edition,
+            item.seal,
+        )
+    return (
+        type(item).__name__,
+        getattr(item, "name", None),
+        getattr(item, "edition", None),
+    )
+
+
+def _filter_bar_observations(
+    raw_items: Sequence[Any],
+    target_types: type | tuple[type, ...],
+    sig_fn: Callable[[Any], Any],
+    prev_items: Sequence[Any],
+    next_obs_counts: Counter[Any] | None = None,
+) -> tuple[list[Any], list[Any]]:
+    """Keeps high-confidence new bar items while anchoring slots matching prior inventory."""
+    raw_obs: list[tuple[Any, Any]] = []
+    for raw_item in raw_items:
+        conv = _convert_items_of_type([raw_item], target_types)
+        if conv:
+            raw_obs.append((raw_item, conv[0]))
+
+    prev_counts = Counter(sig_fn(item) for item in prev_items)
+    kept_indices: set[int] = set()
+    for sig, prev_n in prev_counts.items():
+        ranked_idxs = sorted(
+            (i for i, (_, item) in enumerate(raw_obs) if sig_fn(item) == sig),
+            key=lambda i: (
+                float(
+                    (getattr(raw_obs[i][0], "confidences", None) or {}).get(
+                        "detection", 1.0
+                    )
+                ),
+                float(
+                    (getattr(raw_obs[i][0], "confidences", None) or {}).get("key", 1.0)
+                ),
+            ),
+            reverse=True,
+        )
+        kept_indices.update(ranked_idxs[:prev_n])
+
+    kept_raw: list[Any] = []
+    kept_items: list[Any] = []
+    for i, (raw_item, conv_item) in enumerate(raw_obs):
+        if i not in kept_indices:
+            sig = sig_fn(conv_item)
+            next_has_new = (
+                next_obs_counts is not None and next_obs_counts[sig] > prev_counts[sig]
+            )
+            if not (_is_high_conf_bar_det(raw_item) or next_has_new):
+                continue
+        kept_raw.append(raw_item)
+        kept_items.append(conv_item)
+    return kept_raw, kept_items
+
+
+def _preserve_flickering_jokers(
+    obs_jokers: Sequence[Joker],
+    prev_jokers: Sequence[Joker],
+    next_obs_joker_counts: Counter[Any],
+) -> list[Joker]:
+    """Restores transient missing Jokers (e.g. END_ROUND modal fade) in original slot order."""
+    effective = list(obs_jokers)
+    obs_counts = Counter(j.name for j in effective)
+    prev_counts = Counter(j.name for j in prev_jokers)
+    missing: Counter[Any] = Counter()
+    for name, prev_n in prev_counts.items():
+        expected_keep = min(prev_n, next_obs_joker_counts[name])
+        if obs_counts[name] < expected_keep:
+            missing[name] = expected_keep - obs_counts[name]
+    if missing:
+        for orig_idx, prev_j in enumerate(prev_jokers):
+            if missing[prev_j.name] > 0:
+                effective.insert(
+                    min(orig_idx, len(effective)), copy.deepcopy(prev_j)
+                )
+                missing[prev_j.name] -= 1
+    return effective
+
+
 def _sync_bars_into_state(
     state: GameState,
     shop_out: Any,
@@ -1461,6 +1584,8 @@ def _sync_bars_into_state(
     diag: dict[str, Any] | None = None,
     *,
     next_obs_cons_counts: Counter[tuple[Any, Any]] | None = None,
+    next_obs_joker_counts: Counter[Any] | None = None,
+    preserve_joker_flickers: bool = False,
     suppress_consumable_loss_diag: bool = False,
     sync_jokers: bool = True,
     sync_consumables: bool = True,
@@ -1468,9 +1593,20 @@ def _sync_bars_into_state(
     """Syncs Joker and Consumable bars from CV into `state` & records non-identity `joker_order`."""
     raw_jokers = list(getattr(shop_out, "joker_bar", None) or [])
     if sync_jokers:
-        obs_jokers = _convert_items_of_type(raw_jokers, Joker)
         prev_jokers = list(state.inventory.jokers) if state.inventory else []
         prev_joker_ids = [j.id for j in prev_jokers]
+        raw_jokers, obs_jokers = _filter_bar_observations(
+            raw_jokers,
+            Joker,
+            lambda j: j.name,
+            prev_jokers,
+            next_obs_joker_counts,
+        )
+        effective_obs_jokers = (
+            _preserve_flickering_jokers(obs_jokers, prev_jokers, next_obs_joker_counts)
+            if preserve_joker_flickers and next_obs_joker_counts is not None and prev_jokers
+            else obs_jokers
+        )
 
         if state.inventory and state.inventory.jokers:
             if (
@@ -1482,14 +1618,16 @@ def _sync_bars_into_state(
                 # Stage 2 forces red card backs into bogus classes so preserve tracked jokers.
                 pass
             else:
-                matched_ids = state.match_cv_joker_order(obs_jokers)
+                matched_ids = state.match_cv_joker_order(effective_obs_jokers)
                 if matched_ids:
                     if matched_ids != prev_joker_ids:
                         action.joker_order = matched_ids
                 else:
-                    state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
-        elif obs_jokers:
-            state.reconcile_cv_jokers(obs_jokers, trigger_added_hooks=False)
+                    state.reconcile_cv_jokers(
+                        effective_obs_jokers, trigger_added_hooks=False
+                    )
+        elif effective_obs_jokers:
+            state.reconcile_cv_jokers(effective_obs_jokers, trigger_added_hooks=False)
 
         if diag is not None and state.inventory is not None:
             lost_jokers, gained_jokers = _counter_diff_names(
@@ -1505,57 +1643,15 @@ def _sync_bars_into_state(
     )
     if sync_consumables:
         prev_cons = list(state.inventory.consumables) if state.inventory else []
-        raw_obs_cons: list[tuple[Any, Any]] = []
-        for rc in raw_cons:
-            conv = _convert_items_of_type([rc], (Tarot, Planet, Spectral))
-            if conv:
-                raw_obs_cons.append((rc, conv[0]))
-
-        prev_counts_for_filter = (
-            Counter(_consumable_sig(c) for c in state.inventory.consumables)
-            if state.inventory
-            else Counter()
-        )
         # Prioritize higher-confidence detections when matching existing inventory slots
         # so low-confidence edge slivers cannot displace real held cards into "new" slots.
-        kept_indices: set[int] = set()
-        for sig, prev_n in prev_counts_for_filter.items():
-            ranked_idxs = sorted(
-                (
-                    i
-                    for i, (_, cc) in enumerate(raw_obs_cons)
-                    if _consumable_sig(cc) == sig
-                ),
-                key=lambda i: (
-                    float(
-                        (getattr(raw_obs_cons[i][0], "confidences", None) or {}).get(
-                            "detection", 1.0
-                        )
-                    ),
-                    float(
-                        (getattr(raw_obs_cons[i][0], "confidences", None) or {}).get(
-                            "key", 1.0
-                        )
-                    ),
-                ),
-                reverse=True,
-            )
-            kept_indices.update(ranked_idxs[:prev_n])
-
-        obs_cons: list[Any] = []
-        for i, (rc, conv_c) in enumerate(raw_obs_cons):
-            if i not in kept_indices:
-                sig = _consumable_sig(conv_c)
-                confs = getattr(rc, "confidences", None) or {}
-                det_c = float(confs.get("detection", 1.0))
-                key_c = float(confs.get("key", 1.0))
-                next_has_new = (
-                    next_obs_cons_counts is not None
-                    and next_obs_cons_counts[sig] > prev_counts_for_filter[sig]
-                )
-                if not ((det_c >= 0.60 and key_c >= 0.85) or next_has_new):
-                    continue
-            obs_cons.append(conv_c)
+        raw_cons, obs_cons = _filter_bar_observations(
+            raw_cons,
+            (Tarot, Planet, Spectral),
+            _consumable_sig,
+            prev_cons,
+            next_obs_cons_counts,
+        )
         if state.inventory and (obs_cons or state.inventory.consumables):
             effective_obs_cons = list(obs_cons)
             if next_obs_cons_counts is not None:
@@ -1975,6 +2071,77 @@ def _serialize_shop_shelves(state: GameState) -> dict[str, list[dict[str, Any]]]
     }
 
 
+def _detect_unexpected_shop_transition(
+    prev_obs: dict[str, Any] | None,
+    cur_cards: Sequence[str],
+    cur_vouchers: Sequence[str],
+    cur_packs: Sequence[str],
+    *,
+    actions_between: Sequence[ActionType],
+    shop_visit_opens: int,
+    cashout_frame: int | None = None,
+) -> list[str]:
+    """Detects unexpected shop shelf changes between consecutive shop observations."""
+    if not (cur_cards or cur_vouchers or cur_packs):
+        return []
+    if prev_obs is None:
+        if shop_visit_opens == 0 and len(cur_packs) < 2:
+            return [
+                f"first_shop_obs_missing_packs (seen={list(cur_packs)}, expected=2)"
+            ]
+        return []
+
+    n_reroll = sum(1 for a in actions_between if a == ActionType.REROLL_SHOP)
+    n_buy = sum(
+        1 for a in actions_between if a in (ActionType.BUY_CARD, ActionType.BUY_AND_USE)
+    )
+    n_open = sum(1 for a in actions_between if a == ActionType.OPEN_PACK)
+    n_redeem = sum(1 for a in actions_between if a == ActionType.REDEEM_VOUCHER)
+
+    def _multiset_diff(
+        before: Sequence[str], after: Sequence[str]
+    ) -> tuple[list[str], list[str]]:
+        a_cnt = Counter(after)
+        lost = []
+        for x in before:
+            if a_cnt[x] > 0:
+                a_cnt[x] -= 1
+            else:
+                lost.append(x)
+        b_cnt = Counter(before)
+        gain = []
+        for x in after:
+            if b_cnt[x] > 0:
+                b_cnt[x] -= 1
+            else:
+                gain.append(x)
+        return lost, gain
+
+    c_lost, c_gain = _multiset_diff(prev_obs["cards"], cur_cards)
+    v_lost, v_gain = _multiset_diff(prev_obs["vouchers"], cur_vouchers)
+    p_lost, p_gain = _multiset_diff(prev_obs["packs"], cur_packs)
+
+    reasons: list[str] = []
+    if n_reroll == 0:
+        if len(prev_obs["cards"]) - len(cur_cards) > n_buy:
+            reasons.append(f"cards_lost={c_lost} (buys={n_buy})")
+        if c_gain and n_redeem == 0 and (
+            len(cur_cards) > len(prev_obs["cards"])
+            or len(c_lost) > n_buy
+            or (len(prev_obs["cards"]) >= 2 and len(c_gain) >= 2)
+        ):
+            reasons.append(f"cards_gained={c_gain} (rerolls=0)")
+    if len(v_lost) > n_redeem:
+        reasons.append(f"vouchers_lost={v_lost} (redeems={n_redeem})")
+    if v_gain:
+        reasons.append(f"vouchers_gained={v_gain}")
+    if len(p_lost) > n_open:
+        reasons.append(f"packs_lost={p_lost} (opens={n_open})")
+    if p_gain:
+        reasons.append(f"packs_gained={p_gain}")
+    return reasons
+
+
 _EDITION_CLS_LABELS: dict[Edition, str] = {
     Edition.NONE: "None",
     Edition.FOIL: "Foil",
@@ -2104,8 +2271,9 @@ def _scan_and_quarantine_corrupted_segments(
 
     def _reconcile_flickers(
         by_step: dict[int, list[tuple[list[str], list[str]]]],
-    ) -> set[int]:
+    ) -> tuple[set[int], set[int]]:
         unresolved: set[int] = set()
+        unresolved_losses: set[int] = set()
         reconciled_idxs: set[tuple[int, int]] = set()
         for s in range(1, n_steps):
             entries = by_step.get(s, [])
@@ -2128,12 +2296,17 @@ def _scan_and_quarantine_corrupted_segments(
                             break
                     if not matched:
                         unresolved.add(s)
+                        unresolved_losses.add(s)
                 else:
                     unresolved.add(s)
-        return unresolved
+                    if lost_a:
+                        unresolved_losses.add(s)
+        return unresolved, unresolved_losses
 
-    unresolved_joker_steps = _reconcile_flickers(unexp_joker_by_step)
-    unresolved_cons_steps = _reconcile_flickers(unexp_cons_by_step)
+    unresolved_joker_steps, unresolved_joker_loss_steps = _reconcile_flickers(
+        unexp_joker_by_step
+    )
+    unresolved_cons_steps, _ = _reconcile_flickers(unexp_cons_by_step)
 
     # 2. Build active anomaly categories per step
     cats_by_step: list[set[str]] = [set() for _ in range(n_steps)]
@@ -2239,9 +2412,33 @@ def _scan_and_quarantine_corrupted_segments(
         if len(grp_cats) >= 2 and first_anomalous is not None:
             _update_t_perm(first_anomalous)
 
-    # Rule C4: Unresolved Joker drift or >= 2 consecutive location mismatches
-    if unresolved_joker_steps:
-        _update_t_perm(min(unresolved_joker_steps))
+    # Rule C4: Unresolved Joker loss or Joker drift co-occurring with downstream failure,
+    # or >= 2 consecutive location mismatches
+    step_to_round_group: dict[int, list[int]] = {}
+    for grp in round_groups:
+        for k in grp:
+            step_to_round_group[k] = grp
+    _DOWNSTREAM_FAILURE_CATS = frozenset(
+        {
+            "location_mismatch",
+            "empty_hand_cv",
+            "missing_shop_cv",
+            "unmatched_button_target",
+            "unexpected_deck_addition",
+            "hand_size_over_15",
+            "cashout_without_round_won",
+        }
+    )
+    for s in sorted(unresolved_joker_steps):
+        has_downstream_failure = any(
+            cats_by_step[k] & _DOWNSTREAM_FAILURE_CATS
+            for k in range(s, min(n_steps, s + 5))
+        ) or any(
+            cats_by_step[k] & _DOWNSTREAM_FAILURE_CATS
+            for k in step_to_round_group.get(s, ())
+        )
+        if s in unresolved_joker_loss_steps or has_downstream_failure:
+            _update_t_perm(s)
     for s in range(1, n_steps - 1):
         if (
             "location_mismatch" in cats_by_step[s]
@@ -2261,6 +2458,8 @@ def _scan_and_quarantine_corrupted_segments(
     # Scope A
     for s in sorted(transient_glitch_steps):
         _flag_step(s, "transient_inventory_glitch")
+    for s in sorted(unresolved_joker_steps):
+        _flag_step(s, "unexplained_joker_drift")
     for s in range(1, n_steps):
         if "large_ocr_override" in cats_by_step[s]:
             _flag_step(s, "large_ocr_override")
@@ -3016,17 +3215,55 @@ def _build_run_trajectory_with_plan(
         A.SELL_CARD,
     }
     obs_cons_counts_by_sa_idx: dict[int, Counter[tuple[Any, Any]]] = {}
+    obs_joker_counts_by_sa_idx: dict[int, Counter[Any]] = {}
+    obs_pack_counts_by_sa_idx: dict[int, Counter[tuple[Any, ...]]] = {}
+    obs_booster_counts_by_sa_idx: dict[int, Counter[tuple[Any, Any]]] = {}
+    obs_voucher_counts_by_sa_idx: dict[int, Counter[Any]] = {}
     for i, s_act in enumerate(scheduled_actions):
         s_out = shop_res_by_frame.get(s_act.target_frame)
         if s_out is not None:
-            raw_c = list(getattr(s_out, "consumeables", None) or [])
+            raw_c = [
+                rc
+                for rc in (getattr(s_out, "consumeables", None) or [])
+                if _is_high_conf_bar_det(rc)
+            ]
             obs_c = _convert_items_of_type(raw_c, (Tarot, Planet, Spectral))
             obs_cons_counts_by_sa_idx[i] = Counter(_consumable_sig(c) for c in obs_c)
+            raw_j = [
+                rj
+                for rj in (getattr(s_out, "joker_bar", None) or [])
+                if _is_high_conf_bar_det(rj)
+            ]
+            obs_j = _convert_items_of_type(raw_j, Joker)
+            obs_joker_counts_by_sa_idx[i] = Counter(j.name for j in obs_j)
+            raw_p = list(getattr(s_out, "pack_items", None) or [])
+            obs_p = _convert_items_of_type(
+                raw_p, (Joker, Tarot, Planet, Spectral, PlayingCard)
+            )
+            obs_pack_counts_by_sa_idx[i] = Counter(
+                sig for sig in (_pack_item_sig(p) for p in obs_p) if sig is not None
+            )
+            raw_b = list(getattr(s_out, "boosters", None) or [])
+            obs_b = _convert_items_of_type(raw_b, BoosterPack)
+            obs_booster_counts_by_sa_idx[i] = Counter(
+                (b.booster_type, b.size) for b in obs_b
+            )
+            raw_v = list(getattr(s_out, "vouchers", None) or [])
+            obs_v = _convert_items_of_type(raw_v, Voucher)
+            obs_voucher_counts_by_sa_idx[i] = Counter(v.name for v in obs_v)
 
-    def _next_obs_cons_counts(cur_idx: int) -> Counter[tuple[Any, Any]] | None:
+    def _next_obs_counts(
+        cur_idx: int, by_idx: dict[int, Counter[Any]]
+    ) -> Counter[Any] | None:
         for j in range(cur_idx + 1, len(scheduled_actions)):
-            if j in obs_cons_counts_by_sa_idx:
-                return obs_cons_counts_by_sa_idx[j]
+            if j in by_idx:
+                return by_idx[j]
+        return None
+
+    def _next_non_sort_idx(cur_idx: int) -> int | None:
+        for j in range(cur_idx + 1, len(scheduled_actions)):
+            if scheduled_actions[j].action_type not in (A.SORT_RANK, A.SORT_SUIT):
+                return j
         return None
 
     def _next_hud_money(cur_idx: int) -> int | None:
@@ -3038,11 +3275,17 @@ def _build_run_trajectory_with_plan(
         return None
 
     last_consumable_mutated_frame: int = -1
+    last_money_consumable_frame: int = -1
     shop_reroll_seq = 0
     shop_todo_ctx: tuple[int, int, int] | None = None
     shop_todo_unbought: list[PokerHand] = []
     pack_todo_ctx: tuple[int, int, int] | None = None
     pack_todo_unbought: list[PokerHand] = []
+    shop_visit_active = False
+    shop_visit_cashout_frame: int | None = None
+    last_shop_obs: dict[str, Any] | None = None
+    shop_visit_actions: list[ActionType] = []
+    shop_visit_opens = 0
 
     action_iter = (
         tqdm(
@@ -3066,6 +3309,8 @@ def _build_run_trajectory_with_plan(
         if sa.action_type in (A.SORT_RANK, A.SORT_SUIT) and not is_face_down_boss:
             continue
 
+        shop_synced_this_step = False
+
         action = Action(
             type=sa.action_type,
             frame_idx=sa.frame_id,
@@ -3079,14 +3324,62 @@ def _build_run_trajectory_with_plan(
         ):
             action.metadata["include_round_payout"] = True
 
-        # Drop false-positive Discard (0 discards left, e.g. Burglar) and cancelled Play Hand
-        # drag-offs BEFORE mutating hand/bars/deck/HUD.
+        # Drop false-positive / cancelled Discard, cancelled Play Hand drag-offs, and
+        # false-positive Reroll Shop BEFORE mutating hand/bars/deck/HUD.
         if sa.action_type == A.DISCARD:
             hud_disc = _get_hud_val(hud_peek, "hud_discards")
             if (state.discards_left or 0) <= 0 and hud_disc in (None, 0):
                 for hc in state.hand.cards:
                     hc.selected = False
                 continue
+            cur_round = _get_hud_val(hud_peek, "hud_round")
+            if hud_disc is not None and int(hud_disc) > 0:
+                cancelled_discard = False
+                for nxt in scheduled_actions[sa_idx + 1 :]:
+                    if nxt.action_type in (
+                        A.END_ROUND,
+                        A.CASH_OUT,
+                        A.SELECT_BLIND,
+                        A.SKIP_BLIND,
+                        A.NEXT_ROUND,
+                    ):
+                        break
+                    if nxt.target_frame <= sa.frame_id:
+                        continue
+                    nxt_hud = hud_res_by_frame.get(nxt.target_frame)
+                    nxt_disc = _get_hud_val(nxt_hud, "hud_discards")
+                    nxt_round = _get_hud_val(nxt_hud, "hud_round")
+                    if nxt_disc is not None:
+                        if (
+                            cur_round is None
+                            or nxt_round is None
+                            or int(nxt_round) == int(cur_round)
+                        ) and int(nxt_disc) == int(hud_disc):
+                            cancelled_discard = True
+                        break
+                if cancelled_discard:
+                    for hc in state.hand.cards:
+                        hc.selected = False
+                    continue
+
+        if (
+            sa.action_type == A.REROLL_SHOP
+            and state.free_rerolls == 0
+            and _get_hud_val(hud_peek, "hud_reroll_cost") != 0
+            and sa_idx + 1 < len(scheduled_actions)
+        ):
+            nxt = scheduled_actions[sa_idx + 1]
+            if nxt.ambient_location == Location.SHOP and nxt.target_frame > sa.frame_id:
+                nxt_hud = hud_res_by_frame.get(nxt.target_frame)
+                nxt_rr = _get_hud_val(nxt_hud, "hud_reroll_cost")
+                cur_m = _get_hud_val(hud_peek, "hud_money")
+                nxt_m = _get_hud_val(nxt_hud, "hud_money")
+                if (
+                    nxt_rr is not None
+                    and 0 < int(nxt_rr) <= state.reroll_cost
+                    and (cur_m is None or nxt_m is None or int(nxt_m) >= int(cur_m))
+                ):
+                    continue
 
         if sa.action_type == A.PLAY_HAND:
             cur_hands = _get_hud_val(hud_peek, "hud_hands")
@@ -3180,6 +3473,11 @@ def _build_run_trajectory_with_plan(
             shop_reroll_seq = 0
             shop_todo_ctx = None
             shop_todo_unbought.clear()
+            shop_visit_active = True
+            shop_visit_cashout_frame = synth_co.frame_idx
+            last_shop_obs = None
+            shop_visit_actions = []
+            shop_visit_opens = 0
             if diag is not None:
                 diag["inferred_cash_outs"] += 1
             if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
@@ -3267,7 +3565,8 @@ def _build_run_trajectory_with_plan(
 
         raw_jokers: list[Any] = []
         raw_cons: list[Any] = []
-        next_cons_counts = _next_obs_cons_counts(sa_idx)
+        next_cons_counts = _next_obs_counts(sa_idx, obs_cons_counts_by_sa_idx)
+        next_joker_counts = _next_obs_counts(sa_idx, obs_joker_counts_by_sa_idx)
         stale_cons_frame = (
             last_consumable_mutated_frame >= 0
             and sa.target_frame <= last_consumable_mutated_frame + 10
@@ -3295,12 +3594,22 @@ def _build_run_trajectory_with_plan(
                     next_count = (
                         next_cons_counts[sig] if next_cons_counts is not None else 0
                     )
+                    c_name = getattr(held_c, "name", None)
                     if (
                         cur_cons_counts[sig] < held_sig_total
                         and next_count < held_sig_total
+                        and (
+                            sum(cur_cons_counts.values())
+                            < len(state.inventory.consumables)
+                            or c_name
+                            in (
+                                TarotName.FOOL,
+                                TarotName.EMPEROR,
+                                TarotName.HIGH_PRIESTESS,
+                            )
+                        )
                     ):
                         sell_val = max(1, int(getattr(held_c, "sell_value", 1)))
-                        c_name = getattr(held_c, "name", None)
                         is_sell = (
                             hud_money_val is not None
                             and hud_money_val >= state.money + sell_val
@@ -3342,6 +3651,8 @@ def _build_run_trajectory_with_plan(
                 action,
                 diag=diag,
                 next_obs_cons_counts=next_cons_counts,
+                next_obs_joker_counts=next_joker_counts,
+                preserve_joker_flickers=(sa.action_type == A.END_ROUND),
                 sync_jokers=True,
                 sync_consumables=(
                     sa.action_type != A.END_ROUND and not stale_cons_frame
@@ -3350,14 +3661,26 @@ def _build_run_trajectory_with_plan(
 
         # Sync main shop shelves before matching/stepping shop actions
         if sa.ambient_location == Location.SHOP and shop_out is not None:
+            shop_synced_this_step = True
             pre_cv_shelves = _serialize_shop_shelves(state)
             raw_shop_items = _remap_softlocked_planets(
                 list(getattr(shop_out, "shop_items", None) or []), state
             )
+            # Guard against shop_classifier mislabeling a shop-shelf card as a Voucher or BoosterPack,
+            # keeping `raw_shop_items` and `state.shop_cards` 1-to-1 aligned for `match_button_to_item_index`.
+            _SHOP_CARD_TYPES = (Joker, Tarot, Planet, Spectral, PlayingCard)
+            filtered_shop_pairs = [
+                (raw_item, conv_obj)
+                for raw_item, conv_obj in zip(
+                    raw_shop_items, _convert_items_of_type(raw_shop_items)
+                )
+                if isinstance(conv_obj, _SHOP_CARD_TYPES)
+            ]
+            raw_shop_items = [pair[0] for pair in filtered_shop_pairs]
             raw_vouchers = list(getattr(shop_out, "vouchers", None) or [])
             raw_boosters = list(getattr(shop_out, "boosters", None) or [])
 
-            state.shop_cards = _convert_items_of_type(raw_shop_items)
+            state.shop_cards = [pair[1] for pair in filtered_shop_pairs]
             state.shop_vouchers = _convert_items_of_type(raw_vouchers, Voucher)
             state.shop_packs = _convert_items_of_type(raw_boosters, BoosterPack)
             if getattr(state, "coupon_shop_active", False):
@@ -3450,6 +3773,153 @@ def _build_run_trajectory_with_plan(
             action.target_idx = match_button_to_item_index(
                 sa.button_box, combined_bar, attach="center_right"
             )
+
+        # Drop cancelled SELL_CARD and duplicate/cancelled USE_CONSUMABLE clicks before hand/HUD/sim mutations
+        if (
+            sa.action_type == A.SELL_CARD
+            and action.target_idx is not None
+            and state.inventory is not None
+        ):
+            nxt_idx = _next_non_sort_idx(sa_idx)
+            if nxt_idx is not None:
+                nxt = scheduled_actions[nxt_idx]
+                if nxt.target_frame > sa.frame_id and nxt.action_type not in (
+                    A.BUY_CARD,
+                    A.BUY_AND_USE,
+                    A.USE_IN_PACK,
+                    A.OPEN_PACK,
+                    A.DISCARD,
+                    A.END_ROUND,
+                ):
+                    cur_m = _get_hud_val(hud_peek, "hud_money")
+                    nxt_m = _get_hud_val(
+                        hud_res_by_frame.get(nxt.target_frame), "hud_money"
+                    )
+                    money_not_gained = (
+                        cur_m is None or nxt_m is None or int(nxt_m) <= int(cur_m)
+                    )
+                    if (
+                        0 <= action.target_idx < len(state.inventory.jokers)
+                        and nxt_idx in obs_joker_counts_by_sa_idx
+                    ):
+                        j_name = state.inventory.jokers[action.target_idx].name
+                        cur_cnt = obs_joker_counts_by_sa_idx.get(sa_idx, Counter())[
+                            j_name
+                        ]
+                        nxt_cnt = obs_joker_counts_by_sa_idx[nxt_idx][j_name]
+                        if cur_cnt > 0 and nxt_cnt >= cur_cnt and money_not_gained:
+                            continue
+                    else:
+                        c_idx = action.target_idx - len(state.inventory.jokers)
+                        if (
+                            0 <= c_idx < len(state.inventory.consumables)
+                            and nxt_idx in obs_cons_counts_by_sa_idx
+                        ):
+                            c_sig = _consumable_sig(
+                                state.inventory.consumables[c_idx]
+                            )
+                            cur_cnt = obs_cons_counts_by_sa_idx.get(
+                                sa_idx, Counter()
+                            )[c_sig]
+                            nxt_cnt = obs_cons_counts_by_sa_idx[nxt_idx][c_sig]
+                            if cur_cnt > 0 and nxt_cnt >= cur_cnt and money_not_gained:
+                                continue
+        elif (
+            sa.action_type == A.USE_CONSUMABLE
+            and action.target_idx is not None
+            and state.inventory is not None
+            and 0 <= action.target_idx < len(state.inventory.consumables)
+        ):
+            nxt_idx = _next_non_sort_idx(sa_idx)
+            if nxt_idx is not None:
+                nxt = scheduled_actions[nxt_idx]
+                if (
+                    nxt.action_type == A.USE_CONSUMABLE
+                    and 0 < (nxt.frame_id - sa.frame_id) <= 60
+                    and nxt.target_frame > sa.frame_id
+                    and nxt_idx in obs_cons_counts_by_sa_idx
+                ):
+                    c_sig = _consumable_sig(
+                        state.inventory.consumables[action.target_idx]
+                    )
+                    cur_cnt = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())[c_sig]
+                    nxt_cnt = obs_cons_counts_by_sa_idx[nxt_idx][c_sig]
+                    same_btn = False
+                    if sa.button_box and nxt.button_box:
+                        cx1 = (sa.button_box[0] + sa.button_box[2]) * 0.5
+                        cy1 = (sa.button_box[1] + sa.button_box[3]) * 0.5
+                        cx2 = (nxt.button_box[0] + nxt.button_box[2]) * 0.5
+                        cy2 = (nxt.button_box[1] + nxt.button_box[3]) * 0.5
+                        same_btn = abs(cx1 - cx2) <= 60 and abs(cy1 - cy2) <= 60
+                    nxt2_idx = _next_non_sort_idx(nxt_idx)
+                    after_only_one_consumed = (
+                        nxt2_idx is not None
+                        and nxt2_idx in obs_cons_counts_by_sa_idx
+                        and obs_cons_counts_by_sa_idx[nxt2_idx][c_sig] >= cur_cnt - 1
+                    )
+                    if (
+                        cur_cnt > 0
+                        and nxt_cnt >= cur_cnt
+                        and (same_btn or cur_cnt == 1 or after_only_one_consumed)
+                    ):
+                        for hc in state.hand.cards:
+                            hc.selected = False
+                        continue
+        elif (
+            sa.action_type == A.USE_IN_PACK
+            and action.target_idx is not None
+            and 0 <= action.target_idx < len(state.pack_cards)
+        ):
+            nxt_idx = _next_non_sort_idx(sa_idx)
+            if nxt_idx is not None:
+                nxt = scheduled_actions[nxt_idx]
+                if (
+                    nxt.action_type == A.USE_IN_PACK
+                    and nxt.target_frame > sa.frame_id
+                    and nxt_idx in obs_pack_counts_by_sa_idx
+                ):
+                    sig = _pack_item_sig(state.pack_cards[action.target_idx])
+                    cur_c = obs_pack_counts_by_sa_idx.get(sa_idx, Counter())
+                    nxt_c = obs_pack_counts_by_sa_idx[nxt_idx]
+                    if (
+                        sig is not None
+                        and cur_c[sig] > 0
+                        and nxt_c[sig] >= cur_c[sig]
+                        and sum(nxt_c.values()) >= sum(cur_c.values())
+                    ):
+                        for hc in state.hand.cards:
+                            hc.selected = False
+                        continue
+        elif (
+            sa.ambient_location == Location.SHOP
+            and sa.action_type in (A.OPEN_PACK, A.REDEEM_VOUCHER)
+            and action.target_idx is not None
+        ):
+            nxt_idx = _next_non_sort_idx(sa_idx)
+            if nxt_idx is not None:
+                nxt = scheduled_actions[nxt_idx]
+                if (
+                    nxt.action_type == sa.action_type
+                    and nxt.ambient_location == Location.SHOP
+                    and nxt.target_frame > sa.frame_id
+                ):
+                    counts_map = (
+                        obs_booster_counts_by_sa_idx
+                        if sa.action_type == A.OPEN_PACK
+                        else obs_voucher_counts_by_sa_idx
+                    )
+                    cur_cnt_map = counts_map.get(sa_idx, Counter())
+                    nxt_cnt_map = counts_map.get(nxt_idx, Counter())
+                    cur_m = _get_hud_val(hud_peek, "hud_money")
+                    nxt_m = _get_hud_val(
+                        hud_res_by_frame.get(nxt.target_frame), "hud_money"
+                    )
+                    if (
+                        sum(cur_cnt_map.values()) > 0
+                        and sum(nxt_cnt_map.values()) >= sum(cur_cnt_map.values())
+                        and (cur_m is None or nxt_m is None or int(nxt_m) >= int(cur_m))
+                    ):
+                        continue
 
         # Hand synchronization & sort handling
         pre_selected_uid: int | None = None
@@ -3590,6 +4060,10 @@ def _build_run_trajectory_with_plan(
                 action,
                 has_end_round_after=_has_end_round_after(scheduled_actions, sa_idx),
                 next_hud_money=_next_hud_money(sa_idx),
+                stale_money_drop_guard=(
+                    last_money_consumable_frame >= 0
+                    and sa.frame_id <= last_money_consumable_frame + 30
+                ),
                 diag=diag,
             )
 
@@ -3602,6 +4076,58 @@ def _build_run_trajectory_with_plan(
             )
             if survivors:
                 action.metadata["_surviving_hand_ids"] = survivors
+
+        # Check for unexpected shop shelf changes after cancelled-action filtering
+        if shop_synced_this_step and shop_visit_active:
+            cur_shop_cards = [_display_card_name(c) for c in state.shop_cards]
+            cur_shop_vouchers = [
+                str(getattr(v.name, "value", v.name)) for v in state.shop_vouchers
+            ]
+            cur_shop_packs = [
+                f"{getattr(bp.size, 'value', bp.size)} {getattr(bp.booster_type, 'value', bp.booster_type)}"
+                for bp in state.shop_packs
+            ]
+            unexp_shop_reasons = _detect_unexpected_shop_transition(
+                last_shop_obs,
+                cur_shop_cards,
+                cur_shop_vouchers,
+                cur_shop_packs,
+                actions_between=shop_visit_actions,
+                shop_visit_opens=shop_visit_opens,
+                cashout_frame=shop_visit_cashout_frame,
+            )
+            if unexp_shop_reasons:
+                if diag is not None:
+                    diag["unexpected_shop_transitions"].append(
+                        {
+                            "prev_frame": (
+                                last_shop_obs["frame_id"]
+                                if last_shop_obs is not None
+                                else shop_visit_cashout_frame
+                            ),
+                            "prev_action": (
+                                last_shop_obs["action_type"]
+                                if last_shop_obs is not None
+                                else A.CASH_OUT.value
+                            ),
+                            "frame": action.frame_idx,
+                            "action": action.type.value,
+                            "ante": state.ante,
+                            "round": state.round,
+                            "actions_between": [a.value for a in shop_visit_actions],
+                            "reasons": unexp_shop_reasons,
+                        }
+                    )
+                action.metadata["unexpected_shop_transition"] = list(unexp_shop_reasons)
+            if cur_shop_cards or cur_shop_vouchers or cur_shop_packs:
+                last_shop_obs = {
+                    "frame_id": action.frame_idx,
+                    "action_type": action.type.value,
+                    "cards": cur_shop_cards,
+                    "vouchers": cur_shop_vouchers,
+                    "packs": cur_shop_packs,
+                }
+                shop_visit_actions = []
 
         # Advance simulation
         bought_shop_td_k = (
@@ -3618,6 +4144,28 @@ def _build_run_trajectory_with_plan(
         state.timestamp = action.timestamp
         prev_loc = state.location
         prev_cons_len = len(state.inventory.consumables) if state.inventory else 0
+        if (
+            sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK)
+            and action.metadata.get("target_card") == TarotName.FOOL.value
+            and state.inventory is not None
+            and next_cons_counts is not None
+        ):
+            post_fool_held = Counter(
+                _consumable_sig(c)
+                for idx, c in enumerate(state.inventory.consumables)
+                if not (
+                    sa.action_type == A.USE_CONSUMABLE and idx == action.target_idx
+                )
+            )
+            new_sigs = [
+                sig
+                for sig, cnt in (next_cons_counts - post_fool_held).items()
+                if cnt > 0
+                and isinstance(sig[0], (TarotName, PlanetName))
+                and sig[0] != TarotName.FOOL
+            ]
+            if len(new_sigs) == 1:
+                state.last_tarot_planet = new_sigs[0][0]
         on_action(state, action)
         if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
             break
@@ -3636,6 +4184,27 @@ def _build_run_trajectory_with_plan(
             shop_reroll_seq = 0
             shop_todo_ctx = None
             shop_todo_unbought.clear()
+        if sa.action_type == A.CASH_OUT:
+            shop_visit_active = True
+            shop_visit_cashout_frame = action.frame_idx
+            last_shop_obs = None
+            shop_visit_actions = []
+            shop_visit_opens = 0
+        elif sa.action_type in (
+            A.NEXT_ROUND,
+            A.SELECT_BLIND,
+            A.SKIP_BLIND,
+            A.END_ROUND,
+        ):
+            shop_visit_active = False
+            shop_visit_cashout_frame = None
+            last_shop_obs = None
+            shop_visit_actions = []
+            shop_visit_opens = 0
+        elif shop_visit_active:
+            shop_visit_actions.append(sa.action_type)
+            if sa.action_type == A.OPEN_PACK:
+                shop_visit_opens += 1
         if state.location != Location.PACK:
             pack_todo_ctx = None
             pack_todo_unbought.clear()
@@ -3644,6 +4213,11 @@ def _build_run_trajectory_with_plan(
             sa.action_type == A.SELL_CARD and post_cons_len < prev_cons_len
         ):
             last_consumable_mutated_frame = action.frame_idx
+        if sa.action_type == A.USE_CONSUMABLE and action.metadata.get("target_card") in (
+            TarotName.HERMIT.value,
+            TarotName.TEMPERANCE.value,
+        ):
+            last_money_consumable_frame = action.frame_idx
         action.metadata.pop("_surviving_hand_ids", None)
         if (
             sa.action_type == A.END_ROUND

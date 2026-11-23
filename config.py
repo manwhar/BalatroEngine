@@ -28,6 +28,9 @@ class Config:
     expand_roi_factor: float = 1.1
     shadow_region_height: int = 10  # pixels
     shadow_threshold: float = 52.0
+    use_luminance_check: bool = True
+    min_luminance_ratio: float = 0.70
+    max_luminance_ratio: float = 1.30
     skip_frames: int = 1  # skip n frames then use 1
 
     start_timestamp: float | None = None
@@ -65,6 +68,21 @@ def get_config() -> Config:
         "--end-timestamp", type=float, default=default_cfg.end_timestamp
     )
     parser.add_argument("--skip-frames", type=int, default=default_cfg.skip_frames)
+    parser.add_argument(
+        "--luminance-check",
+        action=argparse.BooleanOptionalAction,
+        default=default_cfg.use_luminance_check,
+    )
+    parser.add_argument(
+        "--min-luminance-ratio",
+        type=float,
+        default=default_cfg.min_luminance_ratio,
+    )
+    parser.add_argument(
+        "--max-luminance-ratio",
+        type=float,
+        default=default_cfg.max_luminance_ratio,
+    )
     parser.add_argument(
         "--use-hwaccel",
         action=argparse.BooleanOptionalAction,
@@ -105,6 +123,9 @@ def get_config() -> Config:
         start_timestamp=args.start_timestamp,
         end_timestamp=args.end_timestamp,
         skip_frames=args.skip_frames,
+        use_luminance_check=args.luminance_check,
+        min_luminance_ratio=args.min_luminance_ratio,
+        max_luminance_ratio=args.max_luminance_ratio,
         use_hwaccel=args.use_hwaccel,
         coarse_to_fine=args.coarse_to_fine,
         coarse_margin=args.coarse_margin,

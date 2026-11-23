@@ -67,6 +67,7 @@ def main():
     parser.add_argument("--batch-classifier", type=int, default=512, help="Batch size for Stage 2 (default: 512)")
     parser.add_argument("--workers", type=int, default=8, help="DataLoader CPU worker processes for Stage 2 (default: 8)")
     parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Classifier backbone")
+    parser.add_argument("--max-deck-crops-per-frame", type=int, default=16, help="Max crops sampled per View Deck frame (0 = all)")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")
     parser.add_argument("--sync", action="store_true", help="Sync latest generated images and labels from balatro_mod/dataset first")
     parser.add_argument("--clean-sync", action="store_true", help="Clean dataset directory before syncing from balatro_mod/dataset")
@@ -96,7 +97,8 @@ def main():
             batch_size=args.batch_classifier,
             backbone=args.backbone,
             exist_ok=args.exist_ok,
-            num_workers=args.workers
+            num_workers=args.workers,
+            max_deck_crops_per_frame=(None if args.max_deck_crops_per_frame <= 0 else args.max_deck_crops_per_frame),
         )
 
     print("\n" + "=" * 60)

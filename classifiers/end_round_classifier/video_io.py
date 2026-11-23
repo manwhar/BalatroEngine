@@ -266,27 +266,14 @@ def read_video_segments_rgb_batch(
     out_height: int = INPUT_HEIGHT,
     progress_callback: Callable[[int], None] | None = None,
 ) -> tuple[list[torch.Tensor], float, list[list[int]]]:
-    """Decode multiple `[start_frame, end_frame)` segments from one video reader."""
+    """Decode multiple `[start_frame, end_frame)` segments using OpenCV VideoCapture.
+
+    Uses OpenCV directly because `decord.VideoReader` exhibits H.264 Open-GOP
+    seeking drift on YouTube MP4s (`_read_video_segments_rgb_batch_decord` is
+    kept defined for compatibility).
+    """
     if not segments:
         return [], 60.0, []
-
-    try:
-        return _read_video_segments_rgb_batch_decord(
-            video_path,
-            segments,
-            target_fps=target_fps,
-            already_cropped=already_cropped,
-            roi_base_1080p=roi_base_1080p,
-            out_width=out_width,
-            out_height=out_height,
-            progress_callback=progress_callback,
-        )
-    except ValueError:
-        raise
-    except ImportError:
-        pass
-    except Exception:
-        pass
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():

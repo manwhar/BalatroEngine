@@ -34,8 +34,9 @@ The primary pipeline for extracting player decisions directly from recorded game
 ### 2. In-Game Dataset Generator Mod (`balatro_mod/`)
 A modular Steamodded mod installed into Balatro to capture synchronized, perfectly labeled CV datasets.
 
-- **Operation Modes**: Configurable from the in-game mod settings menu between **Off**, **Card Classifier**, **Shop Classifier**, **HUD OCR**, and **End Round**.
-- **HUD & End-of-Round Generators (`src/hud_gen.lua`, `src/end_round_gen.lua`, `src/end_round_capture.lua`)**: Synthesizes labeled HUD counter crops (money, hands, discards, ante, round, scores, reroll cost) and captures gameplay clips around round-ending vs non-ending hands for temporal classification.
+- **Operation Modes**: Configurable from the in-game mod settings menu between **Off**, **Card Classifier**, **Shop Classifier**, **End Round**, **HUD OCR**, **Seed OCR**, and **Deck Classifier**.
+- **HUD, Seed & End-of-Round Generators (`src/hud_gen.lua`, `src/seed_gen.lua`, `src/end_round_gen.lua`, `src/end_round_capture.lua`)**: Synthesizes labeled HUD counter crops (money, hands, discards, ante, round, scores, reroll cost), end-of-run seed modals, and captures gameplay clips around round-ending vs non-ending hands for temporal classification.
+- **View Deck Generator (`src/deck_gen.lua`)**: Randomizes `G.playing_cards` (15–100 cards concentrated near ~52, suit bias <= 30/suit, 2–20 duplicate card clusters with 2x trait odds, editions, seals, enhancements, and played/greyed states), opens Balatro's View Deck overlay, and exports left-edge YOLO bounding boxes plus card crop labels to `dataset_deck/`.
 - **Hand Card Generator (`src/cards_gen.lua`)**: Generates randomized hands with configurable distributions for card ranks, suits, enhancements, editions (Foil/Holo/Poly/Negative), seals, face-down flips, and collab deck skins.
 - **Shop & Booster Pack Generator (`src/shop_gen.lua`)**:
   - Cycles between **Main Shop** (2–4 slots) and **Booster Packs** (Buffoon, Arcana, Spectral, Celestial) across normal and Mega sizes.
@@ -155,10 +156,21 @@ python classifiers/shop_classifier/train.py --sync --stage all
 python tools/auto_retrain.py --model shop --target 10000
 ```
 
+### Training View Deck Classifier (Left-Edge YOLO + Shared Card Classifier Stage 2)
+```powershell
+# Sync View Deck dataset from mod, train Stage 1 left-edge YOLO detector,
+# and retrain Stage 2 card classifier on hand + shop crops + View Deck crops:
+python classifiers/deck_classifier/train.py --sync --stage all
+
+# Or monitor dataset_deck generation and auto-train once target frame count is reached:
+python tools/auto_retrain.py --model deck --target 2500
+```
+
 ### Running Pipeline on Video Frames
 ```powershell
 python classifiers/card_classifier/test_video_frame.py --input path/to/frame.png
 python classifiers/shop_classifier/test_video_frame.py --input path/to/frame.png
+python classifiers/deck_classifier/test_video_frame.py --input path/to/frame.png
 ```
 
 ### Running Game Engine & Parity Tests

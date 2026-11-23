@@ -11,7 +11,7 @@ import os
 import cv2
 
 DEFAULT_CONFIG_PATH = r"assets\templates\drspectred\templates.json"
-DEFAULT_IMAGE_PATH = r"assets\testing\buy_card\frame_7872_pressed_false.jpg"
+DEFAULT_IMAGE_PATH = r"assets\sample_inputs\full_deck_shop.jpg"
 EXPECTED_RES = (1920, 1080)  # (width, height)
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
@@ -38,7 +38,9 @@ def load_templates(filepath: str) -> dict:
             normalized[key] = dict(val)
             normalized[key]["label"] = val.get("label", key)
             if "filenames" not in val:
-                normalized[key]["filenames"] = [key] if key.lower().endswith(".png") else []
+                normalized[key]["filenames"] = (
+                    [key] if key.lower().endswith(".png") else []
+                )
             if "rois" not in val:
                 normalized[key]["rois"] = []
         else:

@@ -101,6 +101,7 @@ def _process_frame(
     best_clicked_conf = -1.0
     cash_out_box: list[int] | None = None
     cash_out_present = False
+    open_pack_present = False
     for template in active_templates:
         result = eval(
             template,
@@ -112,9 +113,26 @@ def _process_frame(
         )
         # When "Sell Card" sits directly above "Use Consumable", its 10px shadow box
         # collides with the top border of "Use"; re-evaluate only within the gap.
+        eff_min_luma = (
+            float(template.min_luminance_ratio)
+            if getattr(template, "min_luminance_ratio", None) is not None
+            else config.min_luminance_ratio
+        )
+        eff_max_luma = (
+            float(template.max_luminance_ratio)
+            if getattr(template, "max_luminance_ratio", None) is not None
+            else config.max_luminance_ratio
+        )
+        luma_ratio = getattr(result, "luminance_ratio", None)
+        luma_ok = (
+            not config.use_luminance_check
+            or luma_ratio is None
+            or eff_min_luma <= luma_ratio <= eff_max_luma
+        )
         if (
             result.found
             and not result.clicked
+            and luma_ok
             and result.template_name == "Sell Card"
             and result.box is not None
         ):
@@ -158,6 +176,12 @@ def _process_frame(
                         else:
                             result.clicked = sell_clicked
         if (
+            result.template_name == "Open Pack"
+            and result.found
+            and not result.clicked
+        ):
+            open_pack_present = True
+        if (
             result.template_name == "Cash Out"
             and result.found
             and not result.clicked
@@ -192,6 +216,8 @@ def _process_frame(
         metrics["cash_out_present"] = True
     if cash_out_box is not None:
         metrics["cash_out_box"] = cash_out_box
+    if open_pack_present:
+        metrics["open_pack_present"] = True
     return frame_idx, matches, metrics, template_clicked, clicked_name
 
 
@@ -328,6 +354,10 @@ def detect_video_actions(
     cash_out_missing_streak = 0
     cash_out_first_missing_frame: int | None = None
     cash_out_last_box: list[int] | None = None
+    open_pack_visible_streak = 0
+    open_pack_missing_streak = 0
+    shop_last_activity_frame: int | None = None
+    shop_pack_fallback_frames = 90
 
     def _reset_cash_out_watch() -> None:
         nonlocal \
@@ -338,6 +368,11 @@ def detect_video_actions(
         cash_out_missing_streak = 0
         cash_out_first_missing_frame = None
 
+    def _reset_open_pack_watch() -> None:
+        nonlocal open_pack_visible_streak, open_pack_missing_streak
+        open_pack_visible_streak = 0
+        open_pack_missing_streak = 0
+
     def _apply_frame_detection(
         frame_idx: int,
         template_clicked: dict[str, Any] | None,
@@ -347,6 +382,8 @@ def detect_video_actions(
         """Records detected click (or synthetic Cash Out disappearance) and returns True if state changed."""
         nonlocal cash_out_visible_streak, cash_out_missing_streak
         nonlocal cash_out_first_missing_frame, cash_out_last_box
+        nonlocal open_pack_visible_streak, open_pack_missing_streak
+        nonlocal shop_last_activity_frame
 
         prev_state = (
             screen_tracker.state,
@@ -357,6 +394,11 @@ def detect_video_actions(
         if template_clicked is not None and clicked_name is not None:
             action_frames[frame_idx] = template_clicked
             screen_tracker.on_template_clicked(clicked_name, frame_idx=frame_idx)
+            _reset_open_pack_watch()
+            if screen_tracker.state == CoarseScreenState.SHOP:
+                shop_last_activity_frame = frame_idx
+            else:
+                shop_last_activity_frame = None
             if clicked_name in (
                 "Open Run Info Menu",
                 "Open Options Menu",
@@ -401,8 +443,33 @@ def detect_video_actions(
                             "Cash Out", frame_idx=syn_frame
                         )
                         _reset_cash_out_watch()
+                        _reset_open_pack_watch()
+                        shop_last_activity_frame = syn_frame
             else:
                 _reset_cash_out_watch()
+
+            if screen_tracker.state == CoarseScreenState.SHOP:
+                if metrics.get("open_pack_present"):
+                    open_pack_visible_streak += 1
+                    open_pack_missing_streak = 0
+                elif open_pack_visible_streak >= 1:
+                    open_pack_missing_streak += 1
+                    if open_pack_missing_streak >= 2:
+                        screen_tracker.on_pack_possibly_opened()
+                        _reset_open_pack_watch()
+                        shop_last_activity_frame = None
+                if (
+                    screen_tracker.state == CoarseScreenState.SHOP
+                    and shop_last_activity_frame is not None
+                    and (frame_idx - shop_last_activity_frame)
+                    >= shop_pack_fallback_frames
+                ):
+                    screen_tracker.on_pack_possibly_opened()
+                    _reset_open_pack_watch()
+                    shop_last_activity_frame = None
+            else:
+                _reset_open_pack_watch()
+                shop_last_activity_frame = None
 
         cur_state = (
             screen_tracker.state,

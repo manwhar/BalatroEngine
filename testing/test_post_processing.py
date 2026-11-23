@@ -2560,6 +2560,636 @@ class TestDiagnosticAndCleanupRegressions(unittest.TestCase):
         self.assertIn(bm.ActionType.USE_CONSUMABLE, act_types)
         self.assertEqual(state.hand_levels[bm.PokerHand.HIGH_CARD], 2)
 
+    def test_shop_items_misclassified_as_voucher_are_filtered_safely(self):
+        d = {
+            "key": {"Select Blind": 0, "Play Hand": 1, "End Round": 2, "Cash Out": 3, "Buy Card": 4},
+            "frames": {
+                "100": {"action": 0, "box": [100, 100, 180, 140]},
+                "200": {"action": 1, "box": [780, 900, 880, 950]},
+                "300": {"action": 2, "box": [500, 500, 600, 550]},
+                "400": {"action": 3, "box": [400, 300, 600, 370]},
+                "500": {"action": 4, "box": [620, 380, 720, 440]},  # Clicks second shop item (Joker)
+            },
+        }
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in (98, 200, 298, 398, 498, 500)}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx >= 498:
+                    out.shop_items = [
+                        _make_shop_item("v_overstock", "Voucher", [400, 220, 540, 370]),
+                        _make_shop_item("j_joker", "Joker", [600, 220, 740, 370]),
+                    ]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+        ):
+            state, traj, _ = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0
+            )
+
+        self.assertEqual([j.name for j in state.inventory.jokers], [bm.JokerName.JOKER])
+        self.assertEqual(traj.deltas[-1].action.target_idx, 0)
+
+    def test_cancelled_actions_bar_flickers_and_hud_guards(self):
+        from types import SimpleNamespace
+        from classifiers.inference import HudRecognitionOutput
+
+        # 1. Cancelled DISCARD, cancelled SELL_CARD, duplicate USE_CONSUMABLE, false REROLL_SHOP,
+        # ghost low-confidence Joker filtering, and END_ROUND Joker flicker preservation.
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Discard": 1,
+                "Play Hand": 2,
+                "End Round": 3,
+                "Cash Out": 4,
+                "Buy Card": 5,
+                "Reroll Shop": 6,
+                "Sell Card": 7,
+                "Use Consumable": 8,
+                "Next Round": 9,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},  # Select Blind -> 98
+                "200": {"action": 1, "box": [1127, 905, 1339, 1035]},  # Cancelled Discard -> 200
+                "250": {"action": 2, "box": [705, 907, 912, 1032]},  # Play Hand (discards still 2!) -> 250
+                "300": {"action": 3, "box": [500, 500, 600, 550]},  # End Round -> 298
+                "400": {"action": 4, "box": [400, 300, 600, 370]},  # Cash Out -> 398
+                "450": {"action": 5, "box": [860, 580, 950, 630]},  # Buy Joker -> 450
+                "480": {"action": 5, "box": [860, 580, 950, 630]},  # Buy Hermit -> 480
+                "500": {"action": 7, "box": [750, 80, 830, 140]},  # Cancelled Sell Card -> 498
+                "550": {"action": 6, "box": [560, 502, 791, 634]},  # False Reroll Shop -> 540
+                "600": {"action": 8, "box": [1490, 120, 1570, 180]},  # Duplicate Use Hermit #1 -> 598
+                "625": {"action": 8, "box": [1490, 120, 1570, 180]},  # Actual Use Hermit #2 -> 623
+                "700": {"action": 9, "box": [550, 420, 680, 480]},  # Next Round -> 698
+                "800": {"action": 0, "box": [300, 200, 420, 250]},  # Select Blind R2 -> 798
+                "850": {"action": 2, "box": [705, 907, 912, 1032]},  # Play Hand R2 -> 850
+                "900": {"action": 3, "box": [500, 500, 600, 550]},  # End Round R2 (overlay hides joker_bar) -> 898
+                "1000": {"action": 4, "box": [400, 300, 600, 370]},  # Cash Out R2 (joker_bar returns) -> 998
+            },
+        }
+        needed = (98, 200, 250, 298, 398, 450, 480, 498, 540, 598, 623, 698, 798, 850, 898, 998)
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in needed}
+        joker_box = [530, 30, 670, 210]
+        hermit_box = [1390, 35, 1520, 215]
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 450:
+                    out.shop_items = [_make_shop_item("j_joker", "Joker", [840, 370, 970, 550])]
+                elif f_idx == 480:
+                    out.joker_bar = [_make_shop_item("j_joker", "Joker", joker_box)]
+                    out.shop_items = [_make_shop_item("c_hermit", "Tarot", [840, 370, 970, 550])]
+                elif f_idx in (498, 540, 598, 623, 698, 798, 850, 998):
+                    out.joker_bar = [_make_shop_item("j_joker", "Joker", joker_box)]
+                if f_idx == 540:
+                    ghost = _make_shop_item("j_drivers_license", "Joker", [700, 30, 820, 210])
+                    ghost.confidences = {"detection": 0.27, "key": 0.56}
+                    out.joker_bar.append(ghost)
+                if f_idx in (498, 540, 598, 623):
+                    out.consumeables = [_make_shop_item("c_hermit", "Tarot", hermit_box)]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=(
+                        [_make_card_res("Ace", "Spades", selected=True)]
+                        if f_idx in (200, 250, 850)
+                        else []
+                    ),
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx in (200, 250):
+                    vals.update({"hud_money": 10, "hud_discards": 2, "hud_hands": 4, "hud_ante": 1, "hud_round": 1})
+                elif f_idx == 298:
+                    vals.update({"hud_money": 10, "hud_round_score": 500, "hud_blind_target": 300})
+                elif f_idx in (398, 450, 480, 498, 540, 598, 623):
+                    vals.update({"hud_money": 10, "hud_reroll_cost": 5})
+                elif f_idx in (698, 798, 850, 898, 998):
+                    vals.update({"hud_money": 20, "hud_round_score": 500 if f_idx == 898 else 0, "hud_blind_target": 450})
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        diag = plan["diagnostics"]
+        act_types = [dl.action.type for dl in traj.deltas[1:] if dl.action]
+        self.assertNotIn(bm.ActionType.DISCARD, act_types)
+        self.assertNotIn(bm.ActionType.SELL_CARD, act_types)
+        self.assertNotIn(bm.ActionType.REROLL_SHOP, act_types)
+        self.assertEqual(act_types.count(bm.ActionType.USE_CONSUMABLE), 1)
+        self.assertEqual(state.reroll_cost, 5)
+        # Hermit once ($10 -> $20, not doubled to $40) + Round 2 payout ($11) = $31
+        self.assertEqual(state.money, 31)
+        self.assertEqual(diag["unexplained_joker_changes"], [])
+
+        # 2. Direct _sync_hud_into_state guards: reject backward round & >=2 ante rewind, allow -1 ante, guard stale Temperance drop
+        st_guard = gs.GameState(ante=8, round=20, money=86)
+        sa_blind = SimpleNamespace(
+            frame_id=200,
+            target_frame=200,
+            action_type=bm.ActionType.PLAY_HAND,
+            ambient_location=bm.Location.BLIND,
+        )
+        pp._sync_hud_into_state(
+            st_guard,
+            HudRecognitionOutput(frame_index=200, timestamp_seconds=3.3, values={"hud_ante": 3, "hud_round": 15}),
+            sa_blind,
+            bm.Action(type=bm.ActionType.PLAY_HAND),
+        )
+        self.assertEqual(st_guard.ante, 8)
+        self.assertEqual(st_guard.round, 20)
+
+        st_ante9 = gs.GameState(ante=9, round=24, money=50)
+        pp._sync_hud_into_state(
+            st_ante9,
+            HudRecognitionOutput(frame_index=300, timestamp_seconds=5.0, values={"hud_ante": 8}),
+            sa_blind,
+            bm.Action(type=bm.ActionType.PLAY_HAND),
+        )
+        self.assertEqual(st_ante9.ante, 8)
+
+        sa_cashout = SimpleNamespace(
+            frame_id=84870,
+            target_frame=84868,
+            action_type=bm.ActionType.CASH_OUT,
+            ambient_location=bm.Location.CASH_OUT,
+        )
+        pp._sync_hud_into_state(
+            st_guard,
+            HudRecognitionOutput(frame_index=84868, timestamp_seconds=1414.5, values={"hud_money": 46}),
+            sa_cashout,
+            bm.Action(type=bm.ActionType.CASH_OUT),
+            next_hud_money=86,
+            stale_money_drop_guard=True,
+        )
+        self.assertEqual(st_guard.money, 86)
+
+    def test_rule_c4_scoped_to_loss_or_failure_and_pack_voucher_mars_fool_fixes(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        # 1. Rule C4 scanner behavior:
+        # (a) Isolated reconciled Joker gain at step 2 -> no permanent quarantine watermark, step 2 flagged locally
+        def _make_traj(n: int) -> gs.RunTrajectory:
+            traj = gs.RunTrajectory()
+            st = gs.GameState()
+            traj.record_step(st, None)
+            for k in range(1, n):
+                traj.record_step(st, bm.Action(type=bm.ActionType.NEXT_ROUND, frame_idx=k * 100))
+            return traj
+
+        def _blank_recs(n: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "step_idx": k,
+                    "round_key": (1, 1),
+                    "location": bm.Location.SHOP,
+                    "round_won": True,
+                    "hand_over_15": False,
+                    "unexpected_adds": 0,
+                    "unexplained_joker": [],
+                    "unexplained_cons": [],
+                    "unmatched_target": False,
+                    "location_mismatch": False,
+                    "cashout_no_round_won": False,
+                    "empty_hand_cv": False,
+                    "missing_shop_cv": False,
+                    "large_ocr_override": False,
+                }
+                for k in range(n)
+            ]
+
+        traj_gain = _make_traj(5)
+        recs_gain = _blank_recs(5)
+        recs_gain[2]["unexplained_joker"] = [([], ["Mail-In Rebate"])]
+        wm_gain = pp._scan_and_quarantine_corrupted_segments(traj_gain, recs_gain)
+        self.assertIsNone(wm_gain)
+        self.assertTrue(traj_gain.deltas[2].action.metadata.get("corrupted"))
+        self.assertIn("unexplained_joker_drift", traj_gain.deltas[2].action.metadata.get("corruption_reasons", []))
+        self.assertFalse(traj_gain.deltas[3].action.metadata.get("corrupted", False))
+
+        # (b) Unresolved Joker loss at step 2 -> triggers Rule C4 cascade from step 2
+        traj_loss = _make_traj(5)
+        recs_loss = _blank_recs(5)
+        recs_loss[2]["unexplained_joker"] = [(["The Trio"], [])]
+        self.assertEqual(pp._scan_and_quarantine_corrupted_segments(traj_loss, recs_loss), 2)
+        self.assertTrue(traj_loss.deltas[4].action.metadata.get("corrupted"))
+
+        # (c) Reconciled Joker gain + downstream location_mismatch -> triggers Rule C4 cascade from step 2
+        traj_co = _make_traj(5)
+        recs_co = _blank_recs(5)
+        recs_co[2]["unexplained_joker"] = [([], ["Mail-In Rebate"])]
+        recs_co[3]["location_mismatch"] = True
+        self.assertEqual(pp._scan_and_quarantine_corrupted_segments(traj_co, recs_co), 2)
+
+        # 2. End-to-end: cancelled REDEEM_VOUCHER, OPEN_PACK, USE_IN_PACK (ignoring 'none of none'),
+        # ghost consumable sliver filtering on duplicate USE_CONSUMABLE (Mars), and The Fool CV sync (Death).
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Redeem Voucher": 4,
+                "Open Pack": 5,
+                "Select Card": 6,
+                "Skip Pack": 7,
+                "Buy Card": 8,
+                "Use Consumable": 9,
+                "Next Round": 10,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [705, 907, 912, 1032]},
+                "300": {"action": 2, "box": [500, 500, 600, 550]},
+                "400": {"action": 3, "box": [400, 300, 600, 370]},
+                "500": {"action": 4, "box": [730, 910, 830, 960]},  # Cancelled Redeem Voucher -> 498
+                "520": {"action": 4, "box": [730, 910, 830, 960]},  # Real Redeem Voucher -> 518
+                "600": {"action": 5, "box": [1110, 910, 1210, 960]},  # Cancelled Open Pack -> 598
+                "620": {"action": 5, "box": [1110, 910, 1210, 960]},  # Real Open Pack -> 618
+                "700": {"action": 6, "box": [740, 810, 820, 850]},  # Cancelled Select Card in pack -> 698
+                "720": {"action": 6, "box": [740, 810, 820, 850]},  # Real Select Card (4 of Clubs) -> 718
+                "760": {"action": 7, "box": [1240, 940, 1380, 1030]},  # Skip remaining choice -> 758
+                "800": {"action": 8, "box": [860, 580, 950, 630]},  # Buy Mars #1 -> 800
+                "840": {"action": 8, "box": [860, 580, 950, 630]},  # Buy Mars #2 -> 840
+                "880": {"action": 8, "box": [860, 580, 950, 630]},  # Buy The Fool -> 880
+                "920": {"action": 9, "box": [1530, 165, 1605, 230]},  # Cancelled/dup Use Mars #1 (ghost sliver!) -> 918
+                "944": {"action": 9, "box": [1530, 165, 1605, 230]},  # Real Use Mars #2 -> 942
+                "980": {"action": 9, "box": [1635, 165, 1710, 230]},  # Use The Fool -> spawns Death! -> 978
+                "1020": {"action": 10, "box": [550, 420, 680, 480]},  # Next Round (observes Mars + Death) -> 1018
+            },
+        }
+        needed = (98, 200, 298, 398, 498, 518, 598, 618, 698, 718, 758, 800, 840, 880, 918, 942, 978, 1018)
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in needed}
+        c_box0 = [1370, 40, 1450, 265]
+        c_box1 = [1470, 40, 1550, 265]
+        c_box2 = [1575, 40, 1665, 265]
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx in (498, 518):
+                    out.vouchers = [_make_shop_item("v_overstock", "Voucher", [710, 720, 850, 900])]
+                if f_idx in (598, 618):
+                    out.boosters = [_make_shop_item("p_standard_jumbo_1", "Booster", [1090, 730, 1230, 900])]
+                if f_idx in (698, 718):
+                    out.pack_items = [
+                        _make_shop_item(
+                            "4 of Clubs",
+                            "Playing Card",
+                            [710, 600, 850, 790],
+                            card_details=_make_card_res("4", "Clubs"),
+                        ),
+                        _make_shop_item(
+                            "Ace of Spades",
+                            "Playing Card",
+                            [960, 600, 1100, 790],
+                            card_details=_make_card_res("Ace", "Spades"),
+                        ),
+                    ]
+                    if f_idx == 718:
+                        out.pack_items.append(
+                            _make_shop_item(
+                                "none of none",
+                                "Playing Card",
+                                [1150, 600, 1290, 790],
+                                card_details=_make_card_res("none", "none"),
+                            )
+                        )
+                if f_idx == 800:
+                    out.shop_items = [_make_shop_item("c_mars", "Planet", [840, 370, 970, 550])]
+                elif f_idx == 840:
+                    out.consumeables = [_make_shop_item("c_mars", "Planet", c_box0)]
+                    out.shop_items = [_make_shop_item("c_mars", "Planet", [840, 370, 970, 550])]
+                elif f_idx == 880:
+                    out.consumeables = [
+                        _make_shop_item("c_mars", "Planet", c_box0),
+                        _make_shop_item("c_mars", "Planet", c_box1),
+                    ]
+                    out.shop_items = [_make_shop_item("c_fool", "Tarot", [840, 370, 970, 550])]
+                elif f_idx == 918:
+                    ghost = _make_shop_item("c_mars", "Planet", [1450, 40, 1540, 265])
+                    ghost.confidences = {"detection": 0.25, "key": 0.64}
+                    out.consumeables = [
+                        _make_shop_item("c_mars", "Planet", c_box0),
+                        ghost,
+                        _make_shop_item("c_mars", "Planet", c_box1),
+                        _make_shop_item("c_fool", "Tarot", c_box2),
+                    ]
+                elif f_idx == 942:
+                    out.consumeables = [
+                        _make_shop_item("c_mars", "Planet", c_box0),
+                        _make_shop_item("c_mars", "Planet", c_box1),
+                        _make_shop_item("c_fool", "Tarot", c_box2),
+                    ]
+                elif f_idx == 978:
+                    out.consumeables = [
+                        _make_shop_item("c_mars", "Planet", c_box0),
+                        _make_shop_item("c_fool", "Tarot", c_box2),
+                    ]
+                elif f_idx == 1018:
+                    out.consumeables = [
+                        _make_shop_item("c_mars", "Planet", c_box0),
+                        _make_shop_item("c_death", "Tarot", c_box1),
+                    ]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx == 200:
+                    vals.update({"hud_money": 40, "hud_round_score": 400, "hud_blind_target": 300})
+                elif f_idx == 298:
+                    vals.update({"hud_money": 40, "hud_round_score": 400, "hud_blind_target": 300})
+                elif f_idx in (398, 498, 518):
+                    vals["hud_money"] = 40
+                elif f_idx in (598, 618):
+                    vals["hud_money"] = 30
+                elif f_idx in (800, 840, 880, 918, 942, 978, 1018):
+                    vals["hud_money"] = 24
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            state, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        diag = plan["diagnostics"]
+        act_types = [dl.action.type for dl in traj.deltas[1:] if dl.action]
+        self.assertEqual(act_types.count(bm.ActionType.REDEEM_VOUCHER), 1)
+        self.assertEqual(act_types.count(bm.ActionType.OPEN_PACK), 1)
+        self.assertEqual(act_types.count(bm.ActionType.USE_IN_PACK), 1)
+        self.assertEqual(len(state.full_deck), 53)
+        self.assertEqual(
+            [c.name for c in state.inventory.consumables],
+            [bm.PlanetName.MARS, bm.TarotName.DEATH],
+        )
+        self.assertEqual(diag["unexplained_consumable_changes"], [])
+
+    def test_unexpected_shop_transitions_helper_and_end_to_end(self):
+        from classifiers.inference import HudRecognitionOutput
+
+        # 1. Unit checks for _detect_unexpected_shop_transition
+        # (a) First shop observation with 2 packs -> clean
+        self.assertEqual(
+            pp._detect_unexpected_shop_transition(
+                None,
+                ["Joker", "The Fool"],
+                ["Overstock"],
+                ["Regular Buffoon", "Regular Arcana"],
+                actions_between=[],
+                shop_visit_opens=0,
+                cashout_frame=400,
+            ),
+            [],
+        )
+        # (b) First shop observation missing a pack with 0 opens -> flagged
+        miss_first = pp._detect_unexpected_shop_transition(
+            None,
+            ["Joker"],
+            ["Overstock"],
+            ["Regular Arcana"],
+            actions_between=[],
+            shop_visit_opens=0,
+            cashout_frame=400,
+        )
+        self.assertEqual(len(miss_first), 1)
+        self.assertIn("first_shop_obs_missing_packs", miss_first[0])
+
+        prev = {
+            "frame_id": 500,
+            "action_type": "Buy Card",
+            "cards": ["Joker", "The Fool"],
+            "vouchers": ["Overstock"],
+            "packs": ["Regular Buffoon", "Regular Arcana"],
+        }
+        # (c) Normal Buy Card / Open Pack / Redeem Voucher / Reroll Shop -> clean
+        self.assertEqual(
+            pp._detect_unexpected_shop_transition(
+                prev,
+                ["The Fool"],
+                [],
+                ["Regular Arcana"],
+                actions_between=[
+                    bm.ActionType.BUY_CARD,
+                    bm.ActionType.OPEN_PACK,
+                    bm.ActionType.USE_IN_PACK,
+                    bm.ActionType.REDEEM_VOUCHER,
+                ],
+                shop_visit_opens=1,
+            ),
+            [],
+        )
+        self.assertEqual(
+            pp._detect_unexpected_shop_transition(
+                prev,
+                ["Greedy Joker", "Lusty Joker"],
+                ["Overstock"],
+                ["Regular Buffoon", "Regular Arcana"],
+                actions_between=[bm.ActionType.REROLL_SHOP],
+                shop_visit_opens=0,
+            ),
+            [],
+        )
+
+        # (d) 2 packs disappearing with only 1 Open Pack -> flagged
+        two_packs = pp._detect_unexpected_shop_transition(
+            prev,
+            ["Joker", "The Fool"],
+            ["Overstock"],
+            [],
+            actions_between=[bm.ActionType.OPEN_PACK, bm.ActionType.USE_IN_PACK],
+            shop_visit_opens=1,
+        )
+        self.assertEqual(len(two_packs), 1)
+        self.assertIn("packs_lost=", two_packs[0])
+
+        # (e) 2 cards disappearing with only 1 Buy Card and 0 rerolls -> flagged
+        two_cards = pp._detect_unexpected_shop_transition(
+            prev,
+            [],
+            ["Overstock"],
+            ["Regular Buffoon", "Regular Arcana"],
+            actions_between=[bm.ActionType.BUY_CARD],
+            shop_visit_opens=0,
+        )
+        self.assertEqual(len(two_cards), 1)
+        self.assertIn("cards_lost=", two_cards[0])
+
+        # (f) Voucher disappearing with 0 Redeem Voucher -> flagged
+        vouch_lost = pp._detect_unexpected_shop_transition(
+            prev,
+            ["Joker", "The Fool"],
+            [],
+            ["Regular Buffoon", "Regular Arcana"],
+            actions_between=[],
+            shop_visit_opens=0,
+        )
+        self.assertEqual(len(vouch_lost), 1)
+        self.assertIn("vouchers_lost=", vouch_lost[0])
+
+        # 2. End-to-end check: normal shop vs shop with missed second Open Pack (no corruption set)
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Buy Card": 4,
+                "Open Pack": 5,
+                "Use In Pack": 6,
+                "Next Round": 7,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [705, 907, 912, 1032]},
+                "300": {"action": 2, "box": [500, 500, 600, 550]},
+                "400": {"action": 3, "box": [400, 300, 600, 370]},
+                "500": {"action": 4, "box": [860, 580, 950, 630]},  # Buy Joker
+                "540": {"action": 5, "box": [1090, 910, 1190, 960]},  # Open Pack #1
+                "580": {"action": 6, "box": [740, 810, 820, 850]},  # Pick in Pack #1
+                "640": {"action": 7, "box": [550, 420, 680, 480]},  # Next Round (pack #2 also gone!)
+            },
+        }
+        needed = (98, 200, 298, 398, 500, 538, 578, 638)
+        dummy_frames = {f: np.zeros((1080, 1920, 3), dtype=np.uint8) for f in needed}
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            j_box0 = [350, 40, 450, 265]
+            j_box1 = [470, 40, 570, 265]
+            for _, f_idx, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, mode=mode)
+                if f_idx == 500:
+                    out.shop_items = [
+                        _make_shop_item("j_joker", "Joker", [840, 370, 970, 550]),
+                        _make_shop_item("c_mars", "Planet", [1020, 370, 1150, 550]),
+                    ]
+                    out.vouchers = [_make_shop_item("v_overstock", "Voucher", [710, 720, 850, 900])]
+                    out.boosters = [
+                        _make_shop_item("p_buffoon_normal_1", "Booster", [1090, 730, 1230, 900]),
+                        _make_shop_item("p_celestial_normal_1", "Booster", [1260, 730, 1400, 900]),
+                    ]
+                elif f_idx == 538:
+                    out.joker_bar = [_make_shop_item("j_joker", "Joker", j_box0)]
+                    out.shop_items = [_make_shop_item("c_mars", "Planet", [1020, 370, 1150, 550])]
+                    out.vouchers = [_make_shop_item("v_overstock", "Voucher", [710, 720, 850, 900])]
+                    out.boosters = [
+                        _make_shop_item("p_buffoon_normal_1", "Booster", [1090, 730, 1230, 900]),
+                        _make_shop_item("p_celestial_normal_1", "Booster", [1260, 730, 1400, 900]),
+                    ]
+                elif f_idx == 578:
+                    out.joker_bar = [_make_shop_item("j_joker", "Joker", j_box0)]
+                    out.pack_items = [_make_shop_item("j_hiker", "Joker", [710, 600, 850, 790])]
+                elif f_idx == 638:
+                    out.joker_bar = [
+                        _make_shop_item("j_joker", "Joker", j_box0),
+                        _make_shop_item("j_hiker", "Joker", j_box1),
+                    ]
+                    out.shop_items = [_make_shop_item("c_mars", "Planet", [1020, 370, 1150, 550])]
+                    out.vouchers = [_make_shop_item("v_overstock", "Voucher", [710, 720, 850, 900])]
+                    out.boosters = []  # Second pack vanished with only 1 Open Pack
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f_idx,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f_idx == 200 else [],
+                )
+                for _, f_idx, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f_idx, ts in frames:
+                flds = list((fields_by_frame or {}).get(f_idx, ()))
+                vals = {f: None for f in flds}
+                if f_idx in (200, 298):
+                    vals.update({"hud_money": 4, "hud_round_score": 400, "hud_blind_target": 300})
+                elif f_idx in (398, 500):
+                    vals["hud_money"] = 12
+                elif f_idx in (538, 578, 638):
+                    vals["hud_money"] = 10
+                outs.append(HudRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            _, traj, plan = pp._build_run_trajectory_with_plan(
+                d, preloaded_frames=dummy_frames, fps=60.0, expressive=True
+            )
+
+        diag = plan["diagnostics"]
+        unexp = diag["unexpected_shop_transitions"]
+        self.assertEqual(len(unexp), 1)
+        self.assertEqual(unexp[0]["frame"], 640)
+        self.assertIn("packs_lost=", unexp[0]["reasons"][0])
+
+        nr_step = next(dl for dl in traj.deltas[1:] if dl.action and dl.action.frame_idx == 640)
+        self.assertIn("unexpected_shop_transition", nr_step.action.metadata)
+        self.assertFalse(nr_step.action.metadata.get("corrupted", False))
+
 
 if __name__ == "__main__":
     unittest.main()

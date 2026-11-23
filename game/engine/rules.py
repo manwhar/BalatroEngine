@@ -258,14 +258,21 @@ def trigger_end_of_round_effects(state, action: Action | None = None) -> None:
 
     if getattr(state, "rng", None):
         sdeck = SimDeck(state.full_deck)
-        state.ancient_suit = get_ancient_joker_suit(
-            state.rng, ante=state.ante, current_suit=state.ancient_suit
+        # balatro_source/functions/state_events.lua:248-276 runs ease_ante(1) on Boss Blinds
+        # before resetting Idol, Mail-In Rebate, Ancient Joker, and Castle targets.
+        target_ante = (
+            state.ante + 1
+            if state.current_blind not in (BlindName.SMALL, BlindName.BIG)
+            else state.ante
         )
-        idol_target = get_idol_card(state.rng, sdeck, ante=state.ante)
+        state.ancient_suit = get_ancient_joker_suit(
+            state.rng, ante=target_ante, current_suit=state.ancient_suit
+        )
+        idol_target = get_idol_card(state.rng, sdeck, ante=target_ante)
         state.idol_card = (idol_target.rank, idol_target.suit)
-        state.castle_suit = get_castle_suit(state.rng, sdeck, ante=state.ante)
+        state.castle_suit = get_castle_suit(state.rng, sdeck, ante=target_ante)
         state.mail_card_rank = get_mail_in_rebate_target(
-            state.rng, sdeck, ante=state.ante
+            state.rng, sdeck, ante=target_ante
         )
 
     ctx = TriggerContext(

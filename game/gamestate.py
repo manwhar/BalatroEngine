@@ -197,6 +197,17 @@ def _cards_match(a: PlayingCard, b: PlayingCard) -> bool:
         return True
     if a.id and b.id and a.id == b.id:
         return True
+    if (
+        a.enhancement == Enhancement.STONE
+        and b.enhancement == Enhancement.STONE
+        and (
+            a.rank == Rank.NONE
+            or a.suit == Suit.NONE
+            or b.rank == Rank.NONE
+            or b.suit == Suit.NONE
+        )
+    ):
+        return a.edition == b.edition and a.seal == b.seal
     return (
         a.rank == b.rank
         and a.suit == b.suit
@@ -420,6 +431,35 @@ class GameState:
 
         if self.seed and self.boss_blind is None:
             self.roll_boss_blind(is_reroll=False)
+
+        if self.seed and self.rng is not None and self.apply_deck_stake_on_init and self.full_deck:
+            try:
+                from game.engine.rng_sim.events import (
+                    Deck as SimDeck,
+                    get_ancient_joker_suit,
+                    get_castle_suit,
+                    get_idol_card,
+                    get_mail_in_rebate_target,
+                )
+            except ImportError:
+                from engine.rng_sim.events import (
+                    Deck as SimDeck,
+                    get_ancient_joker_suit,
+                    get_castle_suit,
+                    get_idol_card,
+                    get_mail_in_rebate_target,
+                )
+            sdeck = SimDeck(self.full_deck)
+            idol_target = get_idol_card(self.rng, sdeck, ante=self.ante)
+            self.idol_card = (idol_target.rank, idol_target.suit)
+            self.mail_card_rank = get_mail_in_rebate_target(
+                self.rng, sdeck, ante=self.ante
+            )
+            # game.lua:2387 sets ancient_card.suit = nil before reset_ancient_card() on run start
+            self.ancient_suit = get_ancient_joker_suit(
+                self.rng, ante=self.ante, current_suit=None
+            )
+            self.castle_suit = get_castle_suit(self.rng, sdeck, ante=self.ante)
 
         if self.target_chips is None:
             self.target_chips = self.compute_target_chips()
@@ -929,9 +969,9 @@ class GameState:
 
     def add_card_to_deck(self, card: PlayingCard, add_to_hand: bool = False) -> None:
         """Adds a card to the run's full deck (and optionally hand) and triggers Hologram."""
-        if card.id == 0:
-            max_id = max((c.id for c in self.full_deck), default=0)
-            card.id = max_id + 1
+        existing_ids = {c.id for c in self.full_deck}
+        if card.id == 0 or card.id in existing_ids:
+            card.id = max(existing_ids, default=0) + 1
         self.full_deck.append(card)
         self.deck_cards_count = len(self.full_deck)
         if add_to_hand:

@@ -141,25 +141,14 @@ def extract_video_frames(
 ) -> dict[int, np.ndarray]:
     """Extracts specific BGR frames in one pass over a video file.
 
-    Uses `decord.VideoReader` when available for faster C++ seeking/batching,
-    falling back to `cv2.VideoCapture` with `cap.grab()` for intra-GOP steps.
+    Uses `cv2.VideoCapture` with `cap.grab()` for intra-GOP steps (matching `main.py`
+    frame-for-frame; `decord.VideoReader` exhibits H.264 Open-GOP seeking drift on
+    YouTube MP4s and is intentionally bypassed).
     Returns `{requested_frame_idx: bgr_ndarray}`.
     """
     requested = sorted({int(idx) for idx in frame_indices})
     if not requested:
         return {}
-
-    try:
-        return _extract_video_frames_decord(
-            video_path,
-            requested,
-            progress_callback=progress_callback,
-        )
-    except ImportError:
-        pass
-    except Exception:
-        # Fall back to OpenCV if decord cannot open/decode this container/codec.
-        pass
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():

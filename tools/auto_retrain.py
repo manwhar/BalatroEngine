@@ -8,6 +8,7 @@ then automatically launches the end-to-end retraining pipeline:
 Supported Models:
     --model shop   (default: monitors dataset_shop/images, trains shop_classifier)
     --model card   (monitors dataset/images, trains card_classifier)
+    --model deck   (monitors dataset_deck/images, trains deck_classifier + card_classifier Stage 2)
     --model both   (monitors dataset_shop/images, trains shop_classifier AND card_classifier)
     --model auto   (detects active generation directory automatically)
 
@@ -15,6 +16,7 @@ Usage:
     python tools/auto_retrain.py
     python tools/auto_retrain.py --model shop --target 10000 --interval 5
     python tools/auto_retrain.py --model card --target 10000
+    python tools/auto_retrain.py --model deck --target 2500
     python tools/auto_retrain.py --model both --clean-shop --target 10000
 """
 
@@ -41,6 +43,18 @@ def format_elapsed(seconds: float) -> str:
     return f"{m:02d}m {s:02d}s"
 
 
+def _latest_image_mtime(dirs: list[Path]) -> float:
+    latest = 0.0
+    for d in dirs:
+        if d.exists():
+            for p in d.iterdir():
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg"):
+                    mt = p.stat().st_mtime
+                    if mt > latest:
+                        latest = mt
+    return latest
+
+
 def resolve_images_directory(model_type: str = "shop") -> tuple[Path, str, Path]:
     """
     Finds the active dataset images directory, model name, and train script.
@@ -48,21 +62,23 @@ def resolve_images_directory(model_type: str = "shop") -> tuple[Path, str, Path]
     """
     if model_type == "auto":
         # Check which directory has newly growing files
-        shop_appdata = APPDATA_MOD_DIR / "dataset_shop" / "images"
-        shop_repo = REPO_MOD_DIR / "dataset_shop" / "images"
-        card_appdata = APPDATA_MOD_DIR / "dataset" / "images"
-        card_repo = REPO_MOD_DIR / "dataset" / "images"
+        shop_dirs = [APPDATA_MOD_DIR / "dataset_shop" / "images", REPO_MOD_DIR / "dataset_shop" / "images"]
+        card_dirs = [APPDATA_MOD_DIR / "dataset" / "images", REPO_MOD_DIR / "dataset" / "images"]
+        deck_dirs = [APPDATA_MOD_DIR / "dataset_deck" / "images", REPO_MOD_DIR / "dataset_deck" / "images"]
 
-        shop_count = (len(list(shop_appdata.glob("*.png"))) if shop_appdata.exists() else 0) + \
-                     (len(list(shop_repo.glob("*.png"))) if shop_repo.exists() else 0)
-        card_count = (len(list(card_appdata.glob("*.png"))) if card_appdata.exists() else 0) + \
-                     (len(list(card_repo.glob("*.png"))) if card_repo.exists() else 0)
-
-        model_type = "shop" if shop_count >= card_count else "card"
+        candidates = [
+            ("shop", _latest_image_mtime(shop_dirs)),
+            ("card", _latest_image_mtime(card_dirs)),
+            ("deck", _latest_image_mtime(deck_dirs)),
+        ]
+        model_type = max(candidates, key=lambda item: item[1])[0]
 
     if model_type in ("shop", "both"):
         folder_name = "dataset_shop"
         train_script = ROOT_DIR / "classifiers" / "shop_classifier" / "train.py"
+    elif model_type == "deck":
+        folder_name = "dataset_deck"
+        train_script = ROOT_DIR / "classifiers" / "deck_classifier" / "train.py"
     else:
         folder_name = "dataset"
         train_script = ROOT_DIR / "classifiers" / "card_classifier" / "train.py"
@@ -199,6 +215,34 @@ def clean_shop_datasets():
     print("=" * 70 + "\n")
 
 
+def clean_deck_datasets():
+    """
+    Deletes old View Deck dataset output directories (preserving hand card and shop
+    datasets) so deck frames can be regenerated cleanly with updated ROIs.
+    """
+    targets = [
+        APPDATA_MOD_DIR / "dataset_deck",
+        REPO_MOD_DIR / "dataset_deck",
+        ROOT_DIR / "classifiers" / "deck_classifier" / "dataset",
+        ROOT_DIR / "classifiers" / "card_classifier" / "dataset" / "deck_frames",
+    ]
+    print("\n" + "=" * 70)
+    print("CLEANING OLD VIEW DECK DATASETS (PRESERVING HAND CARD & SHOP DATA)")
+    print("=" * 70)
+    for target in targets:
+        if target.exists():
+            print(f"Removing: {target}")
+            shutil.rmtree(target)
+        else:
+            print(f"Already clean: {target}")
+    for sub in [
+        APPDATA_MOD_DIR / "dataset_deck" / "images",
+        APPDATA_MOD_DIR / "dataset_deck" / "labels",
+    ]:
+        sub.mkdir(parents=True, exist_ok=True)
+    print("=" * 70 + "\n")
+
+
 def launch_training(
     train_script: Path,
     model_type: str,
@@ -238,18 +282,22 @@ def launch_training(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wait for dataset generation and trigger retraining")
-    parser.add_argument("--model", type=str, default="shop", choices=["shop", "card", "both", "auto"], help="Model(s) to train (default: shop)")
+    parser.add_argument("--model", type=str, default="shop", choices=["shop", "card", "deck", "both", "auto"], help="Model(s) to train (default: shop)")
     parser.add_argument("--target", type=int, default=10000, help="Target image count (default: 10000)")
     parser.add_argument("--interval", type=int, default=5, help="Poll interval in seconds (default: 5)")
     parser.add_argument("--epochs-detector", type=int, default=15, help="Stage 1 detector epochs (default: 15)")
     parser.add_argument("--epochs-classifier", type=int, default=15, help="Stage 2 classifier epochs (default: 15)")
     parser.add_argument("--clean-shop", action="store_true", help="Delete existing shop & shop_crops datasets before monitoring/syncing (preserves hand card dataset)")
+    parser.add_argument("--clean-deck", action="store_true", help="Delete existing View Deck datasets before monitoring/syncing (preserves hand card & shop datasets)")
     parser.add_argument("--shop-stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Training stage for shop_classifier (default: all)")
     parser.add_argument("--card-stage", type=str, default=None, choices=["all", "detector", "classifier"], help="Training stage for card_classifier (default: classifier when --model both, else all)")
+    parser.add_argument("--deck-stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Training stage for deck_classifier (default: all)")
     args = parser.parse_args()
 
     if args.clean_shop:
         clean_shop_datasets()
+    if args.clean_deck:
+        clean_deck_datasets()
 
     images_dir, model_type, train_script = resolve_images_directory(args.model)
     wait_for_images(images_dir, model_type, target_count=args.target, check_interval=args.interval)
@@ -276,8 +324,15 @@ if __name__ == "__main__":
             clean_sync=False,
         )
     else:
-        stage = args.shop_stage if model_type == "shop" else (args.card_stage or "all")
-        clean_sync = args.clean_shop if model_type == "shop" else False
+        if model_type == "shop":
+            stage = args.shop_stage
+            clean_sync = args.clean_shop
+        elif model_type == "deck":
+            stage = args.deck_stage
+            clean_sync = args.clean_deck
+        else:
+            stage = args.card_stage or "all"
+            clean_sync = False
         launch_training(
             train_script,
             model_type,

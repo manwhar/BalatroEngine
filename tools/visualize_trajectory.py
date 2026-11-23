@@ -1687,6 +1687,8 @@ def build_visualization_payload(
                 "diff": step_diff,
             }
         )
+        act_meta = (act_dict.get("metadata") or {}) if act_dict else {}
+        warn_reasons = list(act_meta.get("corruption_reasons") or [])
         run_stats.append(
             {
                 "step_idx": snap["step_idx"],
@@ -1701,6 +1703,8 @@ def build_visualization_payload(
                 "joker_count": len(snap["jokers"]),
                 "action_type": act_dict["type"] if act_dict else "Init",
                 "has_changes": step_diff["has_changes"],
+                "corrupted": bool(act_meta.get("corrupted")) or bool(warn_reasons),
+                "warning_reasons": warn_reasons,
             }
         )
         prev_raw_state = raw_state
@@ -2753,7 +2757,7 @@ def _render_html_page() -> str:
 
   .app-shell {
     display: grid;
-    grid-template-rows: auto 1fr 64px;
+    grid-template-rows: auto 1fr auto;
     height: 100vh;
     width: 100vw;
   }
@@ -3021,6 +3025,17 @@ def _render_html_page() -> str:
     background: #101622; border-top: 1px solid var(--border);
     padding: 4px 12px; display: flex; flex-direction: column; justify-content: center; gap: 3px;
   }
+  .diag-track {
+    position: relative; height: 11px; background: #080c13; border: 1px solid var(--border);
+    border-radius: 3px; cursor: pointer; display: flex; align-items: stretch; overflow: hidden;
+  }
+  .diag-tick {
+    position: relative; flex: 1; height: 100%; min-width: 1px; border-right: 1px solid rgba(0,0,0,0.25);
+    display: flex; flex-direction: column;
+  }
+  .diag-seg-err { flex: 1; width: 100%; background: #ef4444; box-shadow: 0 0 4px rgba(239, 68, 68, 0.85); }
+  .diag-seg-warn { flex: 1; width: 100%; background: #f97316; box-shadow: 0 0 4px rgba(249, 115, 22, 0.75); }
+  .diag-seg-cascade { flex: 1; width: 100%; background: rgba(249, 115, 22, 0.32); }
   .scrubber-track {
     position: relative; height: 24px; background: #0a0e16; border: 1px solid var(--border);
     border-radius: 4px; cursor: pointer; display: flex; align-items: flex-end; overflow: hidden;
@@ -3185,11 +3200,13 @@ def _render_html_page() -> str:
 
   <!-- BOTTOM SCRUB TIMELINE -->
   <footer class="timeline-bar">
+    <div id="diagTrack" class="diag-track" title="Errors (red) &amp; Expressive Warnings (orange)"></div>
     <div id="scrubberTrack" class="scrubber-track"></div>
     <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--muted);">
       <span id="timelineHoverInfo">Hover or drag timeline to scrub steps &nbsp;|&nbsp; Shortcuts: &larr;/&rarr; Step, [ / ] Err, V Video, Space Play, D Deck, 1-5 Tabs</span>
       <span id="timelineLocationLegend">
         <span id="legendErrItem" style="color:#ef4444; display:none;">&#9632; Test Error &nbsp;</span>
+        <span id="legendWarnItem" style="color:#f97316; display:none;">&#9632; Warning &nbsp;</span>
         <span style="color:#60a5fa;">&#9632; Blind</span> &nbsp;
         <span style="color:#f59e0b;">&#9632; Shop</span> &nbsp;
         <span style="color:#c084fc;">&#9632; Pack</span> &nbsp;
@@ -4264,24 +4281,42 @@ function renderActiveTab(step) {
 function renderScrubber() {
   const stats = APP.payload?.run_stats || [];
   const track = document.getElementById("scrubberTrack");
+  const diagTrack = document.getElementById("diagTrack");
+  const legendWarn = document.getElementById("legendWarnItem");
   const colors = { blind: "#3b82f6", shop: "#f59e0b", pack: "#c084fc", select: "#22c55e" };
   const errSet = new Set(getErrorStepIndices());
   let html = "";
+  let diagHtml = "";
+  let hasAnyWarn = false;
   let lastAnte = null;
   for (let i = 0; i < stats.length; i++) {
     const r = stats[i];
     const hPct = r.has_changes ? "85%" : "42%";
     const anteBorder = (lastAnte !== null && r.ante !== lastAnte) ? "border-left:2px solid #fff;" : "";
     lastAnte = r.ante;
-    const errMark = errSet.has(i) ? `<div class="scrub-err-mark"></div>` : "";
+    const isErr = errSet.has(i);
+    const reasons = r.warning_reasons || [];
+    const hasDirectWarn = reasons.some(x => x !== "downstream_cascade_quarantine") || (!!r.corrupted && reasons.length === 0);
+    const hasCascadeOnly = !hasDirectWarn && reasons.includes("downstream_cascade_quarantine");
+    if (hasDirectWarn || hasCascadeOnly) hasAnyWarn = true;
+
+    const errMark = isErr ? `<div class="scrub-err-mark"></div>` : "";
     html += `<div class="scrub-tick" data-step="${i}" style="${anteBorder}">
       ${errMark}
       <div class="scrub-tick-bar" style="height:${hPct};background:${colors[r.location] || "#64748b"};opacity:${i === APP.stepIdx ? 1 : 0.72};"></div>
     </div>`;
+
+    let diagSegs = "";
+    if (isErr) diagSegs += `<div class="diag-seg-err"></div>`;
+    if (hasDirectWarn) diagSegs += `<div class="diag-seg-warn"></div>`;
+    else if (hasCascadeOnly) diagSegs += `<div class="diag-seg-cascade"></div>`;
+    diagHtml += `<div class="diag-tick" data-step="${i}" style="${anteBorder}">${diagSegs}</div>`;
   }
   const pctLeft = stats.length > 1 ? (APP.stepIdx / (stats.length - 1)) * 100 : 0;
-  html += `<div class="scrub-playhead" style="left:calc(${pctLeft.toFixed(3)}% - 1.5px);"></div>`;
-  track.innerHTML = html;
+  const playheadHtml = `<div class="scrub-playhead" style="left:calc(${pctLeft.toFixed(3)}% - 1.5px);"></div>`;
+  track.innerHTML = html + playheadHtml;
+  if (diagTrack) diagTrack.innerHTML = diagHtml + playheadHtml;
+  if (legendWarn) legendWarn.style.display = hasAnyWarn ? "inline" : "none";
 }
 
 function openDeckModal() {
@@ -4586,31 +4621,40 @@ async function init() {
     });
   });
 
-  // Timeline click/drag scrub
+  // Timeline click/drag scrub (main bar + stacked diagnostic bar)
   const track = document.getElementById("scrubberTrack");
-  let dragging = false;
-  const scrubFromClientX = (cx) => {
-    const rect = track.getBoundingClientRect();
+  const diagTrackEl = document.getElementById("diagTrack");
+  let activeDragTrack = null;
+  const scrubFromClientX = (cx, el) => {
+    const targetEl = el || track;
+    const rect = targetEl.getBoundingClientRect();
     const frac = Math.max(0, Math.min(1, (cx - rect.left) / Math.max(1, rect.width)));
     const total = APP.payload?.steps?.length || 1;
     goToStep(Math.round(frac * (total - 1)));
   };
-  track.addEventListener("mousedown", e => { dragging = true; scrubFromClientX(e.clientX); });
+  track.addEventListener("mousedown", e => { activeDragTrack = track; scrubFromClientX(e.clientX, track); });
+  if (diagTrackEl) {
+    diagTrackEl.addEventListener("mousedown", e => { activeDragTrack = diagTrackEl; scrubFromClientX(e.clientX, diagTrackEl); });
+  }
   window.addEventListener("mousemove", e => {
-    if (dragging) scrubFromClientX(e.clientX);
-    const tick = e.target?.closest?.(".scrub-tick");
+    if (activeDragTrack) scrubFromClientX(e.clientX, activeDragTrack);
+    const tick = e.target?.closest?.(".scrub-tick, .diag-tick");
     if (tick) {
       const sIdx = Number(tick.dataset.step);
       const r = APP.payload?.run_stats?.[sIdx];
       if (r) {
         const discs = getStepDiscrepancies(sIdx);
         const errText = discs.length ? `  |  ✕ ${discs.length} error(s): ${discs[0].message}` : "";
+        const warnReasons = r.warning_reasons || [];
+        const warnText = warnReasons.length
+          ? `  |  ⚠ Warning: ${warnReasons.join(", ")}`
+          : (r.corrupted ? "  |  ⚠ Warning: corrupted" : "");
         document.getElementById("timelineHoverInfo").textContent =
-          `Step ${r.step_idx} | Frame ${r.frame_idx} | ${r.action_type} | Ante ${r.ante} R${r.round} | $${r.money ?? "—"}${errText}`;
+          `Step ${r.step_idx} | Frame ${r.frame_idx} | ${r.action_type} | Ante ${r.ante} R${r.round} | $${r.money ?? "—"}${errText}${warnText}`;
       }
     }
   });
-  window.addEventListener("mouseup", () => { dragging = false; });
+  window.addEventListener("mouseup", () => { activeDragTrack = null; });
 
   // Deck Modal & Hover Inspector
   document.getElementById("btnDeckModal").addEventListener("click", openDeckModal);

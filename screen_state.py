@@ -232,6 +232,13 @@ class ScreenStateTracker:
             self.pre_pack_location = None
         return self.state
 
+    def on_pack_possibly_opened(self) -> CoarseScreenState:
+        """Widens SHOP -> PACK_OR_SHOP when a missed Open Pack may have entered a pack."""
+        if self.state == CoarseScreenState.SHOP:
+            self.pre_pack_location = Location.SHOP
+            self.state = CoarseScreenState.PACK_OR_SHOP
+        return self.state
+
     def on_template_clicked(
         self, template_name: str, frame_idx: int | None = None
     ) -> CoarseScreenState:

@@ -3293,6 +3293,83 @@ class TestNewEngineFeatures(unittest.TestCase):
         select_pressed[0, :] = 28
         self.assertFalse(analyze_shadow_presence(select_pressed, threshold=52.0))
 
+        # 3. 7-row pressed Open Pack strip with 1px dark bevel ([41, 58, 55...]) -> no shadow
+        open_pack_pressed = np.full((7, 60), 55, dtype=np.uint8)
+        open_pack_pressed[0, :] = 41
+        open_pack_pressed[1, :] = 58
+        self.assertFalse(analyze_shadow_presence(open_pack_pressed, threshold=52.0))
+
+        # 4. 4-row unpressed Sort by Rank strip ([58, 33, 33, 35]) -> shadow still detected
+        sort_rank_unpressed = np.full((4, 60), 33, dtype=np.uint8)
+        sort_rank_unpressed[0, :] = 58
+        sort_rank_unpressed[3, :] = 35
+        self.assertTrue(analyze_shadow_presence(sort_rank_unpressed, threshold=52.0))
+
+    def test_eval_template_luminance_gate(self):
+        import cv2
+        import numpy as np
+        from config import Config
+        import eval_template
+        from geometry import ImageSize, NormalizedROI, PixelROI
+        from template import Template
+
+        # Build a non-uniform 24x32 template with button interior luma ~80 and white text border
+        tpl_bgr = np.full((24, 32, 3), 80, dtype=np.uint8)
+        tpl_bgr[6:18, 8:24] = 200
+        tpl_bgr[8:16, 10:22] = 80
+        tpl_gray = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+        mask = np.full((24, 32), 255, dtype=np.uint8)
+        tmpl = Template(
+            name="Test Button",
+            filenames=["test.png"],
+            norm_rois=[NormalizedROI(0.05, 0.05, 0.95, 0.95)],
+            px_rois=[PixelROI(1, 1, 119, 79)],
+            images=[np.dstack([tpl_bgr, mask])],
+            images_gray=[tpl_gray],
+            masks=[mask],
+            shadow_dy=0,
+            shadow_dw=0,
+            shadow_dh=0,
+            adjusted=True,
+        )
+
+        def _make_scene(scale: float) -> tuple[np.ndarray, np.ndarray]:
+            img = np.full((80, 120, 3), 25, dtype=np.uint8)
+            patch = np.clip(tpl_bgr.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+            img[20:44, 30:62] = patch
+            return img, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        cfg = Config(debug_plot=False, setup_mode=False, elem_conf_thresh=0.90)
+
+        # Bright unhovered match (luma ~135, ratio ~1.69) -> found=True, clicked=False
+        img_bright, gray_bright = _make_scene(135.0 / 80.0)
+        res_bright = eval_template.eval(tmpl, img_bright, gray_bright, cfg)
+        self.assertTrue(res_bright.found)
+        self.assertFalse(res_bright.clicked)
+        self.assertGreater(res_bright.luminance_ratio, 1.50)
+
+        # Dimmed modal match (luma ~40, ratio ~0.50) -> found=True, clicked=False
+        img_dim, gray_dim = _make_scene(40.0 / 80.0)
+        res_dim = eval_template.eval(tmpl, img_dim, gray_dim, cfg)
+        self.assertTrue(res_dim.found)
+        self.assertFalse(res_dim.clicked)
+        self.assertLess(res_dim.luminance_ratio, 0.60)
+
+        # Normal hovered/pressed match (luma ~84, ratio ~1.05) -> found=True, clicked=True (flat bg)
+        img_ok, gray_ok = _make_scene(84.0 / 80.0)
+        res_ok = eval_template.eval(tmpl, img_ok, gray_ok, cfg)
+        self.assertTrue(res_ok.found)
+        self.assertTrue(res_ok.clicked)
+        self.assertAlmostEqual(res_ok.luminance_ratio, 1.05, delta=0.03)
+
+        # use_luminance_check=False bypasses luminance gate cleanly
+        cfg_off = Config(
+            debug_plot=False, setup_mode=False, elem_conf_thresh=0.90, use_luminance_check=False
+        )
+        res_bypass = eval_template.eval(tmpl, img_bright, gray_bright, cfg_off)
+        self.assertTrue(res_bypass.found)
+        self.assertTrue(res_bypass.clicked)
+
     def test_batch_recognize_hands_passes_pack_hand_roi(self):
         from unittest.mock import MagicMock, patch
         import numpy as np
@@ -3413,6 +3490,138 @@ class TestNewEngineFeatures(unittest.TestCase):
             active_spectrals=get_blocked_card_names(spec_state, CardType.SPECTRAL),
         )
         self.assertNotEqual(alt_spec.name, first_spec)
+
+    def test_initial_round_targets_rolled_on_init_erratic_z1dcpjse(self) -> None:
+        """Game:start_run() rolls idol/mail/ancient/castle on init so Round 1..3 match Balatro."""
+        from game.balatro_models import Action, ActionType, Deck, Rank, Stake
+        from game.engine.rules import on_action
+        from game.gamestate import GameState
+
+        state = GameState(
+            seed="Z1DCPJSE",
+            deck=Deck.ERRATIC_DECK,
+            stake=Stake.GOLD,
+        )
+        # Initial Round 1 (Small Blind) targets rolled at run start
+        self.assertEqual(state.rng.get_channel_call_count("mail1"), 1)
+        self.assertEqual(state.rng.get_channel_call_count("idol1"), 1)
+        self.assertEqual(state.rng.get_channel_call_count("anc1"), 1)
+        self.assertEqual(state.rng.get_channel_call_count("cas1"), 1)
+        self.assertEqual(state.mail_card_rank, Rank.EIGHT)
+        self.assertIsNotNone(state.idol_card)
+        self.assertIsNotNone(state.ancient_suit)
+        self.assertIsNotNone(state.castle_suit)
+
+        # Round 1 -> Round 2 (Big Blind)
+        on_action(state, Action(type=ActionType.SELECT_BLIND))
+        on_action(state, Action(type=ActionType.END_ROUND))
+        self.assertEqual(state.mail_card_rank, Rank.NINE)
+        on_action(state, Action(type=ActionType.CASH_OUT))
+        on_action(state, Action(type=ActionType.NEXT_ROUND))
+
+        # Round 2 -> Round 3 (Boss Blind)
+        on_action(state, Action(type=ActionType.SELECT_BLIND))
+        on_action(state, Action(type=ActionType.END_ROUND))
+        self.assertEqual(state.mail_card_rank, Rank.THREE)
+        on_action(state, Action(type=ActionType.CASH_OUT))
+        on_action(state, Action(type=ActionType.NEXT_ROUND))
+        on_action(state, Action(type=ActionType.SELECT_BLIND))
+        self.assertEqual(state.ante, 1)
+        self.assertEqual(state.round, 3)
+        self.assertEqual(state.mail_card_rank, Rank.THREE)
+
+        # Beat Boss Blind -> Ante 2 Rounds 4, 5, 6 use mail2 #1 (6), #2 (King), #3 (7)
+        on_action(state, Action(type=ActionType.END_ROUND))
+        self.assertEqual(state.mail_card_rank, Rank.SIX)
+        on_action(state, Action(type=ActionType.CASH_OUT))
+        on_action(state, Action(type=ActionType.NEXT_ROUND))
+        self.assertEqual(state.ante, 2)
+        self.assertEqual(state.round, 4)
+
+        on_action(state, Action(type=ActionType.SELECT_BLIND))
+        on_action(state, Action(type=ActionType.END_ROUND))
+        self.assertEqual(state.mail_card_rank, Rank.KING)
+        on_action(state, Action(type=ActionType.CASH_OUT))
+        on_action(state, Action(type=ActionType.NEXT_ROUND))
+        self.assertEqual(state.round, 5)
+
+        on_action(state, Action(type=ActionType.SELECT_BLIND))
+        on_action(state, Action(type=ActionType.END_ROUND))
+        self.assertEqual(state.mail_card_rank, Rank.SEVEN)
+
+    def test_purple_seal_key_stone_match_and_clone_unique_ids(self) -> None:
+        """Purple Seal uses '8ba', Stone cards match rank/suit NONE, and clones get unique IDs."""
+        from game.balatro_models import (
+            Action,
+            ActionType,
+            Edition,
+            Enhancement,
+            Hand,
+            HandCard,
+            Inventory,
+            Joker,
+            JokerName,
+            PlayingCard,
+            Rank,
+            Seal,
+            Spectral,
+            SpectralName,
+            Suit,
+        )
+        from game.engine.rng_sim.events import poll_tarot_pool, predict_purple_seal_tarot
+        from game.engine.rng_sim.rng import BalatroRNG
+        from game.gamestate import GameState, _cards_match, step_simulation
+
+        # 1. Purple Seal uses '8ba' stream (card.lua:2260)
+        rng_a = BalatroRNG("Z1DCPJSE")
+        rng_b = BalatroRNG("Z1DCPJSE")
+        p_tarot = predict_purple_seal_tarot(rng_a, ante=4)
+        e_tarot = poll_tarot_pool(rng_b, ante=4, key_append="8ba")
+        self.assertEqual(p_tarot.key, e_tarot.key)
+        self.assertEqual(p_tarot.tarot_name, e_tarot.tarot_name)
+
+        # 2. Stone cards with Rank.NONE/Suit.NONE match converted Stone cards (checking edition/seal)
+        converted_stone = PlayingCard(
+            rank=Rank.SIX,
+            suit=Suit.CLUBS,
+            enhancement=Enhancement.STONE,
+            edition=Edition.HOLOGRAPHIC,
+            seal=Seal.BLUE,
+        )
+        cv_stone = PlayingCard(
+            rank=Rank.NONE,
+            suit=Suit.NONE,
+            enhancement=Enhancement.STONE,
+            edition=Edition.HOLOGRAPHIC,
+            seal=Seal.BLUE,
+        )
+        cv_stone_diff_seal = PlayingCard(
+            rank=Rank.NONE,
+            suit=Suit.NONE,
+            enhancement=Enhancement.STONE,
+            edition=Edition.HOLOGRAPHIC,
+            seal=Seal.NONE,
+        )
+        self.assertTrue(_cards_match(converted_stone, cv_stone))
+        self.assertTrue(_cards_match(cv_stone, converted_stone))
+        self.assertFalse(_cards_match(converted_stone, cv_stone_diff_seal))
+
+        # 3. DNA and Cryptid assign distinct PlayingCard.id values in full_deck
+        dna = Joker(name=JokerName.DNA)
+        cryptid = Spectral(name=SpectralName.CRYPTID)
+        c1 = PlayingCard(rank=Rank.THREE, suit=Suit.CLUBS, id=2)
+        state = GameState(
+            inventory=Inventory(jokers=[dna], consumables=[cryptid]),
+            hand=Hand(cards=[HandCard(card=c1, selected=True)]),
+        )
+        state, _ = step_simulation(state, Action(type=ActionType.PLAY_HAND))
+        dna_ids = [c.id for c in state.full_deck]
+        self.assertEqual(len(dna_ids), len(set(dna_ids)))
+
+        state.hand.cards[0].selected = True
+        state, _ = step_simulation(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))
+        cryptid_ids = [c.id for c in state.full_deck]
+        self.assertEqual(len(cryptid_ids), len(set(cryptid_ids)))
 
 
 def run_synthetic_test() -> None:

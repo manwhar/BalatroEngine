@@ -179,6 +179,98 @@ class TestScreenStateTracker(unittest.TestCase):
         )
         self.assertEqual(Path(posix_out), Path("outputs") / "balatro_run_2_123456.json")
 
+    def test_on_pack_possibly_opened_widens_shop_and_recovers(self):
+        tracker = ScreenStateTracker()
+        # No-op outside SHOP
+        self.assertEqual(tracker.on_pack_possibly_opened(), CoarseScreenState.PRE_GAME)
+        tracker.on_template_clicked("Select Blind")
+        self.assertEqual(tracker.on_pack_possibly_opened(), CoarseScreenState.BLIND)
+
+        # In SHOP -> widens to PACK_OR_SHOP with pre_pack_location=SHOP and Next Round cooldown preserved
+        tracker.on_template_clicked("Cash Out", frame_idx=200)
+        self.assertEqual(tracker.on_pack_possibly_opened(), CoarseScreenState.PACK_OR_SHOP)
+        self.assertEqual(tracker.pre_pack_location, Location.SHOP)
+        allowed = tracker.allowed_template_names(frame_idx=220)
+        self.assertIn("Select Card", allowed)
+        self.assertIn("Use In Pack", allowed)
+        self.assertIn("Skip Pack", allowed)
+        self.assertNotIn("Next Round", allowed)
+
+        # Clicking a SHOP button narrows PACK_OR_SHOP cleanly back to SHOP
+        self.assertEqual(tracker.on_template_clicked("Buy Card", frame_idx=240), CoarseScreenState.SHOP)
+
+    def test_process_frame_luminance_guards_sell_gap_and_tracks_open_pack_present(self):
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import numpy as np
+
+        from config import Config
+        from eval_template import EvaluationResult
+        from geometry import ImageSize, PixelROI
+        from matcher import TemplateMatch
+
+        vf = SimpleNamespace(
+            index=100,
+            timestamp_seconds=1.67,
+            image=np.zeros((1080, 1920, 3), dtype=np.uint8),
+        )
+        cfg = Config(debug_plot=False, setup_mode=False, coarse_to_fine=False)
+        tmpl_sell = SimpleNamespace(name="Sell Card", shadow_dy=0)
+        tmpl_use = SimpleNamespace(name="Use Consumable", shadow_dy=0)
+        tmpl_open = SimpleNamespace(name="Open Pack", shadow_dy=6)
+        tkey = {"Sell Card": 0, "Use Consumable": 1, "Open Pack": 2}
+        dummy_match = TemplateMatch(
+            found=True,
+            top_left=(1500, 100),
+            confidence=0.96,
+            score_map=None,
+            roi=PixelROI(1, 1, 1920, 1080),
+            template_size=ImageSize(75, 82),
+        )
+
+        def fake_eval(tmpl, img, gray, config, **kwargs):
+            if tmpl.name == "Sell Card":
+                return EvaluationResult(
+                    template_name="Sell Card",
+                    found=True,
+                    match=dummy_match,
+                    clicked=False,
+                    box=(1500, 100, 1575, 182),
+                    luminance_ratio=1.85,
+                )
+            if tmpl.name == "Use Consumable":
+                return EvaluationResult(
+                    template_name="Use Consumable",
+                    found=True,
+                    match=dummy_match,
+                    clicked=False,
+                    box=(1500, 183, 1575, 249),
+                    luminance_ratio=1.70,
+                )
+            return EvaluationResult(
+                template_name="Open Pack",
+                found=True,
+                match=dummy_match,
+                clicked=False,
+                box=(1200, 960, 1290, 1034),
+                luminance_ratio=1.10,
+            )
+
+        with patch.object(main_module, "eval", side_effect=fake_eval):
+            _, _, metrics, clicked, clicked_name = main_module._process_frame(
+                vf,
+                [tmpl_sell, tmpl_use, tmpl_open],
+                tkey,
+                cfg,
+                logging.getLogger(__name__),
+            )
+
+        # Unhovered Sell Card (luminance_ratio=1.85) must NOT be flipped to True even though y1-y0 < 2
+        self.assertIsNone(clicked)
+        self.assertIsNone(clicked_name)
+        self.assertTrue(metrics.get("open_pack_present"))
+
 
 if __name__ == "__main__":
     unittest.main()

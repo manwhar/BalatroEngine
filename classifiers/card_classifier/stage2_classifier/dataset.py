@@ -60,8 +60,76 @@ def get_transforms(is_train: bool = True):
         ])
 
 
+def _select_deck_cards_for_frame(cards: list[dict], max_crops: int | None, rng: random.Random) -> list[dict]:
+    """
+    Subsamples dense View Deck screenshots while preserving rare attributes
+    (editions, seals, enhancements, debuffed, greyed, Stone cards) and unique card combinations.
+    """
+    if max_crops is None or max_crops <= 0 or len(cards) <= max_crops:
+        return list(cards)
+
+    indexed = list(enumerate(cards))
+    rng.shuffle(indexed)
+
+    unique_by_sig: dict[tuple, tuple[int, dict]] = {}
+    for orig_idx, card in indexed:
+        sig = (
+            card.get("rank", "None"),
+            card.get("suit", "None"),
+            card.get("edition", "None"),
+            card.get("enhancement", "None"),
+            card.get("seal", "None"),
+            bool(card.get("debuffed", False)),
+            bool(card.get("greyed", False)),
+        )
+        if sig not in unique_by_sig:
+            unique_by_sig[sig] = (orig_idx, card)
+
+    def _rarity_priority(entry: tuple[int, dict]) -> int:
+        c = entry[1]
+        score = 0
+        if c.get("edition", "None") != "None":
+            score += 8
+        if c.get("seal", "None") != "None":
+            score += 6
+        if c.get("enhancement", "None") != "None":
+            score += 3
+        if bool(c.get("debuffed", False)):
+            score += 4
+        if bool(c.get("greyed", False)):
+            score += 2
+        if c.get("rank", "None") == "Stone":
+            score += 3
+        return -score
+
+    unique_entries = sorted(unique_by_sig.values(), key=_rarity_priority)
+    selected_entries = unique_entries[:max_crops]
+    chosen_indices = {orig_idx for orig_idx, _ in selected_entries}
+
+    if len(selected_entries) < max_crops:
+        for orig_idx, card in indexed:
+            if orig_idx not in chosen_indices:
+                selected_entries.append((orig_idx, card))
+                chosen_indices.add(orig_idx)
+                if len(selected_entries) >= max_crops:
+                    break
+
+    selected_entries.sort(key=lambda item: item[0])
+    return [card for _, card in selected_entries]
+
+
 class CardCropDataset(Dataset):
-    def __init__(self, data_root, split="train", val_ratio=0.20, seed=42, transform=None, cache_in_memory=True, max_cache_gb=12.0):
+    def __init__(
+        self,
+        data_root,
+        split="train",
+        val_ratio=0.20,
+        seed=42,
+        transform=None,
+        cache_in_memory=True,
+        max_cache_gb=12.0,
+        max_deck_crops_per_frame: int | None = 16,
+    ):
         super().__init__()
         self.data_root = Path(data_root)
         self.images_dir = self.data_root / "images"
@@ -69,16 +137,18 @@ class CardCropDataset(Dataset):
         self.is_train = (split == "train")
         self.raw_tensor_mode = (transform is None)
         self.transform = transform
+        self.max_deck_crops_per_frame = max_deck_crops_per_frame
 
-        # 1. Discover all matching frame image & json pairs
-        json_files = sorted(list(self.labels_dir.glob("*.json")))
+        # 1. Discover all matching hand frame image & json pairs
         valid_frames = []
-        for jf in json_files:
-            img_path = self.images_dir / f"{jf.stem}.png"
-            if not img_path.exists():
-                img_path = self.images_dir / f"{jf.stem}.jpg"
-            if img_path.exists():
-                valid_frames.append((img_path, jf))
+        if self.labels_dir.exists() and self.images_dir.exists():
+            json_files = sorted(list(self.labels_dir.glob("*.json")))
+            for jf in json_files:
+                img_path = self.images_dir / f"{jf.stem}.png"
+                if not img_path.exists():
+                    img_path = self.images_dir / f"{jf.stem}.jpg"
+                if img_path.exists():
+                    valid_frames.append((img_path, jf, "hand"))
 
         # Also discover shop & pack playing card crops (from self.data_root / "shop_crops")
         shop_crops_dir = self.data_root / "shop_crops"
@@ -93,28 +163,61 @@ class CardCropDataset(Dataset):
                     if not img_path.exists():
                         img_path = shop_images / f"{jf.stem}.jpg"
                     if img_path.exists():
-                        valid_frames.append((img_path, jf))
+                        valid_frames.append((img_path, jf, "shop"))
 
-        # 2. Split by frame to prevent data leakage between train and val
+        # Discover View Deck frames (from self.data_root / "deck_frames" or fallback "deck_crops")
+        deck_frames = []
+        for deck_sub in ("deck_frames", "deck_crops"):
+            deck_dir = self.data_root / deck_sub
+            if deck_dir.exists():
+                deck_images = deck_dir / "images"
+                deck_labels = deck_dir / "labels_json"
+                if not deck_labels.exists():
+                    deck_labels = deck_dir / "labels"
+                if deck_labels.exists() and deck_images.exists():
+                    for jf in sorted(list(deck_labels.glob("*.json"))):
+                        img_path = deck_images / f"{jf.stem}.png"
+                        if not img_path.exists():
+                            img_path = deck_images / f"{jf.stem}.jpg"
+                        if img_path.exists():
+                            deck_frames.append((img_path, jf, "deck"))
+
+        # 2. Split by frame to prevent data leakage between train and val.
+        # Hand+shop frames use the identical original RNG sequence so splits remain unchanged when deck_frames is absent.
         rng = random.Random(seed)
         shuffled = list(valid_frames)
         rng.shuffle(shuffled)
-        val_count = max(1, int(len(shuffled) * val_ratio))
+        val_count = max(1, int(len(shuffled) * val_ratio)) if shuffled else 0
 
         if split == "train":
             selected_frames = shuffled[val_count:]
         else:
             selected_frames = shuffled[:val_count]
 
+        if deck_frames:
+            deck_rng = random.Random(seed)
+            deck_shuffled = list(deck_frames)
+            deck_rng.shuffle(deck_shuffled)
+            deck_val_count = max(1, int(len(deck_shuffled) * val_ratio))
+            if split == "train":
+                selected_frames.extend(deck_shuffled[deck_val_count:])
+            else:
+                selected_frames.extend(deck_shuffled[:deck_val_count])
+
         # 3. Flatten into individual card crop samples
         self.samples = []
-        for img_path, jf in selected_frames:
+        crop_rng = random.Random(seed + (0 if split == "train" else 10_000))
+        source_counts = {"hand": 0, "shop": 0, "deck": 0}
+        for img_path, jf, source in selected_frames:
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     cards = json.load(f)
+                if source == "deck":
+                    cards = _select_deck_cards_for_frame(cards, self.max_deck_crops_per_frame, crop_rng)
                 for card in cards:
                     self.samples.append({
                         "img_path": img_path,
+                        "source": source,
                         "box_pixel": card["box_pixel"],
                         "rank": card.get("rank", "None"),
                         "suit": card.get("suit", "None"),
@@ -125,10 +228,15 @@ class CardCropDataset(Dataset):
                         "debuffed": card.get("debuffed", False),
                         "face_down": card.get("face_down", False)
                     })
-            except Exception as e:
+                    source_counts[source] = source_counts.get(source, 0) + 1
+            except Exception:
                 continue
 
-        print(f"[{split.upper()}] Loaded {len(self.samples)} card crops across {len(selected_frames)} frames.")
+        self.sample_sources = [s["source"] for s in self.samples]
+        print(
+            f"[{split.upper()}] Loaded {len(self.samples)} card crops across {len(selected_frames)} frames "
+            f"(hand={source_counts['hand']}, shop={source_counts['shop']}, deck={source_counts['deck']})."
+        )
 
         # Precompute contiguous target tensors
         n = len(self.samples)

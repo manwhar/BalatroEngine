@@ -77,6 +77,7 @@ local EndRoundGenModule     = load_submodule("src/end_round_gen.lua")
 local EndRoundCaptureModule = load_submodule("src/end_round_capture.lua")
 local HudGenModule          = load_submodule("src/hud_gen.lua")
 local SeedGenModule         = load_submodule("src/seed_gen.lua")
+local DeckGenModule         = load_submodule("src/deck_gen.lua")
 local UIModule              = load_submodule("src/ui.lua")
 local RunTracker            = load_submodule("src/run_tracker.lua")
 
@@ -85,6 +86,7 @@ G.DATASET_MOD.EndRoundGen = EndRoundGenModule
 G.DATASET_MOD.EndRoundCapture = EndRoundCaptureModule
 G.DATASET_MOD.HudGen = HudGenModule
 G.DATASET_MOD.SeedGen = SeedGenModule
+G.DATASET_MOD.DeckGen = DeckGenModule
 G.DATASET_MOD.RunTracker = RunTracker
 
 -- Initialize configuration, counters, and directories
@@ -241,6 +243,10 @@ function Card:draw(layer)
                 for _, c in ipairs(G.shop_booster.cards) do
                     if c == self then tracked = true; break end
                 end
+            end
+        elseif mode == 'deck_classifier' then
+            if self.area and self.area.config and self.area.config.view_deck then
+                tracked = true
             end
         end
 

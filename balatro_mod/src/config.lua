@@ -3,7 +3,7 @@
 local Config = {}
 
 local DEFAULT_CONFIG = {
-    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr', 'seed_ocr'
+    mode = 'off', -- 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr', 'seed_ocr', 'deck_classifier'
     calibration_mode = 'setup', -- 'setup' or 'generation'
     max_frames = 20000,
     max_clips = 1000, -- Target clip count cap for end_round_classifier
@@ -33,6 +33,7 @@ local DEFAULT_CONFIG = {
         hud_blind_target = {x = 245.537867, y = 233.218735, w = 253.485902, h = 88.705984},
         seed_win         = {x = 1066.000000, y = 700.000000, w = 173.000000, h = 58.000000},
         seed_game_over   = {x = 1066.000000, y = 660.000000, w = 173.000000, h = 58.000000},
+        view_deck        = {x = 600.000000,  y = 200.000000, w = 1140.000000, h = 660.000000},
     },
     boxes = {
         card             = {w = 0.465890, h = 1.040970, ox = -0.240265, oy = 0.020829},
@@ -41,6 +42,7 @@ local DEFAULT_CONFIG = {
         consumeable_card = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
         voucher_card     = {w = 0.524853, h = 1.052198, ox = -0.230837, oy = -0.024396},
         booster_card     = {w = 1.000000, h = 1.000000, ox = 0.000000,  oy = 0.000000},
+        deck_card        = {w = 0.400000, h = 1.040000, ox = -0.290000, oy = 0.000000},
     }
 }
 
@@ -68,7 +70,7 @@ function Config.init(mod)
     end
 
     mod.selected_target = 'roi_joker_bar'
-    mod.frame_counts = {card = 0, shop = 0, end_round = 0, hud_ocr = 0, seed_ocr = 0}
+    mod.frame_counts = {card = 0, shop = 0, end_round = 0, hud_ocr = 0, seed_ocr = 0, deck = 0}
 
     Config.init_directories()
     mod:load_config()
@@ -94,6 +96,9 @@ function Config.init_directories()
         "Mods/gamestate_dataset_cv/dataset_seed_ocr",
         "Mods/gamestate_dataset_cv/dataset_seed_ocr/images",
         "Mods/gamestate_dataset_cv/dataset_seed_ocr/labels",
+        "Mods/gamestate_dataset_cv/dataset_deck",
+        "Mods/gamestate_dataset_cv/dataset_deck/images",
+        "Mods/gamestate_dataset_cv/dataset_deck/labels",
     }
     for _, dir in ipairs(dirs) do
         love.filesystem.createDirectory(dir)
@@ -182,6 +187,22 @@ function Config.init_frame_counts(mod)
     end
     mod.frame_counts.seed_ocr = max_seed_idx + 1
 
+    -- 6. View Deck dataset frame counter
+    local max_deck_idx = -1
+    local deck_dirs = {"Mods/gamestate_dataset_cv/dataset_deck/images", "Mods/gamestate_dataset_cv/dataset_deck/labels"}
+    for _, dir in ipairs(deck_dirs) do
+        if love.filesystem.getInfo(dir) then
+            for _, f in ipairs(love.filesystem.getDirectoryItems(dir)) do
+                local num = f:match("^frame_(%d+)%.%w+$")
+                if num then
+                    local n = tonumber(num)
+                    if n and n > max_deck_idx then max_deck_idx = n end
+                end
+            end
+        end
+    end
+    mod.frame_counts.deck = max_deck_idx + 1
+
     if mod.config.mode == 'shop_classifier' then
         mod.frame_count = mod.frame_counts.shop
     elseif mod.config.mode == 'end_round_classifier' then
@@ -190,16 +211,19 @@ function Config.init_frame_counts(mod)
         mod.frame_count = mod.frame_counts.hud_ocr
     elseif mod.config.mode == 'seed_ocr' then
         mod.frame_count = mod.frame_counts.seed_ocr
+    elseif mod.config.mode == 'deck_classifier' then
+        mod.frame_count = mod.frame_counts.deck
     else
         mod.frame_count = mod.frame_counts.card
     end
-    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d, EndRound Clips: %d, HUD OCR: %d, Seed OCR: %d", mod.frame_counts.card, mod.frame_counts.shop, mod.frame_counts.end_round, mod.frame_counts.hud_ocr, mod.frame_counts.seed_ocr))
+    print(string.format("DATASET: Initialized counters - Card: %d, Shop: %d, EndRound Clips: %d, HUD OCR: %d, Seed OCR: %d, Deck: %d", mod.frame_counts.card, mod.frame_counts.shop, mod.frame_counts.end_round, mod.frame_counts.hud_ocr, mod.frame_counts.seed_ocr, mod.frame_counts.deck))
 end
 
 function Config.init_classes(mod)
     local shop_classes_path = "Mods/gamestate_dataset_cv/dataset_shop/classes.txt"
     local shop_classes = "Joker\nTarot\nSpectral\nPlanet\nVoucher\nBooster\nPlayingCard\n"
     love.filesystem.write(shop_classes_path, shop_classes)
+    love.filesystem.write("Mods/gamestate_dataset_cv/dataset_deck/classes.txt", "card\n")
 end
 
 function Config.clear_all_dataset_data(mod)
@@ -214,6 +238,8 @@ function Config.clear_all_dataset_data(mod)
         "Mods/gamestate_dataset_cv/dataset_hud_ocr/labels",
         "Mods/gamestate_dataset_cv/dataset_seed_ocr/images",
         "Mods/gamestate_dataset_cv/dataset_seed_ocr/labels",
+        "Mods/gamestate_dataset_cv/dataset_deck/images",
+        "Mods/gamestate_dataset_cv/dataset_deck/labels",
     }
     local removed_count = 0
     for _, dir in ipairs(dirs) do
@@ -254,9 +280,10 @@ function Config.clear_all_dataset_data(mod)
     mod.frame_counts.end_round = 0
     mod.frame_counts.hud_ocr = 0
     mod.frame_counts.seed_ocr = 0
+    mod.frame_counts.deck = 0
     mod.frame_count = 0
     mod.phase_step = 0
-    mod.stats_text = string.format("Card: 0  |  Shop: 0  |  EndRound Clips: 0  |  Phase: %s",
+    mod.stats_text = string.format("Card: 0  |  Shop: 0  |  Deck: 0  |  EndRound Clips: 0  |  Phase: %s",
         string.upper(mod.shop_phase or 'shop'))
 
     print(string.format("DATASET: Cleared %d files from dataset directories.", removed_count))
@@ -370,7 +397,7 @@ function G.DATASET_MOD:load_config(preserve_mode)
 end
 
 function G.DATASET_MOD:set_mode(mode)
-    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'hud_ocr' or mode == 'seed_ocr' or mode == 'off' then
+    if mode == 'card_classifier' or mode == 'shop_classifier' or mode == 'end_round_classifier' or mode == 'hud_ocr' or mode == 'seed_ocr' or mode == 'deck_classifier' or mode == 'off' then
         if mode ~= self.config.mode then
             self.config.calibration_mode = 'setup'
             self.state = 'idle'
@@ -380,6 +407,9 @@ function G.DATASET_MOD:set_mode(mode)
         end
         if mode ~= 'seed_ocr' and self.cleanup_seed_overlay then
             self:cleanup_seed_overlay()
+        end
+        if mode ~= 'deck_classifier' and self.cleanup_deck_overlay then
+            self:cleanup_deck_overlay(true)
         end
         if mode ~= 'end_round_classifier' and self.EndRoundCapture then
             if self._active_end_round_clip then
@@ -403,6 +433,9 @@ function G.DATASET_MOD:set_mode(mode)
         elseif mode == 'seed_ocr' then
             self.selected_target = 'roi_seed_win'
             self.frame_count = self.frame_counts.seed_ocr
+        elseif mode == 'deck_classifier' then
+            self.selected_target = 'roi_view_deck'
+            self.frame_count = self.frame_counts.deck
         end
         print("DATASET: Mode set to " .. tostring(mode))
     end

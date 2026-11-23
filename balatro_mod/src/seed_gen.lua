@@ -108,6 +108,11 @@ function G.DATASET_MOD:cleanup_seed_overlay()
             G.ROOM.jiggle = 0
         end
     end
+    if self.ShopGen and self.ShopGen.cleanup_cycle then
+        self.ShopGen.cleanup_cycle()
+    else
+        collectgarbage("collect")
+    end
 end
 
 local function randomize_round_scores_for_modal()
@@ -174,9 +179,9 @@ function G.DATASET_MOD:setup_seed_screen(phase_override)
 
     randomize_round_scores_for_modal()
 
-    -- ~10% negative/empty examples: either no overlay or off-screen mid-slide modal
+    -- ~10% negative/empty examples: background only (no modal overlay)
     local negative_roll = math.random()
-    if negative_roll < 0.06 then
+    if negative_roll < 0.10 then
         self.seed_corrupted = true
         return true
     end
@@ -211,14 +216,8 @@ function G.DATASET_MOD:setup_seed_screen(phase_override)
 
     G.OVERLAY_MENU = box
     G.SETTINGS.paused = true
-    if negative_roll < 0.10 then
-        -- Simulate modal mid-slide vertically out of the crop ROI -> ground truth ""
-        self.seed_corrupted = true
-        G.OVERLAY_MENU.alignment.offset.y = (math.random() < 0.5 and -1 or 1) * (4.5 + math.random() * 4.5)
-    else
-        self.seed_corrupted = false
-        G.OVERLAY_MENU.alignment.offset.y = 0
-    end
+    self.seed_corrupted = false
+    G.OVERLAY_MENU.alignment.offset.y = 0
     if G.OVERLAY_MENU.align_to_major then
         pcall(G.OVERLAY_MENU.align_to_major, G.OVERLAY_MENU)
     end

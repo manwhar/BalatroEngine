@@ -151,7 +151,7 @@ def train_seed_ocr(args: argparse.Namespace) -> Path:
             mod_dir, split="train", seed=args.seed, augment=True
         )
         mod_val = ModSeedOcrDataset(
-            mod_dir, split="val", seed=args.seed, augment=True
+            mod_dir, split="val", seed=args.seed, augment=False
         )
         datasets_train.append(mod_train)
         if len(mod_val) > 0:

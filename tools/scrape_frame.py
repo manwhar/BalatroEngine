@@ -25,20 +25,20 @@ VIDEOS_TO_DOWNLOAD = {
 }
 
 # Download settings
-DOWNLOAD_VIDEOS = True
+DOWNLOAD_VIDEOS = False
 DOWNLOAD_VIDEO = DOWNLOAD_VIDEOS  # Alias for backward compatibility
 DELAY_BETWEEN_DOWNLOADS = (
     2.0  # Seconds to wait between downloads to avoid rate limiting
 )
 
 # Frame scraping settings (if needed)
-DOWNLOAD_FRAME = False
+DOWNLOAD_FRAME = True
 FRAME_VIDEO_URL = "https://www.youtube.com/watch?v=FyVXc7DaeqE"
-FRAME_TIMESTAMP = "00:01:23.500"
-FRAME_FILENAME = "scraped_frame.jpg"
+FRAME_TIMESTAMP = "00:19:55.000"
+FRAME_FILENAME = "full_deck_blind.jpg"
 
 SCRIPT_DIR = Path(__file__).parent
-FRAME_OUTPUT_DIR = SCRIPT_DIR.parent / "assets" / "sample_inputs" / "scraped_frames"
+FRAME_OUTPUT_DIR = SCRIPT_DIR.parent / "assets" / "sample_inputs"
 VIDEO_OUTPUT_DIR = SCRIPT_DIR.parent / "assets" / "sample_inputs" / "videos"
 
 

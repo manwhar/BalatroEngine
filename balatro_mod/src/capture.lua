@@ -97,6 +97,9 @@ function G.DATASET_MOD:calculate_boxes_for_card(card, draw_args)
     elseif card.area == G.shop_booster then
         box_def = self.config.boxes.booster_card or {w = 1.0, h = 1.0, ox = 0.0, oy = 0.0}
         box_name = "booster_card"
+    elseif card.area and card.area.config and card.area.config.view_deck then
+        box_def = self.config.boxes.deck_card or {w = 0.400000, h = 1.040000, ox = -0.290000, oy = 0.000000}
+        box_name = "deck_card"
     else
         box_def = self.config.boxes.card
         box_name = "card"
@@ -674,6 +677,196 @@ function G.DATASET_MOD:capture_frame_seed()
         self.state = 'idle'
         self.capture_flash = 0.5
         self.capture_flash_text = string.format("SEED FRAME %05d SAVED (%s | %s)!", current_frame, string.upper(phase), seed_label ~= "" and seed_label or "<EMPTY>")
+        if self.ShopGen and self.ShopGen.cleanup_cycle then
+            self.ShopGen.cleanup_cycle()
+        else
+            collectgarbage("collect")
+        end
+    end)
+end
+
+-- ==========================================
+-- VIEW DECK CLASSIFIER CAPTURE & EXPORT
+-- ==========================================
+local function get_view_deck_areas(mod)
+    if mod and mod.DeckGen and mod.DeckGen.get_active_deck_areas then
+        return mod.DeckGen.get_active_deck_areas(mod)
+    end
+    local areas = {}
+    if G and G.I and G.I.CARDAREA then
+        for _, area in ipairs(G.I.CARDAREA) do
+            if area and area.config and area.config.view_deck and not area.REMOVED and not area.removed and area.cards then
+                table.insert(areas, area)
+            end
+        end
+    end
+    table.sort(areas, function(a, b)
+        local ay = (a.VT and a.VT.y) or (a.T and a.T.y) or 0
+        local by = (b.VT and b.VT.y) or (b.T and b.T.y) or 0
+        return ay < by
+    end)
+    return areas
+end
+
+function G.DATASET_MOD:save_labels_deck(frame_num)
+    local roi = (self.config and self.config.rois and self.config.rois.view_deck) or {x = 600, y = 200, w = 1140, h = 660}
+    local areas = get_view_deck_areas(self)
+    local yolo_labels = {}
+    local json_cards = {}
+    local card_idx = 0
+
+    for _, area in ipairs(areas) do
+        local row_cards = {}
+        for _, card in ipairs(area.cards) do
+            local box_data = self.captured_boxes and self.captured_boxes[card]
+            if box_data and box_data.aabb then
+                local min_x, min_y, bw, bh = box_data.aabb[1], box_data.aabb[2], box_data.aabb[3], box_data.aabb[4]
+                local clamped = {clamp_aabb_to_roi(roi, min_x, min_y, bw, bh)}
+                if clamped[1] then
+                    table.insert(row_cards, {
+                        card = card,
+                        aabb_x = min_x,
+                        clamped = clamped,
+                    })
+                end
+            end
+        end
+
+        table.sort(row_cards, function(a, b)
+            if a.aabb_x ~= b.aabb_x then
+                return a.aabb_x < b.aabb_x
+            end
+            return a.clamped[1] < b.clamped[1]
+        end)
+
+        for _, entry in ipairs(row_cards) do
+            card_idx = card_idx + 1
+            local card = entry.card
+            local clamped = entry.clamped
+            local nx, ny, nw, nh = to_yolo(roi, clamped[1], clamped[2], clamped[3], clamped[4])
+
+            table.insert(yolo_labels, string.format("0 %.6f %.6f %.6f %.6f", nx, ny, nw, nh))
+
+            local is_face_down = (card.facing == 'back' or card.sprite_facing == 'back')
+            local row_suit = (card.base and tostring(card.base.suit or "None")) or "None"
+            local rank = "None"
+            local suit = "None"
+            local edition = "None"
+            local enhancement = "None"
+            local seal = "None"
+            local debuffed = false
+            local greyed = (card.greyed == true)
+
+            if not is_face_down then
+                if card.config and card.config.center and card.config.center.name == "Stone Card" then
+                    rank = "Stone"
+                    suit = "None"
+                    enhancement = "Stone"
+                else
+                    if card.base then
+                        rank = tostring(card.base.value or "None")
+                        suit = tostring(card.base.suit or "None")
+                    end
+                    if card.config and card.config.center and card.config.center.name and card.config.center.name ~= "Default Base" then
+                        enhancement = string.gsub(card.config.center.name, " Card", "")
+                        enhancement = string.gsub(enhancement, " ", "")
+                    end
+                end
+
+                if card.edition then
+                    if card.edition.foil then edition = "Foil"
+                    elseif card.edition.holo then edition = "Holo"
+                    elseif card.edition.polychrome then edition = "Polychrome"
+                    elseif card.edition.negative then edition = "Negative"
+                    end
+                end
+
+                seal = card.seal or "None"
+                debuffed = (card.debuff == true)
+            end
+
+            local card_skin = "None"
+            local is_suit_hc = false
+            local skin_suit = (suit ~= "None") and suit or row_suit
+            if skin_suit ~= "None" and not is_face_down then
+                card_skin = (G.SETTINGS.CUSTOM_DECK and G.SETTINGS.CUSTOM_DECK.Collabs and G.SETTINGS.CUSTOM_DECK.Collabs[skin_suit]) or "default"
+                is_suit_hc = (G.SETTINGS.colour_palettes and G.SETTINGS.colour_palettes[skin_suit] == "hc") or false
+            end
+
+            table.insert(json_cards, string.format(
+                '  {"card_index": %d, "row_suit": "%s", "box_yolo": [%.6f, %.6f, %.6f, %.6f], "box_pixel": [%.1f, %.1f, %.1f, %.1f], "rank": "%s", "suit": "%s", "edition": "%s", "enhancement": "%s", "seal": "%s", "selected": false, "debuffed": %s, "face_down": %s, "greyed": %s, "skin": "%s", "high_contrast": %s}',
+                card_idx, json_escape(row_suit), nx, ny, nw, nh, clamped[1] - roi.x, clamped[2] - roi.y, clamped[3], clamped[4],
+                json_escape(rank), json_escape(suit), json_escape(edition), json_escape(enhancement), json_escape(seal),
+                debuffed and "true" or "false", is_face_down and "true" or "false", greyed and "true" or "false",
+                json_escape(card_skin), is_suit_hc and "true" or "false"
+            ))
+        end
+    end
+
+    local label_path = string.format("Mods/gamestate_dataset_cv/dataset_deck/labels/frame_%05d.txt", frame_num)
+    love.filesystem.write(label_path, table.concat(yolo_labels, "\n"))
+
+    local json_path = string.format("Mods/gamestate_dataset_cv/dataset_deck/labels/frame_%05d.json", frame_num)
+    local json_content = "[\n" .. table.concat(json_cards, ",\n") .. "\n]\n"
+    love.filesystem.write(json_path, json_content)
+
+    return card_idx
+end
+
+function G.DATASET_MOD:capture_frame_deck()
+    self.frame_counts = self.frame_counts or {card = 0, shop = 0, end_round = 0, hud_ocr = 0, seed_ocr = 0, deck = 0}
+    local roi = (self.config and self.config.rois and self.config.rois.view_deck) or {x = 600, y = 200, w = 1140, h = 660}
+    local areas = get_view_deck_areas(self)
+    local box_count = 0
+    for _, area in ipairs(areas) do
+        for _, card in ipairs(area.cards) do
+            local box_data = self.captured_boxes and self.captured_boxes[card]
+            if box_data and box_data.aabb then
+                local min_x, min_y, bw, bh = box_data.aabb[1], box_data.aabb[2], box_data.aabb[3], box_data.aabb[4]
+                local cx = clamp_aabb_to_roi(roi, min_x, min_y, bw, bh)
+                if cx then
+                    box_count = box_count + 1
+                end
+            end
+        end
+    end
+
+    if box_count == 0 then
+        if self.config and self.config.calibration_mode == 'generation' then
+            self.state = 'waiting'
+            self.timer = 0.05
+        else
+            self.state = 'idle'
+            self.capture_flash = 1.5
+            self.capture_flash_text = "OPEN VIEW DECK OR PRESS [R] FIRST!"
+        end
+        return
+    end
+
+    local rw, rh = math.max(1, math.floor(roi.w)), math.max(1, math.floor(roi.h))
+    local rx, ry = math.floor(roi.x), math.floor(roi.y)
+    local current_frame = self.frame_counts.deck or 0
+
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_deck/images")
+    love.filesystem.createDirectory("Mods/gamestate_dataset_cv/dataset_deck/labels")
+
+    love.graphics.captureScreenshot(function(img)
+        local cropped = paste_clamped_region(img, rx, ry, rw, rh)
+        local filedata = cropped:encode("png")
+        local filename = string.format("Mods/gamestate_dataset_cv/dataset_deck/images/frame_%05d.png", current_frame)
+        love.filesystem.write(filename, filedata)
+
+        if filedata and filedata.release then filedata:release() end
+        if cropped and cropped.release then cropped:release() end
+        if img and img.release then img:release() end
+
+        local saved_count = self:save_labels_deck(current_frame)
+        self.frame_counts.deck = current_frame + 1
+        self.frame_count = self.frame_counts.deck
+        self.state = 'idle'
+        self.capture_flash = 0.5
+        self.capture_flash_text = string.format("DECK FRAME %05d SAVED (%d cards)!", current_frame, saved_count or 0)
+
         collectgarbage("step", 200)
     end)
 end
@@ -688,6 +881,8 @@ function G.DATASET_MOD:capture_frame()
         self:capture_frame_hud()
     elseif self.config.mode == 'seed_ocr' then
         self:capture_frame_seed()
+    elseif self.config.mode == 'deck_classifier' then
+        self:capture_frame_deck()
     end
 end
 

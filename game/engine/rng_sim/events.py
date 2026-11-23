@@ -1602,7 +1602,8 @@ def predict_purple_seal_tarot(
     return poll_tarot_pool(
         rng,
         ante=ante,
-        key_append="pur",
+        # balatro_source/card.lua:2260 uses key_append='8ba' for Purple Seal too
+        key_append="8ba",
         active_tarots=active_tarots,
         has_showman=has_showman,
         source_label="Purple Seal",

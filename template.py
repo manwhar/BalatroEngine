@@ -33,6 +33,8 @@ class CompiledTemplateSpec:
     hx2: int
     hy2: int
     can_coarse: bool
+    interior_mask: np.ndarray | None
+    template_median_luma: float
 
 
 @dataclass
@@ -50,6 +52,8 @@ class Template:
     adjusted: bool
     shadow_threshold: float | None = None
     conf_threshold: float | None = None
+    min_luminance_ratio: float | None = None
+    max_luminance_ratio: float | None = None
     _compiled_specs_cache: dict[tuple[int, int, float], tuple[CompiledTemplateSpec, ...]] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -117,6 +121,12 @@ class Template:
                 and (hy2 - hy1) >= im_gray_half.shape[0]
                 and (hx2 - hx1) >= im_gray_half.shape[1]
             )
+            interior_mask = (im_mask > 127) if im_mask is not None else None
+            if interior_mask is not None and np.any(interior_mask):
+                template_median_luma = float(np.median(im_gray[interior_mask]))
+            else:
+                interior_mask = None
+                template_median_luma = float(np.median(im_gray))
 
             specs.append(
                 CompiledTemplateSpec(
@@ -136,6 +146,8 @@ class Template:
                     hx2=hx2,
                     hy2=hy2,
                     can_coarse=can_coarse,
+                    interior_mask=interior_mask,
+                    template_median_luma=template_median_luma,
                 )
             )
 
@@ -179,6 +191,10 @@ def template_loader(
         shadow_threshold = float(raw_thresh) if raw_thresh is not None else None
         raw_conf = data.get("conf_threshold", None)
         conf_threshold = float(raw_conf) if raw_conf is not None else None
+        raw_min_luma = data.get("min_luminance_ratio", None)
+        min_luminance_ratio = float(raw_min_luma) if raw_min_luma is not None else None
+        raw_max_luma = data.get("max_luminance_ratio", None)
+        max_luminance_ratio = float(raw_max_luma) if raw_max_luma is not None else None
         adjusted = data.get("adjusted", False)
 
         images = [
@@ -194,6 +210,24 @@ def template_loader(
             images_gray.append(cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY))
             masks.append(img[:, :, 3] if img.shape[2] == 4 else None)
 
-        templates.append(Template(name, filenames, norm_rois, px_rois, images, images_gray, masks, shadow_dy, shadow_dw, shadow_dh, adjusted, shadow_threshold, conf_threshold))
+        templates.append(
+            Template(
+                name,
+                filenames,
+                norm_rois,
+                px_rois,
+                images,
+                images_gray,
+                masks,
+                shadow_dy,
+                shadow_dw,
+                shadow_dh,
+                adjusted,
+                shadow_threshold,
+                conf_threshold,
+                min_luminance_ratio,
+                max_luminance_ratio,
+            )
+        )
 
     return templates

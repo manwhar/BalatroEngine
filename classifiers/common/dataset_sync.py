@@ -20,7 +20,7 @@ def sync_mod_dataset(
     and balatro_mod/<source_subfolder>.
     """
     appdata_candidate = Path(os.path.expandvars(rf"%APPDATA%\Balatro\Mods\gamestate_dataset_cv\{source_subfolder}"))
-    repo_root = target_dataset_dir.parent.parent.parent
+    repo_root = Path(__file__).resolve().parent.parent.parent
     repo_candidate = repo_root / "balatro_mod" / source_subfolder
 
     candidates = [appdata_candidate, repo_candidate]

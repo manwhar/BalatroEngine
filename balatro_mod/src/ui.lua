@@ -24,12 +24,14 @@ function G.DATASET_MOD:get_selected_object()
     elseif t == 'roi_hud_blind_target' then return self.config.rois.hud_blind_target, 'roi', "ROI: HUD Blind Target"
     elseif t == 'roi_seed_win' then return self.config.rois.seed_win, 'roi', "ROI: Seed (Win Modal)"
     elseif t == 'roi_seed_game_over' then return self.config.rois.seed_game_over, 'roi', "ROI: Seed (Game Over Modal)"
+    elseif t == 'roi_view_deck' then return self.config.rois.view_deck, 'roi', "ROI: View Deck Region"
     elseif t == 'box_joker_bar' then return self.config.boxes.joker_bar_card, 'box', "Box: Joker Bar Card"
     elseif t == 'box_item' then return self.config.boxes.item_card, 'box', "Box: Shop/Pack Item"
     elseif t == 'box_consumeable' then return self.config.boxes.consumeable_card, 'box', "Box: Consumable Card"
     elseif t == 'box_voucher' then return self.config.boxes.voucher_card, 'box', "Box: Voucher Card"
     elseif t == 'box_booster' then return self.config.boxes.booster_card, 'box', "Box: Booster Pack"
     elseif t == 'box_card' then return self.config.boxes.card, 'box', "Box: Hand Card"
+    elseif t == 'box_deck_card' then return self.config.boxes.deck_card, 'box', "Box: Deck Card Left Edge"
     end
     return nil, nil, "None"
 end
@@ -348,6 +350,7 @@ function UI.init_callbacks(mod)
             ['End Round Classifier'] = 'end_round_classifier',
             ['HUD OCR'] = 'hud_ocr',
             ['Seed OCR'] = 'seed_ocr',
+            ['Deck Classifier'] = 'deck_classifier',
         }
         local chosen = mode_map[args.to_val] or 'off'
         mod:set_mode(chosen)
@@ -363,6 +366,7 @@ function UI.init_callbacks(mod)
         if mod.config.calibration_mode ~= 'generation' then
             if mod.restore_joker_display_config then mod:restore_joker_display_config() end
             if mod.cleanup_seed_overlay then mod:cleanup_seed_overlay() end
+            if mod.cleanup_deck_overlay and mod.config.mode == 'deck_classifier' then mod:cleanup_deck_overlay(true) end
             if mod.EndRoundCapture and mod._active_end_round_clip then mod.EndRoundCapture.stop(mod) end
         end
     end
@@ -445,8 +449,15 @@ function UI.init_callbacks(mod)
                 end
                 load_sub("src/config.lua")
                 load_sub("src/cards_gen.lua")
-                load_sub("src/shop_gen.lua")
+                local shop_m = load_sub("src/shop_gen.lua")
+                if shop_m then mod.ShopGen = shop_m end
                 load_sub("src/capture.lua")
+                local hud_m = load_sub("src/hud_gen.lua")
+                if hud_m then mod.HudGen = hud_m end
+                local seed_m = load_sub("src/seed_gen.lua")
+                if seed_m then mod.SeedGen = seed_m end
+                local deck_m = load_sub("src/deck_gen.lua")
+                if deck_m then mod.DeckGen = deck_m end
                 local er_gen = load_sub("src/end_round_gen.lua")
                 if er_gen then mod.EndRoundGen = er_gen end
                 if mod.EndRoundCapture then
@@ -999,6 +1010,7 @@ function UI.build_page_definition(mod)
         or (mod.config.mode == 'end_round_classifier' and 4)
         or (mod.config.mode == 'hud_ocr' and 5)
         or (mod.config.mode == 'seed_ocr' and 6)
+        or (mod.config.mode == 'deck_classifier' and 7)
         or 1
 
     local max_frames_options = {'1000', '2500', '5000', '10000', '20000'}
@@ -1034,7 +1046,7 @@ function UI.build_page_definition(mod)
         n = G.UIT.ROOT,
         config = {align = "cm", padding = 0.06, r = 0.1, colour = G.C.L_BLACK, minw = 7.2},
         nodes = {
-            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier', 'HUD OCR', 'Seed OCR'}, current_mode_idx, 'gdcv_change_mode', 3.6),
+            make_cycle_row("Classifier Mode", 'gdcv_mode_cycle', {'Off', 'Card Classifier', 'Shop Classifier', 'End Round Classifier', 'HUD OCR', 'Seed OCR', 'Deck Classifier'}, current_mode_idx, 'gdcv_change_mode', 3.6),
             make_cycle_row("Target Frame Cap", 'gdcv_mf_cycle', max_frames_options, current_mf_idx, 'gdcv_change_max_frames'),
             make_cycle_row("End-Round Clip Cap", 'gdcv_mc_cycle', max_clips_options, current_mc_idx, 'gdcv_change_max_clips'),
             make_cycle_row("End-Round Sim Batch", 'gdcv_er_cycle', er_batch_options, current_er_idx, 'gdcv_change_er_batch'),
@@ -1058,9 +1070,10 @@ function UI.create_config_tab()
     mod.clear_confirm_timer = 0
     mod.clear_button_text = "Clear Dataset"
     mod.config_page = mod.config_page or 'dataset'
-    mod.stats_text = string.format("Card: %d  |  Shop: %d  |  EndRound Clips: %d  |  Phase: %s",
+    mod.stats_text = string.format("Card: %d  |  Shop: %d  |  Deck: %d  |  EndRound Clips: %d  |  Phase: %s",
         mod.frame_counts and mod.frame_counts.card or 0,
         mod.frame_counts and mod.frame_counts.shop or 0,
+        mod.frame_counts and mod.frame_counts.deck or 0,
         mod.frame_counts and mod.frame_counts.end_round or 0,
         string.upper(mod.shop_phase or 'shop'))
 
@@ -1218,6 +1231,9 @@ function G.DATASET_MOD:draw_debug()
         local sel = self.selected_target
         draw_roi_box(self.config.rois.seed_win,       "[1: SEED (WIN MODAL)]",       sel == 'roi_seed_win',       0.2, 1.0, 0.5)
         draw_roi_box(self.config.rois.seed_game_over, "[2: SEED (GAME OVER MODAL)]", sel == 'roi_seed_game_over', 1.0, 0.45, 0.3)
+    elseif self.config.mode == 'deck_classifier' then
+        local sel = self.selected_target
+        draw_roi_box(self.config.rois.view_deck, "[1: ROI VIEW DECK]", sel == 'roi_view_deck', 0.2, 1.0, 0.5)
     elseif self.config.mode == 'shop_classifier' then
         local sel = self.selected_target
         draw_roi_box(self.config.rois.joker_bar, "[ROI: JOKER BAR (TOP)]", sel == 'roi_joker_bar', 0.2, 0.8, 1)
@@ -1287,6 +1303,8 @@ function G.DATASET_MOD:draw_debug()
                     if c == card then return true end
                 end
             end
+        elseif self.config.mode == 'deck_classifier' then
+            return card.area ~= nil and card.area.config ~= nil and card.area.config.view_deck == true and not card.area.REMOVED
         end
         return false
     end
@@ -1302,7 +1320,8 @@ function G.DATASET_MOD:draw_debug()
                                    (self.selected_target == 'box_consumeable' and box.box_name == 'consumeable_card') or
                                    (self.selected_target == 'box_voucher' and box.box_name == 'voucher_card') or
                                    (self.selected_target == 'box_booster' and box.box_name == 'booster_card') or
-                                   (self.selected_target == 'box_card' and box.box_name == 'card')
+                                   (self.selected_target == 'box_card' and box.box_name == 'card') or
+                                   (self.selected_target == 'box_deck_card' and box.box_name == 'deck_card')
 
                 if box.box_name == 'joker_bar_card' then
                     love.graphics.setColor(0, 1, 1, is_sel_box and 1.0 or 0.6)
@@ -1314,6 +1333,8 @@ function G.DATASET_MOD:draw_debug()
                     love.graphics.setColor(0.3, 1, 0.3, is_sel_box and 1.0 or 0.6)
                 elseif box.box_name == 'booster_card' then
                     love.graphics.setColor(1, 0.6, 0.1, is_sel_box and 1.0 or 0.6)
+                elseif box.box_name == 'deck_card' then
+                    love.graphics.setColor(0.2, 1.0, 0.5, is_sel_box and 1.0 or 0.6)
                 else
                     love.graphics.setColor(0, 1, 1, is_sel_box and 1.0 or 0.6)
                 end
@@ -1340,6 +1361,7 @@ function G.DATASET_MOD:draw_debug()
         or (self.config.mode == 'end_round_classifier' and "END ROUND CLASSIFIER")
         or (self.config.mode == 'hud_ocr' and "HUD OCR")
         or (self.config.mode == 'seed_ocr' and "SEED OCR")
+        or (self.config.mode == 'deck_classifier' and "VIEW DECK CLASSIFIER")
         or "SHOP & JOKER CLASSIFIER"
     love.graphics.setColor(1, 0.85, 0.2, 1)
     love.graphics.print(string.format("GAMESTATE CV CALIBRATION  -  [%s]", mode_str), 18, 14)
@@ -1366,6 +1388,8 @@ function G.DATASET_MOD:draw_debug()
         love.graphics.print("Keys: 1:Score | 2:Money | 3:Hands | 4:Discards | 5:Ante | 6:Round | 7:Reroll | 8:BlindTarget | 9:PackHand", 18, 58)
     elseif self.config.mode == 'seed_ocr' then
         love.graphics.print("Keys: 1: Seed ROI (Win) | 2: Seed ROI (Game Over) | R: Spawn Seed Modal | P: Win/GameOver", 18, 58)
+    elseif self.config.mode == 'deck_classifier' then
+        love.graphics.print("Keys: 1: ROI View Deck | 2: Box Deck Card Left Edge | R: Randomize Deck | P: Full/Remaining | C: Capture", 18, 58)
     else
         love.graphics.print("Keys: 1: ROI Card Hand | 2: Box Hand Card | 3: ROI Play Area", 18, 58)
     end
@@ -1396,6 +1420,12 @@ function G.DATASET_MOD:draw_debug()
         local phase_str = string.upper(self.seed_phase or 'win')
         love.graphics.print(string.format("Next Seed Frame: %05d / %d | Modal: %s (%d/%d) | P: Win/GameOver | Lua Mem: %.1f MB",
             cur_seed, max_frames, phase_str, self.seed_phase_step or 0, self.config.frames_per_phase or 100, collectgarbage("count") / 1024), 18, 146)
+    elseif self.config.mode == 'deck_classifier' then
+        local cur_deck = (self.frame_counts and self.frame_counts.deck) or 0
+        local max_frames = self.config.max_frames or 10000
+        local deck_info_str = self.last_deck_summary or ("Phase: " .. string.upper(self.deck_phase or 'full'))
+        love.graphics.print(string.format("Next Deck Frame: %05d / %d | %s | Lua Mem: %.1f MB",
+            cur_deck, max_frames, deck_info_str, collectgarbage("count") / 1024), 18, 146)
     else
         local cur_frame = (self.config.mode == 'shop_classifier') and self.frame_counts.shop or self.frame_counts.card
         local phase_extra = ""
@@ -1428,7 +1458,7 @@ end
 -- ==========================================
 -- KEYPRESS HANDLER
 -- ==========================================
-local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr', 'seed_ocr' }
+local MODE_ORDER = { 'off', 'card_classifier', 'shop_classifier', 'end_round_classifier', 'hud_ocr', 'seed_ocr', 'deck_classifier' }
 local MODE_DISPLAY_NAMES = {
     off = 'OFF',
     card_classifier = 'CARD CLASSIFIER',
@@ -1436,6 +1466,7 @@ local MODE_DISPLAY_NAMES = {
     end_round_classifier = 'END ROUND CLASSIFIER',
     hud_ocr = 'HUD OCR',
     seed_ocr = 'SEED OCR',
+    deck_classifier = 'DECK CLASSIFIER',
 }
 
 local function cycle_classifier_mode(mod, step)
@@ -1487,9 +1518,9 @@ function G.DATASET_MOD:on_keypressed(key)
 
     if key == 'tab' then
         if self.config.calibration_mode == 'setup' then
-            if (self.config.mode == 'hud_ocr' or self.config.mode == 'seed_ocr') and not (G and G.GAME) then
+            if (self.config.mode == 'hud_ocr' or self.config.mode == 'seed_ocr' or self.config.mode == 'deck_classifier') and not (G and G.GAME) then
                 self.capture_flash = 2.0
-                self.capture_flash_text = "START A RUN FIRST BEFORE GENERATING OCR DATA!"
+                self.capture_flash_text = "START A RUN FIRST BEFORE GENERATING DATA!"
                 return
             end
             self.config.calibration_mode = 'generation'
@@ -1505,6 +1536,9 @@ function G.DATASET_MOD:on_keypressed(key)
             end
             if self.cleanup_seed_overlay and self.config.mode == 'seed_ocr' then
                 self:cleanup_seed_overlay()
+            end
+            if self.cleanup_deck_overlay and self.config.mode == 'deck_classifier' then
+                self:cleanup_deck_overlay(true)
             end
             if self.restore_joker_display_config then self:restore_joker_display_config() end
             self.capture_flash = 2.0
@@ -1534,6 +1568,10 @@ function G.DATASET_MOD:on_keypressed(key)
         elseif self.config.mode == 'seed_ocr' then
             if key == '1' then self.selected_target = 'roi_seed_win'
             elseif key == '2' then self.selected_target = 'roi_seed_game_over'
+            end
+        elseif self.config.mode == 'deck_classifier' then
+            if key == '1' then self.selected_target = 'roi_view_deck'
+            elseif key == '2' then self.selected_target = 'box_deck_card'
             end
         elseif self.config.mode == 'shop_classifier' then
             if key == '1' then self.selected_target = 'roi_joker_bar'
@@ -1571,6 +1609,8 @@ function G.DATASET_MOD:on_keypressed(key)
                 self:generate_hud_step()
             elseif self.config.mode == 'seed_ocr' then
                 self:generate_seed_step()
+            elseif self.config.mode == 'deck_classifier' then
+                self:setup_deck_screen()
             else
                 if (self.shop_phase or 'shop') == 'shop' then
                     self:setup_shop_screen()
@@ -1590,6 +1630,8 @@ function G.DATASET_MOD:on_keypressed(key)
             self:toggle_hud_screen_mode()
         elseif key == 'p' and self.config.mode == 'seed_ocr' then
             self:toggle_seed_screen_mode()
+        elseif key == 'p' and self.config.mode == 'deck_classifier' then
+            self:toggle_deck_screen_mode()
         elseif key == 't' and self.config.mode == 'card_classifier' then
             self:randomize_hand_selection()
         elseif key == 'c' then
@@ -1632,9 +1674,10 @@ function G.DATASET_MOD:update(dt)
         end
     end
 
-    self.stats_text = string.format("Card: %d  |  Shop: %d  |  EndRound Clips: %d  |  Phase: %s",
+    self.stats_text = string.format("Card: %d  |  Shop: %d  |  Deck: %d  |  EndRound Clips: %d  |  Phase: %s",
         self.frame_counts and self.frame_counts.card or 0,
         self.frame_counts and self.frame_counts.shop or 0,
+        self.frame_counts and self.frame_counts.deck or 0,
         self.frame_counts and self.frame_counts.end_round or 0,
         string.upper(self.shop_phase or 'shop'))
 
@@ -1689,6 +1732,7 @@ function G.DATASET_MOD:update(dt)
         local cur_frame = (self.config.mode == 'shop_classifier' and self.frame_counts.shop)
             or (self.config.mode == 'hud_ocr' and self.frame_counts.hud_ocr)
             or (self.config.mode == 'seed_ocr' and self.frame_counts.seed_ocr)
+            or (self.config.mode == 'deck_classifier' and self.frame_counts.deck)
             or self.frame_counts.card
         local max_frames = self.config.max_frames or 10000
 
@@ -1697,6 +1741,7 @@ function G.DATASET_MOD:update(dt)
             self.state = 'idle'
             if self.restore_joker_display_config then self:restore_joker_display_config() end
             if self.cleanup_seed_overlay and self.config.mode == 'seed_ocr' then self:cleanup_seed_overlay() end
+            if self.cleanup_deck_overlay and self.config.mode == 'deck_classifier' then self:cleanup_deck_overlay(true) end
             self.capture_flash = 3.0
             self.capture_flash_text = string.format("REACHED TARGET CAP (%d FRAMES)! GENERATION STOPPED.", max_frames)
             print(string.format("DATASET: Reached threshold cap of %d frames. Stopped generation.", max_frames))
@@ -1717,6 +1762,12 @@ function G.DATASET_MOD:update(dt)
                 end
             elseif self.config.mode == 'seed_ocr' then
                 local ok = self:generate_seed_step()
+                if not ok then
+                    self.config.calibration_mode = 'setup'
+                    return
+                end
+            elseif self.config.mode == 'deck_classifier' then
+                local ok = self:generate_deck_step()
                 if not ok then
                     self.config.calibration_mode = 'setup'
                     return

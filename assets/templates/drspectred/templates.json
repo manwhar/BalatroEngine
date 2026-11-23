@@ -236,7 +236,7 @@
         0.97
       ]
     ],
-    "shadow_dy": 5,
+    "shadow_dy": 6,
     "shadow_dw": 0,
     "conf_threshold": 0.95,
     "test_frames": [
@@ -355,9 +355,9 @@
     "rois": [
       [
         0.2849,
-        0.880,
+        0.88,
         0.5396,
-        0.930
+        0.93
       ]
     ],
     "shadow_dy": 0,
@@ -1043,6 +1043,33 @@
         "pressed": true,
         "frame_idx": 861
       }
+    ]
+  },
+  "Back (Run Info)": {
+    "label": "Back (Run Info)",
+    "filenames": [
+      "back.png"
+    ],
+    "rois": []
+  },
+  "Full Deck": {
+    "label": "Full Deck",
+    "filenames": [
+      "full_deck.png"
+    ],
+    "rois": [
+      [
+        0.4859,
+        0.0833,
+        0.6078,
+        0.1722
+      ],
+      [
+        0.4292,
+        0.0852,
+        0.5484,
+        0.1704
+      ]
     ]
   }
 }

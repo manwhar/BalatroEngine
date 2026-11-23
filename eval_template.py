@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import cv2
 import cv2.mat_wrapper
+import numpy as np
 
 from config import Config
 from tools.debug_plotter import plot
@@ -28,6 +29,7 @@ class EvaluationResult:
     template_filename: str | None = None
     plot_kwargs: dict | None = None
     box: tuple[int, int, int, int] | None = None
+    luminance_ratio: float | None = None
 
 
 def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
@@ -83,7 +85,7 @@ def eval(
                 spec.image_gray,
                 spec.image_bgr,
                 spec.mask,
-                img_gray_half[spec.hy1:spec.hy2, spec.hx1:spec.hx2],
+                img_gray_half[spec.hy1 : spec.hy2, spec.hx1 : spec.hx2],
                 spec.image_gray_half,
                 spec.mask_half,
                 spec.template_size,
@@ -107,7 +109,40 @@ def eval(
             )
             top_left = (match.top_left[0] + x1, match.top_left[1] + y1)
 
+        luminance_ratio: float | None = None
         if match.found:
+            matched_gray = img_gray[
+                top_left[1] : top_left[1] + h_inp,
+                top_left[0] : top_left[0] + w_inp,
+            ]
+            if (
+                spec.interior_mask is not None
+                and matched_gray.shape == spec.interior_mask.shape
+            ):
+                roi_med = float(np.median(matched_gray[spec.interior_mask]))
+            elif matched_gray.size > 0:
+                roi_med = float(np.median(matched_gray))
+            else:
+                roi_med = spec.template_median_luma
+            luminance_ratio = (
+                roi_med / spec.template_median_luma
+                if spec.template_median_luma > 0.0
+                else 1.0
+            )
+            eff_min_luma = (
+                float(template.min_luminance_ratio)
+                if getattr(template, "min_luminance_ratio", None) is not None
+                else config.min_luminance_ratio
+            )
+            eff_max_luma = (
+                float(template.max_luminance_ratio)
+                if getattr(template, "max_luminance_ratio", None) is not None
+                else config.max_luminance_ratio
+            )
+            luma_ok = (not config.use_luminance_check) or (
+                eff_min_luma <= luminance_ratio <= eff_max_luma
+            )
+
             bottom_left = (top_left[0], top_left[1] + h_inp)
             bottom_right = (top_left[0] + w_inp, top_left[1] + h_inp)
 
@@ -127,15 +162,19 @@ def eval(
                 if getattr(template, "shadow_threshold", None) is not None
                 else config.shadow_threshold
             )
-            shadow_img_gray = crop_image_to_roi(img_gray, shadow_region)
-            has_shadow = analyze_shadow_presence(
-                shadow_img_gray, threshold=eff_shadow_threshold
-            )
-            clicked = not has_shadow
+            if not luma_ok:
+                clicked = False
+            else:
+                shadow_img_gray = crop_image_to_roi(img_gray, shadow_region)
+                has_shadow = analyze_shadow_presence(
+                    shadow_img_gray, threshold=eff_shadow_threshold
+                )
+                clicked = not has_shadow
 
             if info_enabled:
                 logger.info(
-                    f"FOUND {template.name} at {top_left} with confidence of {match.confidence:.4f}; Clicked={clicked}"
+                    f"FOUND {template.name} at {top_left} with confidence of {match.confidence:.4f}; "
+                    f"luma_ratio={luminance_ratio:.3f}; Clicked={clicked}"
                 )
         else:
             if debug_enabled:
@@ -187,7 +226,9 @@ def eval(
                     )
                     if "shadow_threshold" in data[template.name]:
                         raw_t = data[template.name]["shadow_threshold"]
-                        template.shadow_threshold = float(raw_t) if raw_t is not None else None
+                        template.shadow_threshold = (
+                            float(raw_t) if raw_t is not None else None
+                        )
             except Exception as e:
                 logger.error(f"Failed to reload template data for {template.name}: {e}")
 
@@ -198,7 +239,13 @@ def eval(
                 match=match,
                 clicked=clicked,
                 template_filename=None,
-                box=(top_left[0], top_left[1], top_left[0] + w_inp, top_left[1] + h_inp),
+                box=(
+                    top_left[0],
+                    top_left[1],
+                    top_left[0] + w_inp,
+                    top_left[1] + h_inp,
+                ),
+                luminance_ratio=luminance_ratio,
             )
 
     return EvaluationResult(

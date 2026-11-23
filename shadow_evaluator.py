@@ -82,15 +82,10 @@ def analyze_shadow_presence(image: np.ndarray, threshold: float = 1000.0) -> boo
 
     # Check both Sobel edge strength and dark-trough-to-background intensity steps
     # so dark Boss Blind backgrounds and slight motion blur don't mask real shadows.
-    if len(row_sums) >= 8 and gray.shape[0] >= 3 and gray.shape[1] >= 1:
-        sob_signed = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        pos_row_medians = np.median(sob_signed, axis=1)
-        # Skip row 1 negative (bright button edge -> flat dark bg) spikes on shadow_dy=0 buttons,
-        # while still catching row 1 positive (dark shadow -> bright bg) transitions.
-        max_gradient = max(
-            float(np.max(row_sums[2:])),
-            float(pos_row_medians[1]),
-        )
+    if len(row_sums) >= 5 and gray.shape[0] >= 3 and gray.shape[1] >= 1:
+        # Skip rows 0..1 (button bottom border / 1px dark bevel spikes) on all strips
+        # with >= 5 rows while preserving 4-row strips like Sort by Rank (shadow_dh=-6).
+        max_gradient = float(np.max(row_sums[2:]))
     else:
         max_gradient = float(np.max(row_sums))
 
@@ -110,7 +105,10 @@ def analyze_shadow_presence(image: np.ndarray, threshold: float = 1000.0) -> boo
                 continue
             for j in range(i + 1, min(len(row_medians), i + 4)):
                 step = float(row_medians[j]) - dark
-                if step >= min_step and (float(row_medians[j]) + 1.0) / (dark + 1.0) >= 1.45:
+                if (
+                    step >= min_step
+                    and (float(row_medians[j]) + 1.0) / (dark + 1.0) >= 1.45
+                ):
                     return True
 
     return False
