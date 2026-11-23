@@ -271,6 +271,75 @@ class TestScreenStateTracker(unittest.TestCase):
         self.assertIsNone(clicked_name)
         self.assertTrue(metrics.get("open_pack_present"))
 
+    def test_full_deck_template_allowed_everywhere_and_view_mode_metadata(self):
+        import logging
+        from pathlib import Path as _Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import cv2
+        import numpy as np
+
+        from config import Config
+        from eval_template import EvaluationResult, detect_view_deck_tab_mode
+        from geometry import ImageSize, PixelROI
+        from matcher import TemplateMatch
+
+        tracker = ScreenStateTracker()
+        # Full Deck is scannable on every coarse state without mutating state or flags
+        for st in (
+            CoarseScreenState.PRE_GAME,
+            CoarseScreenState.SELECT,
+            CoarseScreenState.BLIND,
+            CoarseScreenState.CASH_OUT,
+            CoarseScreenState.SHOP,
+            CoarseScreenState.PACK,
+        ):
+            tracker.state = st
+            self.assertIn("Full Deck", tracker.allowed_template_names())
+            self.assertEqual(tracker.on_template_clicked("Full Deck", frame_idx=100), st)
+
+        # Real screenshots confirm red triangle above Full Deck detects view_mode accurately
+        img_full = cv2.imread(str(_Path(REPO_ROOT) / "assets" / "sample_inputs" / "full_deck_shop.jpg"))
+        img_rem = cv2.imread(str(_Path(REPO_ROOT) / "assets" / "sample_inputs" / "full_deck_blind.jpg"))
+        self.assertIsNotNone(img_full)
+        self.assertIsNotNone(img_rem)
+        self.assertEqual(detect_view_deck_tab_mode(img_full, (837, 105, 1041, 167)), "full_deck")
+        self.assertEqual(detect_view_deck_tab_mode(img_rem, (948, 105, 1152, 167)), "remaining")
+
+        # main._process_frame attaches metadata['view_mode'] when Full Deck matches
+        cfg = Config(debug_plot=False, setup_mode=False, coarse_to_fine=False)
+        tmpl_fd = SimpleNamespace(name="Full Deck", shadow_dy=0)
+        dummy_match = TemplateMatch(
+            found=True,
+            top_left=(837, 105),
+            confidence=0.992,
+            score_map=None,
+            roi=PixelROI(1, 1, 1920, 1080),
+            template_size=ImageSize(204, 62),
+        )
+        vf = SimpleNamespace(index=50, timestamp_seconds=0.83, image=img_full)
+        fd_res = EvaluationResult(
+            template_name="Full Deck",
+            found=True,
+            match=dummy_match,
+            clicked=True,
+            box=(837, 105, 1041, 167),
+        )
+        with patch.object(main_module, "eval", return_value=fd_res):
+            _, _, _, clicked, clicked_name = main_module._process_frame(
+                vf, [tmpl_fd], {"Full Deck": 22}, cfg, logging.getLogger(__name__)
+            )
+        self.assertEqual(clicked_name, "Full Deck")
+        self.assertEqual(clicked["metadata"]["view_mode"], "full_deck")
+
+    def test_shop_idle_fallback_widens_to_select_blind_and_pack(self):
+        tracker = ScreenStateTracker(state=CoarseScreenState.SHOP)
+        self.assertEqual(tracker.on_shop_idle_fallback(), CoarseScreenState.SHOP_OR_SELECT_OR_PACK)
+        allowed = tracker.allowed_template_names()
+        for name in ("Select Blind", "Skip Blind", "Open Pack", "Buy Card", "Next Round"):
+            self.assertIn(name, allowed)
+        self.assertEqual(tracker.on_template_clicked("Select Blind"), CoarseScreenState.BLIND)
+
 
 if __name__ == "__main__":
     unittest.main()

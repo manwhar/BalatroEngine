@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from config import Config, configure_logging
 from tools.debug_plotter import plot
-from eval_template import eval, format_timestamp
+from eval_template import detect_view_deck_tab_mode, eval, format_timestamp
 from frame import iter_video_frames
 from post_processing import (
     build_run_trajectory,
@@ -206,6 +206,15 @@ def _process_frame(
                     "action": template_key[result.template_name],
                     "box": list(result.box) if result.box is not None else None,
                 }
+                if (
+                    result.template_name == "Full Deck"
+                    and result.box is not None
+                ):
+                    template_clicked["metadata"] = {
+                        "view_mode": detect_view_deck_tab_mode(
+                            video_frame.image, result.box
+                        )
+                    }
     t2 = time.perf_counter()
 
     metrics: dict[str, Any] = {
@@ -401,6 +410,8 @@ def detect_video_actions(
                 shop_last_activity_frame = None
             if clicked_name in (
                 "Open Run Info Menu",
+                "Back (Run Info)",
+                "Full Deck",
                 "Open Options Menu",
                 "Cash Out",
                 "Play Hand",
@@ -464,7 +475,7 @@ def detect_video_actions(
                     and (frame_idx - shop_last_activity_frame)
                     >= shop_pack_fallback_frames
                 ):
-                    screen_tracker.on_pack_possibly_opened()
+                    screen_tracker.on_shop_idle_fallback()
                     _reset_open_pack_watch()
                     shop_last_activity_frame = None
             else:

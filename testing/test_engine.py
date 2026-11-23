@@ -3623,6 +3623,50 @@ class TestNewEngineFeatures(unittest.TestCase):
         cryptid_ids = [c.id for c in state.full_deck]
         self.assertEqual(len(cryptid_ids), len(set(cryptid_ids)))
 
+    def test_remaining_deck_id_first_and_hook_discard_override(self) -> None:
+        """remaining_deck prefers exact card.id matches on clones and THE_HOOK honors _hook_discard_ids."""
+        from game.balatro_models import (
+            Action,
+            ActionType,
+            BlindName,
+            Hand,
+            HandCard,
+            Location,
+            PlayingCard,
+            Rank,
+            Seal,
+            Suit,
+        )
+        from game.engine.rules import on_action
+        from game.gamestate import GameState
+
+        c2 = PlayingCard(rank=Rank.THREE, suit=Suit.CLUBS, seal=Seal.PURPLE, id=2)
+        c18 = PlayingCard(rank=Rank.THREE, suit=Suit.CLUBS, seal=Seal.PURPLE, id=18)
+        c63 = PlayingCard(rank=Rank.THREE, suit=Suit.CLUBS, seal=Seal.PURPLE, id=63)
+        h4 = PlayingCard(rank=Rank.FOUR, suit=Suit.HEARTS, id=30)
+        h5 = PlayingCard(rank=Rank.FIVE, suit=Suit.DIAMONDS, id=31)
+        state = GameState(
+            location=Location.BLIND,
+            current_blind=BlindName.THE_HOOK,
+            full_deck=[c2, c18, c63, h4, h5],
+            hand=Hand(cards=[HandCard(card=c63, selected=True), HandCard(card=h4), HandCard(card=h5)]),
+            discard_pile=[c2],
+        )
+        # Before ID-first subtraction, id=63 popped c2 and c2 popped c18, leaving id=63 behind!
+        rem_ids = [c.id for c in state.remaining_deck]
+        self.assertEqual(rem_ids, [18])
+
+        # _hook_discard_ids directs THE_HOOK to discard exact specified unplayed card IDs
+        act = Action(
+            type=ActionType.PLAY_HAND,
+            selected_cards=[c63],
+            metadata={"_hook_discard_ids": [30]},
+        )
+        on_action(state, act)
+        discard_ids = {c.id for c in state.discard_pile}
+        self.assertIn(30, discard_ids)
+        self.assertIn(31, discard_ids)  # Remainder filled by PRNG when only 1 override ID supplied
+
 
 def run_synthetic_test() -> None:
     """Convenience function running the synthetic test directly."""

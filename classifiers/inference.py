@@ -73,6 +73,11 @@ from classifiers.hud_ocr.config import (
 # pyrefly: ignore [missing-import]
 from classifiers.hud_ocr.pipeline import HudOcrPipeline, HudOcrResult
 
+# pyrefly: ignore [missing-import]
+from classifiers.deck_classifier.config import resolve_view_deck_roi
+
+from eval_template import detect_view_deck_tab_mode
+
 BASE_WIDTH = 1920.0
 BASE_HEIGHT = 1080.0
 
@@ -91,6 +96,7 @@ ROIS = {
     "voucher": {"x": 656.059547, "y": 714.459732, "w": 360.743773, "h": 284.420985},
     "booster": {"x": 1071.358597, "y": 724.761198, "w": 427.707911, "h": 300.000000},
     "pack": {"x": 510.0, "y": 575.0, "w": 1070.0, "h": 330.0},
+    "view_deck": resolve_view_deck_roi(),
     "play_area": dict(PLAY_AREA_ROI),
     **{k: dict(v) for k, v in HUD_ROIS.items()},
 }
@@ -180,6 +186,17 @@ class HudRecognitionOutput:
         return self.values.get("hud_blind_target")
 
 
+@dataclass(slots=True)
+class DeckRecognitionOutput:
+    """Output results for full-deck / remaining-deck View Deck modal recognition."""
+
+    frame_index: int
+    timestamp_seconds: float
+    cards: list[CardResult] = field(default_factory=list)
+    view_mode: str = "full_deck"  # "full_deck" or "remaining"
+    roi: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+
 # =====================================================================
 # Model Cache & Lazy Initialization
 # =====================================================================
@@ -189,6 +206,7 @@ _SHOP_PIPELINE: ShopRecognitionPipeline | None = None
 _END_ROUND_PIPELINE: EndRoundRecognitionPipeline | None = None
 _HUD_OCR_PIPELINE: HudOcrPipeline | None = None
 _SEED_OCR_PIPELINE: Any = None
+_DECK_PIPELINE: Any = None
 
 
 def get_card_pipeline(device: str | None = None) -> CardRecognitionPipeline:
@@ -283,6 +301,30 @@ def get_seed_ocr_pipeline(device: str | None = None):
     return _SEED_OCR_PIPELINE
 
 
+def get_deck_pipeline(device: str | None = None):
+    """Lazily loads singleton DeckRecognitionPipeline from classifiers/prod_weights/."""
+    global _DECK_PIPELINE
+    if _DECK_PIPELINE is None:
+        from classifiers.deck_classifier.pipeline import DeckRecognitionPipeline
+
+        det_path = PROD_WEIGHTS_DIR / "deck_detector.pt"
+        cls_path = PROD_WEIGHTS_DIR / "card_classifier.pt"
+        if not det_path.exists():
+            raise FileNotFoundError(
+                f"Missing production deck detector weights at {det_path}"
+            )
+        if not cls_path.exists():
+            raise FileNotFoundError(
+                f"Missing production card classifier weights at {cls_path}"
+            )
+        _DECK_PIPELINE = DeckRecognitionPipeline(
+            detector_path=det_path,
+            classifier_path=cls_path,
+            device=device,
+        )
+    return _DECK_PIPELINE
+
+
 def _extract_frame_image_and_meta(video_frame: Any) -> tuple[np.ndarray, int, float]:
     """Helper to unwrap VideoFrame, tuple, or raw np.ndarray."""
     if hasattr(video_frame, "image") and hasattr(video_frame, "index"):
@@ -357,6 +399,31 @@ def recognize_hand_cards(
 
     return HandRecognitionOutput(
         frame_index=f_idx, timestamp_seconds=ts, cards=cards, roi=roi_coords
+    )
+
+
+def recognize_full_deck(
+    video_frame: Any,
+    *,
+    view_mode: str = "full_deck",
+    conf_threshold: float = 0.45,
+    iou_threshold: float = 0.55,
+    device: str | None = None,
+) -> DeckRecognitionOutput:
+    """Evaluates Balatro's View Deck overlay on a single frame (boxes returned in full-frame pixels)."""
+    img_bgr, f_idx, ts = _extract_frame_image_and_meta(video_frame)
+    pipeline = get_deck_pipeline(device=device)
+
+    crop_pil, roi_coords = _crop_roi_to_pil(img_bgr, "view_deck")
+    cards = pipeline.predict(crop_pil, conf=conf_threshold, iou=iou_threshold)
+    _translate_item_boxes(cards, roi_coords[0], roi_coords[1])
+
+    return DeckRecognitionOutput(
+        frame_index=f_idx,
+        timestamp_seconds=ts,
+        cards=cards,
+        view_mode=view_mode,
+        roi=roi_coords,
     )
 
 

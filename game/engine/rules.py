@@ -1397,10 +1397,36 @@ def on_action(state, action: Action):
                     and not state.boss_disabled
                     and state.hand.cards
                 ):
-                    hook_hand_cards = predict_hook_discards(
-                        state.rng, state.hand.cards, count=2
+                    hook_cards: list[PlayingCard] = []
+                    override_ids = (
+                        list(action.metadata.get("_hook_discard_ids") or [])
+                        if action.metadata
+                        else []
                     )
-                    hook_cards = [hc.card for hc in hook_hand_cards]
+                    if override_ids:
+                        used_ptrs: set[int] = set()
+                        for target_id in override_ids:
+                            if len(hook_cards) >= 2:
+                                break
+                            for hc in state.hand.cards:
+                                if id(hc) not in used_ptrs and hc.card.id == target_id:
+                                    hook_cards.append(hc.card)
+                                    used_ptrs.add(id(hc))
+                                    break
+                        remaining_for_hook = [
+                            hc for hc in state.hand.cards if id(hc) not in used_ptrs
+                        ]
+                        need = min(2, len(state.hand.cards)) - len(hook_cards)
+                        if need > 0 and remaining_for_hook:
+                            extra = predict_hook_discards(
+                                state.rng, remaining_for_hook, count=need
+                            )
+                            hook_cards.extend(hc.card for hc in extra)
+                    else:
+                        hook_hand_cards = predict_hook_discards(
+                            state.rng, state.hand.cards, count=2
+                        )
+                        hook_cards = [hc.card for hc in hook_hand_cards]
                     _apply_discard_cards(state, action, hook_cards, is_hook=True)
                 _evaluate_played_cards(state, action, played_cards)
 

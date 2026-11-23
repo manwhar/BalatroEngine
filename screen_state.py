@@ -32,6 +32,7 @@ class CoarseScreenState(StrEnum):
     PACK = "pack"
     PACK_OR_SHOP = "pack_or_shop"
     PACK_OR_SELECT = "pack_or_select"
+    SHOP_OR_SELECT_OR_PACK = "shop_or_select_or_pack"
 
 
 # Exact mapping from templates.json keys to game ActionType (None for non-gameplay UI).
@@ -39,6 +40,8 @@ TEMPLATE_TO_ACTION: dict[str, ActionType | None] = {
     "Play Game": None,
     "Open Options Menu": None,
     "Open Run Info Menu": None,
+    "Back (Run Info)": None,
+    "Full Deck": None,
     "Select Blind": ActionType.SELECT_BLIND,
     "Skip Blind": ActionType.SKIP_BLIND,
     "Reroll Boss": ActionType.REROLL_BOSS,
@@ -62,7 +65,7 @@ TEMPLATE_TO_ACTION: dict[str, ActionType | None] = {
 
 # Verified against balatro_source/card.lua (can_sell_card, can_use_consumeable),
 # functions/button_callbacks.lua, and game.lua (create_UIBox_buttons only in SELECTING_HAND).
-_UI_ALWAYS = frozenset({"Open Options Menu", "Open Run Info Menu"})
+_UI_ALWAYS = frozenset({"Open Options Menu", "Open Run Info Menu", "Full Deck"})
 _HELD_ITEM_ACTIONS = frozenset({"Sell Card", "Use Consumable"})
 
 _PRE_GAME_BUTTONS = frozenset(
@@ -73,6 +76,7 @@ _PRE_GAME_BUTTONS = frozenset(
         "Reroll Boss",
         "Open Options Menu",
         "Open Run Info Menu",
+        "Full Deck",
     }
 )
 _SELECT_BUTTONS = (
@@ -118,6 +122,9 @@ ALLOWED_TEMPLATES_BY_STATE: dict[CoarseScreenState, frozenset[str]] = {
     CoarseScreenState.PACK: _PACK_BUTTONS,
     CoarseScreenState.PACK_OR_SHOP: _PACK_BUTTONS | _SHOP_BUTTONS,
     CoarseScreenState.PACK_OR_SELECT: _PACK_BUTTONS | _SELECT_BUTTONS,
+    CoarseScreenState.SHOP_OR_SELECT_OR_PACK: (
+        _SHOP_BUTTONS | _PACK_BUTTONS | frozenset({"Select Blind", "Skip Blind"})
+    ),
 }
 
 
@@ -199,7 +206,12 @@ class ScreenStateTracker:
         if self.allow_play_game:
             allowed = allowed | {"Play Game"}
         if (
-            self.state in (CoarseScreenState.SHOP, CoarseScreenState.PACK_OR_SHOP)
+            self.state
+            in (
+                CoarseScreenState.SHOP,
+                CoarseScreenState.PACK_OR_SHOP,
+                CoarseScreenState.SHOP_OR_SELECT_OR_PACK,
+            )
             and frame_idx is not None
             and self.last_cash_out_frame is not None
             and 0 <= (frame_idx - self.last_cash_out_frame) < self.shop_next_round_cooldown_frames
@@ -239,6 +251,13 @@ class ScreenStateTracker:
             self.state = CoarseScreenState.PACK_OR_SHOP
         return self.state
 
+    def on_shop_idle_fallback(self) -> CoarseScreenState:
+        """Widens SHOP -> SHOP_OR_SELECT_OR_PACK on prolonged inactivity so Next Round/Skip Pack can recover."""
+        if self.state == CoarseScreenState.SHOP:
+            self.pre_pack_location = Location.SHOP
+            self.state = CoarseScreenState.SHOP_OR_SELECT_OR_PACK
+        return self.state
+
     def on_template_clicked(
         self, template_name: str, frame_idx: int | None = None
     ) -> CoarseScreenState:
@@ -248,7 +267,7 @@ class ScreenStateTracker:
             self.allow_play_game = True
             return self.state
 
-        if template_name == "Open Run Info Menu":
+        if template_name in ("Open Run Info Menu", "Back (Run Info)", "Full Deck"):
             return self.state
 
         if template_name == "Play Game":

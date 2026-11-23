@@ -1070,6 +1070,31 @@
         0.5484,
         0.1704
       ]
+    ],
+    "check_shadow": false,
+    "conf_threshold": 0.98,
+    "adjusted": true,
+    "test_frames": [
+      {
+        "path": "assets/sample_inputs/full_deck_blind.jpg",
+        "pressed": true,
+        "frame_idx": 0
+      },
+      {
+        "path": "assets/sample_inputs/full_deck_shop.jpg",
+        "pressed": true,
+        "frame_idx": 1
+      },
+      {
+        "path": "assets/sample_inputs/shop.jpg",
+        "pressed": false,
+        "frame_idx": 2
+      },
+      {
+        "path": "assets/sample_inputs/click_run_info_bu.png",
+        "pressed": false,
+        "frame_idx": 3
+      }
     ]
   }
 }

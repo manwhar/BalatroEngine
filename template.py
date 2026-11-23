@@ -54,6 +54,7 @@ class Template:
     conf_threshold: float | None = None
     min_luminance_ratio: float | None = None
     max_luminance_ratio: float | None = None
+    check_shadow: bool = True
     _compiled_specs_cache: dict[tuple[int, int, float], tuple[CompiledTemplateSpec, ...]] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -195,6 +196,7 @@ def template_loader(
         min_luminance_ratio = float(raw_min_luma) if raw_min_luma is not None else None
         raw_max_luma = data.get("max_luminance_ratio", None)
         max_luminance_ratio = float(raw_max_luma) if raw_max_luma is not None else None
+        check_shadow = bool(data.get("check_shadow", True))
         adjusted = data.get("adjusted", False)
 
         images = [
@@ -227,6 +229,7 @@ def template_loader(
                 conf_threshold,
                 min_luminance_ratio,
                 max_luminance_ratio,
+                check_shadow,
             )
         )
 

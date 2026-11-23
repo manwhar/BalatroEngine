@@ -1068,10 +1068,21 @@ class GameState:
             drawn_or_used = drawn_or_used + self.discard_pile + extra_played
         remaining = list(self.full_deck)
         for card in drawn_or_used:
-            for i, rem_card in enumerate(remaining):
-                if _cards_match(rem_card, card):
-                    remaining.pop(i)
-                    break
+            # Prefer exact persistent card.id match before attribute fallback so
+            # identical clones (e.g. DNA / Death) subtract the exact drawn/discarded copy.
+            matched_idx: int | None = None
+            if card.id:
+                for i, rem_card in enumerate(remaining):
+                    if rem_card.id == card.id:
+                        matched_idx = i
+                        break
+            if matched_idx is None:
+                for i, rem_card in enumerate(remaining):
+                    if _cards_match(rem_card, card):
+                        matched_idx = i
+                        break
+            if matched_idx is not None:
+                remaining.pop(matched_idx)
         return remaining
 
     def _get_next_slot_uid(self) -> int:

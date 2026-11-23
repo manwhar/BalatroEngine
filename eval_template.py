@@ -32,6 +32,26 @@ class EvaluationResult:
     luminance_ratio: float | None = None
 
 
+def detect_view_deck_tab_mode(
+    img_bgr: np.ndarray, full_deck_box: tuple[int, int, int, int] | list[int]
+) -> str:
+    """Distinguishes active 'Full Deck' tab (red pointer triangle above button) from 'Remaining'."""
+    x1, y1, x2, _ = (int(v) for v in full_deck_box)
+    y0 = max(0, y1 - 45)
+    y1_strip = max(0, y1 - 2)
+    x0 = max(0, x1)
+    x1_strip = min(img_bgr.shape[1], x2)
+    if y1_strip <= y0 or x1_strip <= x0:
+        return "remaining"
+    strip = img_bgr[y0:y1_strip, x0:x1_strip]
+    red_px = int(
+        np.sum(
+            (strip[:, :, 2] > 180) & (strip[:, :, 1] < 90) & (strip[:, :, 0] < 90)
+        )
+    )
+    return "full_deck" if red_px >= 40 else "remaining"
+
+
 def format_timestamp(timestamp_seconds: float, frame_index: int) -> str:
     sec = int(timestamp_seconds)
     hh = sec // 3600
@@ -162,7 +182,9 @@ def eval(
                 if getattr(template, "shadow_threshold", None) is not None
                 else config.shadow_threshold
             )
-            if not luma_ok:
+            if not getattr(template, "check_shadow", True):
+                clicked = True
+            elif not luma_ok:
                 clicked = False
             else:
                 shadow_img_gray = crop_image_to_roi(img_gray, shadow_region)
