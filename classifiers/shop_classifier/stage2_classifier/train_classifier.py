@@ -30,13 +30,13 @@ RUNS_DIR = CURRENT_DIR / "runs"
 WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
 
 try:
-    from .config import ITEM_KEYS, EDITIONS
+    from .config import ITEM_KEYS, EDITIONS, CROP_WIDTH, CROP_HEIGHT
     # pyrefly: ignore [missing-import]
     from .dataset import ItemCropDataset
     # pyrefly: ignore [missing-import]
     from .model import MultiHeadItemClassifier
 except ImportError:
-    from config import ITEM_KEYS, EDITIONS
+    from config import ITEM_KEYS, EDITIONS, CROP_WIDTH, CROP_HEIGHT
     from dataset import ItemCropDataset
     # pyrefly: ignore [missing-import]
     from model import MultiHeadItemClassifier
@@ -58,10 +58,10 @@ def get_next_run_dir(base_name="shop_classifier", exist_ok=False) -> Path:
 
 
 def run_train_classifier(
-    epochs=25,
+    epochs=20,
     batch_size=256,
     lr=1e-3,
-    backbone="mobilenet_v3_small",
+    backbone="mobilenet_v3_large",
     run_name="shop_classifier",
     exist_ok=False,
     num_workers=4
@@ -91,9 +91,9 @@ def run_train_classifier(
     print(f"Item Keys    : {len(ITEM_KEYS)} classes")
     print("=" * 60 + "\n")
 
-    # 1. Datasets & Loaders
-    train_dataset = ItemCropDataset(DATASET_DIR, split="train", val_ratio=0.15)
-    val_dataset = ItemCropDataset(DATASET_DIR, split="val", val_ratio=0.15)
+    # 1. Datasets & Loaders (8% halo crops on train for bounding-box jitter)
+    train_dataset = ItemCropDataset(DATASET_DIR, split="train", val_ratio=0.15, pad_ratio=0.08)
+    val_dataset = ItemCropDataset(DATASET_DIR, split="val", val_ratio=0.15, pad_ratio=0.0)
 
     print(f"Loaded {len(train_dataset):,} train samples, {len(val_dataset):,} validation samples.")
     if len(train_dataset) == 0:
@@ -155,7 +155,15 @@ def run_train_classifier(
         for images, targets in _iter_batches(train_dataset, train_loader, shuffle=True, drop_last=(len(train_dataset) > batch_size)):
             images = images.to(device, non_blocking=True)
             if train_dataset.raw_tensor_mode:
-                images = apply_gpu_batch_augmentations(images, is_train=True, compression_prob=0.5, cursor_prob=0.3, color_jitter=True)
+                images = apply_gpu_batch_augmentations(
+                    images,
+                    is_train=True,
+                    compression_prob=0.5,
+                    cursor_prob=0.3,
+                    color_jitter=True,
+                    geom_prob=0.45,
+                    pad_crop_size=(CROP_HEIGHT, CROP_WIDTH),
+                )
             if device.type == "cuda":
                 images = images.contiguous(memory_format=torch.channels_last)
             for k in targets:
@@ -297,10 +305,10 @@ def run_train_classifier(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stage 2 Multi-Head Shop Item Classifier")
-    parser.add_argument("--epochs", type=int, default=15, help="Epoch count (default: 15)")
+    parser.add_argument("--epochs", type=int, default=20, help="Epoch count (default: 20)")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size (default: 512)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
-    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"])
+    parser.add_argument("--backbone", type=str, default="mobilenet_v3_large", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"])
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader CPU workers (default: 8)")
     args = parser.parse_args()

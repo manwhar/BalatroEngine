@@ -340,6 +340,33 @@ class TestScreenStateTracker(unittest.TestCase):
             self.assertIn(name, allowed)
         self.assertEqual(tracker.on_template_clicked("Select Blind"), CoarseScreenState.BLIND)
 
+    def test_cash_out_cooldown_after_held_item_click_and_reset(self):
+        tracker = ScreenStateTracker(state=CoarseScreenState.BLIND)
+        self.assertIn("Cash Out", tracker.allowed_template_names(frame_idx=100))
+
+        tracker.on_template_clicked("Use Consumable", frame_idx=100)
+        self.assertEqual(tracker.last_held_item_action_frame, 100)
+        self.assertNotIn("Cash Out", tracker.allowed_template_names(frame_idx=105))
+        self.assertNotIn("Cash Out", tracker.allowed_template_names(frame_idx=129))
+        self.assertIn("Cash Out", tracker.allowed_template_names(frame_idx=130))
+
+        tracker.state = CoarseScreenState.CASH_OUT
+        tracker.on_template_clicked("Sell Card", frame_idx=200)
+        self.assertNotIn("Cash Out", tracker.allowed_template_names(frame_idx=210))
+
+        tracker.on_template_clicked("Play Hand", frame_idx=215)
+        self.assertIsNone(tracker.last_held_item_action_frame)
+        self.assertIn("Cash Out", tracker.allowed_template_names(frame_idx=216))
+
+    def test_blind_full_deck_tab_recovers_coarse_state_to_blind(self):
+        tracker = ScreenStateTracker(state=CoarseScreenState.SHOP)
+        self.assertNotIn("Play Hand", tracker.allowed_template_names())
+        self.assertEqual(tracker.on_blind_view_deck_observed(), CoarseScreenState.BLIND)
+        allowed = tracker.allowed_template_names()
+        self.assertIn("Play Hand", allowed)
+        self.assertIn("Discard", allowed)
+        self.assertIn("Cash Out", allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

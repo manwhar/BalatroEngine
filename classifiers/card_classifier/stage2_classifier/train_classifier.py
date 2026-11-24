@@ -36,11 +36,11 @@ RUNS_DIR = CURRENT_DIR / "runs"
 WEIGHTS_DIR = CLASSIFIER_ROOT / "weights"
 
 try:
-    from .config import RANKS, SUITS, EDITIONS, ENHANCEMENTS, SEALS
+    from .config import RANKS, SUITS, EDITIONS, ENHANCEMENTS, SEALS, ENHANCEMENT_TO_IDX, CROP_WIDTH, CROP_HEIGHT
     from .dataset import CardCropDataset
     from .model import MultiHeadCardClassifier
 except ImportError:
-    from config import RANKS, SUITS, EDITIONS, ENHANCEMENTS, SEALS
+    from config import RANKS, SUITS, EDITIONS, ENHANCEMENTS, SEALS, ENHANCEMENT_TO_IDX, CROP_WIDTH, CROP_HEIGHT
     from dataset import CardCropDataset
     from model import MultiHeadCardClassifier
 
@@ -94,11 +94,11 @@ def run_train_classifier(
     epochs=25,
     batch_size=256,
     lr=1e-3,
-    backbone="mobilenet_v3_small",
+    backbone="mobilenet_v3_large",
     run_name="card_classifier",
     exist_ok=False,
     num_workers=4,
-    max_deck_crops_per_frame: int | None = 16,
+    max_deck_crops_per_frame: int | None = 32,
 ):
     print("\n" + "=" * 60)
     print("Stage 2: Multi-Head Card Attribute Classifier Training")
@@ -131,18 +131,20 @@ def run_train_classifier(
     print(f"Batch Size    : {batch_size}")
     print("=" * 60 + "\n")
 
-    # Load datasets
+    # Load datasets (use 8% padded crops on train so affine jitter samples real neighbor pixels)
     train_dataset = CardCropDataset(
         DATASET_DIR,
         split="train",
         val_ratio=0.20,
         max_deck_crops_per_frame=max_deck_crops_per_frame,
+        pad_ratio=0.08,
     )
     val_dataset = CardCropDataset(
         DATASET_DIR,
         split="val",
         val_ratio=0.20,
         max_deck_crops_per_frame=max_deck_crops_per_frame,
+        pad_ratio=0.0,
     )
     val_sources = getattr(val_dataset, "sample_sources", ["hand"] * len(val_dataset))
     val_is_hand = torch.tensor([s == "hand" for s in val_sources], dtype=torch.bool)
@@ -183,8 +185,14 @@ def run_train_classifier(
     if use_amp:
         model = model.to(memory_format=torch.channels_last)
 
-    # Loss criteria
+    # Loss criteria (gently emphasize Glass & Steel cards for hand/View Deck discrimination)
+    enh_weights = torch.ones(len(ENHANCEMENTS), device=device, dtype=torch.float32)
+    if "Glass" in ENHANCEMENT_TO_IDX:
+        enh_weights[ENHANCEMENT_TO_IDX["Glass"]] = 1.5
+    if "Steel" in ENHANCEMENT_TO_IDX:
+        enh_weights[ENHANCEMENT_TO_IDX["Steel"]] = 1.3
     criterion_ce = nn.CrossEntropyLoss()
+    criterion_enh = nn.CrossEntropyLoss(weight=enh_weights)
     criterion_bce = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -207,7 +215,8 @@ def run_train_classifier(
                     compression_prob=0.6,
                     cursor_prob=0.3,
                     color_jitter=True,
-                    geom_prob=0.4,
+                    geom_prob=0.45,
+                    pad_crop_size=(CROP_HEIGHT, CROP_WIDTH),
                 )
             if use_amp:
                 images = images.contiguous(memory_format=torch.channels_last)
@@ -220,7 +229,7 @@ def run_train_classifier(
                 l_rank = criterion_ce(logits["rank"], targets["rank"])
                 l_suit = criterion_ce(logits["suit"], targets["suit"])
                 l_edition = criterion_ce(logits["edition"], targets["edition"])
-                l_enh = criterion_ce(logits["enhancement"], targets["enhancement"])
+                l_enh = criterion_enh(logits["enhancement"], targets["enhancement"])
                 l_seal = criterion_ce(logits["seal"], targets["seal"])
                 l_deb = criterion_bce(logits["debuffed"], targets["debuffed"])
                 l_fd = criterion_bce(logits["face_down"], targets["face_down"])
@@ -371,13 +380,13 @@ def run_train_classifier(
 
         # Save last checkpoint
         last_ckpt = weights_subdir / "last.pt"
-        torch.save({"model": model.state_dict(), "epoch": epoch, "stats": epoch_stats}, last_ckpt)
+        torch.save({"model": model.state_dict(), "backbone": backbone, "epoch": epoch, "stats": epoch_stats}, last_ckpt)
 
         # Check and save best
         if exact_match_acc > best_exact_match:
             best_exact_match = exact_match_acc
             best_ckpt = weights_subdir / "best.pt"
-            torch.save({"model": model.state_dict(), "epoch": epoch, "stats": epoch_stats}, best_ckpt)
+            torch.save({"model": model.state_dict(), "backbone": backbone, "epoch": epoch, "stats": epoch_stats}, best_ckpt)
 
             WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
             shutil.copy2(best_ckpt, WEIGHTS_DIR / "classifier_best.pt")
@@ -428,10 +437,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size (default: 512)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--backbone", type=str, default="mobilenet_v3_small", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Backbone model")
+    parser.add_argument("--backbone", type=str, default="mobilenet_v3_large", choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Backbone model")
     parser.add_argument("--name", type=str, default="card_classifier", help="Run directory name")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing run")
-    parser.add_argument("--max-deck-crops-per-frame", type=int, default=16, help="Max crops sampled per View Deck frame (0 = all)")
+    parser.add_argument("--max-deck-crops-per-frame", type=int, default=32, help="Max crops sampled per View Deck frame (0 = all)")
     args = parser.parse_args()
 
     run_train_classifier(

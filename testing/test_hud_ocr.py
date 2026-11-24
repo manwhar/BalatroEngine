@@ -83,9 +83,35 @@ class TestHudOcr(unittest.TestCase):
         self.assertEqual(parse_hud_value("hud_round_score", "12,450"), 12450)
         self.assertEqual(parse_hud_value("hud_round_score", "1.25e+12"), 1_250_000_000_000)
         self.assertEqual(parse_hud_value("hud_money", "-$14"), -14)
+        self.assertEqual(parse_hud_value("hud_money", "$-14"), -14)
         self.assertEqual(parse_hud_value("hud_ante", "3/8"), 3)
         self.assertEqual(parse_hud_value("hud_reroll_cost", "$7"), 7)
         self.assertIsNone(parse_hud_value("hud_money", ""))
+
+        # Per-character run records peak timestep prob; sequence confidence takes mean over chars
+        import math
+
+        logits = torch.full((1, 7, NUM_CLASSES), -20.0)
+        logits[0, 0, CHAR_TO_IDX["5"]] = math.log(0.99)
+        logits[0, 0, 0] = math.log(0.01)
+        logits[0, 1, 0] = 0.0  # blank separating '5' and '8'
+        logits[0, 2, CHAR_TO_IDX["8"]] = math.log(0.60)
+        logits[0, 2, 0] = math.log(0.40)
+        logits[0, 3, CHAR_TO_IDX["8"]] = math.log(0.95)
+        logits[0, 3, 0] = math.log(0.05)
+        logits[0, 4:, 0] = 0.0  # trailing blanks
+        logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        decoded_peak = ctc_greedy_decode(logits)
+        self.assertEqual(decoded_peak[0][0], "58")
+        self.assertAlmostEqual(decoded_peak[0][1], (0.99 + 0.95) / 2.0, places=2)
+
+        # Negative money synthesizer renders real text without error and targets "-14"
+        neg_synth = BalatroHudSynthesizer()
+        neg_crop, neg_text, _ = neg_synth.render_sample(
+            random.Random(7), field_name="hud_money", text_override="-14", augment=False
+        )
+        self.assertEqual(neg_text, "-14")
+        self.assertEqual(neg_crop.shape, (INPUT_HEIGHT, INPUT_WIDTH, 3))
 
     def test_dataset_collate_train_and_pipeline_smoke(self) -> None:
         ds = SyntheticHudOcrDataset(num_samples=8, seed=7, fixed=True, augment=False)

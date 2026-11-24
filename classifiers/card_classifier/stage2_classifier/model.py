@@ -132,3 +132,31 @@ class MultiHeadCardClassifier(nn.Module):
                 "face_down": p_face_down > 0.5,
                 "face_down_conf": p_face_down,
             }
+
+
+def infer_backbone_from_checkpoint(ckpt, default_backbone: str = "mobilenet_v3_small") -> str:
+    """Detects classifier backbone from checkpoint metadata or linear layer input dims."""
+    valid = {"mobilenet_v3_small", "mobilenet_v3_large", "resnet18"}
+    if isinstance(ckpt, dict):
+        meta_bb = ckpt.get("backbone")
+        if isinstance(meta_bb, str) and meta_bb in valid:
+            return meta_bb
+        state_dict = ckpt.get("model_state_dict") or ckpt.get("model") or ckpt
+    else:
+        state_dict = ckpt
+    if isinstance(state_dict, dict):
+        fc_w = state_dict.get("fc_shared.0.weight")
+        if isinstance(fc_w, torch.Tensor) and fc_w.ndim == 2:
+            if fc_w.shape[1] == 960:
+                return "mobilenet_v3_large"
+            if fc_w.shape[1] == 576:
+                return "mobilenet_v3_small"
+        head_w = state_dict.get("head_rank.weight")
+        if isinstance(head_w, torch.Tensor) and head_w.ndim == 2:
+            if head_w.shape[1] == 1280:
+                return "mobilenet_v3_large"
+            if head_w.shape[1] == 1024:
+                return "mobilenet_v3_small"
+            if head_w.shape[1] == 512:
+                return "resnet18"
+    return default_backbone

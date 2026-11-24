@@ -160,42 +160,61 @@ def apply_video_compression_noise(img_tensor: torch.Tensor, p: float = 0.5) -> t
     return out.squeeze(0) if is_single else out
 
 
-def apply_card_crop_jitter(img_tensor: torch.Tensor, p: float = 0.4) -> torch.Tensor:
+def apply_card_crop_jitter(
+    img_tensor: torch.Tensor,
+    p: float = 0.4,
+    output_size: tuple[int, int] | None = None,
+) -> torch.Tensor:
     """
     Applies mild affine crop/scale/rotation jitter on GPU to simulate pack_hand
     framing shifts and YOLO bounding-box tightness variation.
+
+    When `output_size=(target_h, target_w)` is provided and differs from `(H, W)` (e.g. from
+    `pad_ratio`-expanded real-frame crops), samples real bordering pixels inside `(H, W)` and
+    center-crops the non-jittered batch elements cleanly to `output_size`.
     """
     if not isinstance(img_tensor, torch.Tensor) or img_tensor.ndim != 4 or img_tensor.shape[0] == 0:
         return img_tensor
 
     batch_size, _, H, W = img_tensor.shape
+    target_h, target_w = output_size if output_size is not None else (H, W)
     device = img_tensor.device
     mask = torch.rand(batch_size, device=device) < p
-    if not mask.any():
+    if not mask.any() and (target_h, target_w) == (H, W):
         return img_tensor
 
-    out = img_tensor.clone()
+    if (target_h, target_w) == (H, W):
+        out = img_tensor.clone()
+    else:
+        y0 = max(0, (H - target_h) // 2)
+        x0 = max(0, (W - target_w) // 2)
+        out = img_tensor[:, :, y0 : y0 + target_h, x0 : x0 + target_w].clone()
+        if not mask.any():
+            return out
+
     orig_dtype = out.dtype
-    selected = out[mask].float()
+    selected = img_tensor[mask].float()
     n = selected.shape[0]
 
-    scales = torch.empty(n, device=device).uniform_(0.93, 1.06)
+    base_sx = float(target_w) / float(max(1, W))
+    base_sy = float(target_h) / float(max(1, H))
+    scales = torch.empty(n, device=device).uniform_(0.90, 1.08)
     inv_s = 1.0 / scales
     angles = torch.empty(n, device=device).uniform_(-2.5, 2.5) * (3.141592653589793 / 180.0)
     cos_a = torch.cos(angles) * inv_s
     sin_a = torch.sin(angles) * inv_s
-    tx = torch.empty(n, device=device).uniform_(-0.04, 0.04)
-    ty = torch.empty(n, device=device).uniform_(-0.04, 0.04)
+    tx = torch.empty(n, device=device).uniform_(-0.06, 0.06)
+    ty = torch.empty(n, device=device).uniform_(-0.06, 0.06)
 
     theta = torch.zeros((n, 2, 3), device=device, dtype=torch.float32)
-    theta[:, 0, 0] = cos_a
-    theta[:, 0, 1] = -sin_a
+    theta[:, 0, 0] = cos_a * base_sx
+    theta[:, 0, 1] = -sin_a * base_sx
     theta[:, 0, 2] = tx
-    theta[:, 1, 0] = sin_a
-    theta[:, 1, 1] = cos_a
+    theta[:, 1, 0] = sin_a * base_sy
+    theta[:, 1, 1] = cos_a * base_sy
     theta[:, 1, 2] = ty
 
-    grid = F.affine_grid(theta, size=list(selected.shape), align_corners=False)
+    grid = F.affine_grid(theta, size=[n, selected.shape[1], target_h, target_w], align_corners=False)
     warped = F.grid_sample(selected, grid, mode="bilinear", padding_mode="border", align_corners=False)
     out[mask] = warped.to(orig_dtype)
     return out
@@ -262,6 +281,7 @@ def apply_gpu_batch_augmentations(
     cursor_prob: float = 0.3,
     color_jitter: bool = True,
     geom_prob: float = 0.0,
+    pad_crop_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """
     Converts uint8/float (B, 3, H, W) tensor batch on GPU to normalized float32,
@@ -276,8 +296,8 @@ def apply_gpu_batch_augmentations(
     if is_train:
         b = x.shape[0]
         device = x.device
-        if geom_prob > 0.0 and b > 0:
-            x = apply_card_crop_jitter(x, p=geom_prob)
+        if (geom_prob > 0.0 or (pad_crop_size is not None and tuple(x.shape[-2:]) != tuple(pad_crop_size))) and b > 0:
+            x = apply_card_crop_jitter(x, p=geom_prob, output_size=pad_crop_size)
         if color_jitter and b > 0:
             # Vectorized brightness, contrast, and saturation jitter on GPU
             bright = torch.empty((b, 1, 1, 1), device=device).uniform_(0.85, 1.15)
@@ -296,6 +316,12 @@ def apply_gpu_batch_augmentations(
             x = apply_video_compression_noise(x, p=compression_prob)
         if cursor_prob > 0.0:
             x = overlay_cursor_noise(x, p=cursor_prob)
+    elif pad_crop_size is not None and tuple(x.shape[-2:]) != tuple(pad_crop_size):
+        th, tw = pad_crop_size
+        H, W = x.shape[-2:]
+        y0 = max(0, (H - th) // 2)
+        x0 = max(0, (W - tw) // 2)
+        x = x[:, :, y0 : y0 + th, x0 : x0 + tw]
 
     mean, std = _get_imagenet_stats(x.device)
     return (x - mean) / std

@@ -199,6 +199,8 @@ class ScreenStateTracker:
     allow_play_game: bool = True
     last_cash_out_frame: int | None = None
     shop_next_round_cooldown_frames: int = 60
+    last_held_item_action_frame: int | None = None
+    cash_out_after_held_item_cooldown_frames: int = 30
 
     def allowed_template_names(self, frame_idx: int | None = None) -> frozenset[str]:
         """Returns the exact set of template names valid to scan in the current state."""
@@ -217,6 +219,13 @@ class ScreenStateTracker:
             and 0 <= (frame_idx - self.last_cash_out_frame) < self.shop_next_round_cooldown_frames
         ):
             allowed = allowed - {"Next Round"}
+        if (
+            self.state in (CoarseScreenState.BLIND, CoarseScreenState.CASH_OUT)
+            and frame_idx is not None
+            and self.last_held_item_action_frame is not None
+            and 0 <= (frame_idx - self.last_held_item_action_frame) < self.cash_out_after_held_item_cooldown_frames
+        ):
+            allowed = allowed - {"Cash Out"}
         return allowed
 
     def filter_templates(
@@ -258,6 +267,15 @@ class ScreenStateTracker:
             self.state = CoarseScreenState.SHOP_OR_SELECT_OR_PACK
         return self.state
 
+    def on_blind_view_deck_observed(self) -> CoarseScreenState:
+        """Moves non-blind coarse states to BLIND when two-tab Blind View Deck UI is active."""
+        if self.state not in (CoarseScreenState.BLIND, CoarseScreenState.CASH_OUT):
+            self.state = CoarseScreenState.BLIND
+            self.pre_pack_location = None
+            self.last_cash_out_frame = None
+            self.last_held_item_action_frame = None
+        return self.state
+
     def on_template_clicked(
         self, template_name: str, frame_idx: int | None = None
     ) -> CoarseScreenState:
@@ -277,6 +295,7 @@ class ScreenStateTracker:
             self.pre_pack_location = None
             self.allow_play_game = True
             self.last_cash_out_frame = None
+            self.last_held_item_action_frame = None
             return self.state
 
         # Any concrete in-run gameplay click clears temporary Options/Main-Menu Play Game flag.
@@ -286,6 +305,7 @@ class ScreenStateTracker:
             self.state = CoarseScreenState.BLIND
             self.pre_pack_location = None
             self.last_cash_out_frame = None
+            self.last_held_item_action_frame = None
         elif template_name == "Skip Blind":
             # Skip Tag may either jump to next blind on SELECT or immediately open a pack.
             self.state = CoarseScreenState.SELECT_OR_PACK
@@ -296,10 +316,13 @@ class ScreenStateTracker:
         elif template_name in ("Play Hand", "Discard", "Sort by Rank", "Sort by Suit"):
             self.state = CoarseScreenState.BLIND
             self.pre_pack_location = None
+            if template_name in ("Play Hand", "Discard"):
+                self.last_held_item_action_frame = None
         elif template_name == "Cash Out":
             self.state = CoarseScreenState.SHOP
             self.pre_pack_location = None
             self.last_cash_out_frame = frame_idx
+            self.last_held_item_action_frame = None
         elif template_name in ("Buy Card", "Buy and Use", "Redeem Voucher", "Reroll Shop"):
             self.state = CoarseScreenState.SHOP
             self.pre_pack_location = None
@@ -310,6 +333,7 @@ class ScreenStateTracker:
             self.state = CoarseScreenState.SELECT
             self.pre_pack_location = None
             self.last_cash_out_frame = None
+            self.last_held_item_action_frame = None
         elif template_name in ("Use In Pack", "Select Card"):
             return_loc = self._resolve_pack_return_location()
             self.pre_pack_location = return_loc
@@ -334,8 +358,10 @@ class ScreenStateTracker:
                 if frame_idx is not None:
                     self.last_cash_out_frame = frame_idx
         elif template_name in _HELD_ITEM_ACTIONS:
-            # Selling or using a held consumable never leaves the current screen.
-            pass
+            # Selling or using a held consumable never leaves the current screen; block
+            # immediate "Cash Out" false positives triggered by dissolving card/UI particles.
+            if frame_idx is not None:
+                self.last_held_item_action_frame = frame_idx
         return self.state
 
 

@@ -86,14 +86,14 @@ def main():
     parser.add_argument(
         "--backbone",
         type=str,
-        default="mobilenet_v3_small",
+        default="mobilenet_v3_large",
         choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"],
         help="Stage 2 classifier backbone",
     )
     parser.add_argument(
         "--max-deck-crops-per-frame",
         type=int,
-        default=16,
+        default=32,
         help="Max crops sampled per View Deck frame for Stage 2 training (0 = all)",
     )
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing runs")

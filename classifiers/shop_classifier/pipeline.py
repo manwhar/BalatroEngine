@@ -32,6 +32,7 @@ try:
     )
     from classifiers.shop_classifier.stage2_classifier.model import (
         MultiHeadItemClassifier,
+        infer_backbone_from_checkpoint,
     )
 except ImportError:
     from stage2_classifier.config import (
@@ -41,7 +42,10 @@ except ImportError:
         IDX_TO_KEY,
     )
     from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-    from stage2_classifier.model import MultiHeadItemClassifier
+    from stage2_classifier.model import (
+        MultiHeadItemClassifier,
+        infer_backbone_from_checkpoint,
+    )
 
 
 @dataclass
@@ -203,18 +207,22 @@ class ShopRecognitionPipeline:
         print(f"[Pipeline] Loading Stage 1 detector: {detector_path}")
         self.detector = YOLO(str(detector_path))
 
-        print(f"[Pipeline] Loading Stage 2 classifier: {classifier_path} ({backbone})")
-        self.classifier = MultiHeadItemClassifier(
-            backbone_name=backbone, pretrained=False
-        ).to(self.device)
-
         if classifier_path.exists():
             checkpoint = torch.load(classifier_path, map_location=self.device)
-            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            resolved_backbone = infer_backbone_from_checkpoint(checkpoint, default_backbone=backbone or "mobilenet_v3_small")
+            print(f"[Pipeline] Loading Stage 2 classifier: {classifier_path} ({resolved_backbone})")
+            self.classifier = MultiHeadItemClassifier(
+                backbone_name=resolved_backbone, pretrained=False
+            ).to(self.device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
             self.classifier.load_state_dict(state_dict)
             self.classifier.eval()
             print("[Pipeline] Weights loaded successfully.")
         else:
+            print(f"[Pipeline] Loading Stage 2 classifier: {classifier_path} ({backbone})")
+            self.classifier = MultiHeadItemClassifier(
+                backbone_name=backbone, pretrained=False
+            ).to(self.device)
             print(
                 f"[Pipeline Warning] Classifier weights not found at: {classifier_path}"
             )

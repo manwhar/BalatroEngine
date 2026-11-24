@@ -84,7 +84,9 @@ def run_train_detector(
         val=True,
         save=True,
         exist_ok=exist_ok,
-        verbose=True
+        verbose=True,
+        fliplr=0.0,
+        flipud=0.0,
     )
 
     actual_run_dir = Path(results.save_dir) if hasattr(results, "save_dir") else (RUNS_DIR / name)

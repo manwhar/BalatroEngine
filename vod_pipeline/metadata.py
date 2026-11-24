@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any, Sequence
 from urllib.parse import parse_qs, urlparse
 
@@ -339,8 +340,39 @@ def _is_playlist_only_url(url: str) -> bool:
     return ("/playlist" in parsed.path) and ("list" in qs) and ("v" not in qs)
 
 
-def expand_input_urls(urls: Sequence[str], *, timeout: int = 60) -> list[str]:
+def _yt_dlp_extra_args(
+    *,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+    sleep_requests: float | None = None,
+) -> list[str]:
+    args: list[str] = []
+    if cookies_from_browser:
+        args.extend(["--cookies-from-browser", str(cookies_from_browser)])
+    elif cookies_file:
+        args.extend(["--cookies", str(cookies_file)])
+    if sleep_requests is not None and sleep_requests > 0:
+        args.extend(["--sleep-requests", str(sleep_requests)])
+    return args
+
+
+def expand_input_urls(
+    urls: Sequence[str],
+    *,
+    timeout: int = 60,
+    retries: int = 3,
+    retry_backoff_sec: float = 2.0,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+    sleep_requests: float | None = None,
+) -> list[str]:
     """Expands pure playlist URLs via `--flat-playlist`; keeps watch/video URLs as single entries."""
+    extra = _yt_dlp_extra_args(
+        cookies_from_browser=cookies_from_browser,
+        cookies_file=cookies_file,
+        sleep_requests=sleep_requests,
+    )
+    max_attempts = 1 + max(0, int(retries))
     expanded: list[str] = []
     seen: set[str] = set()
     for raw_url in urls:
@@ -348,22 +380,34 @@ def expand_input_urls(urls: Sequence[str], *, timeout: int = 60) -> list[str]:
         if not u or u.startswith("#"):
             continue
         if _is_playlist_only_url(u):
-            proc = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--no-warnings", u],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                payload = json.loads(proc.stdout)
-                for entry in payload.get("entries") or ():
-                    eid = entry.get("id")
-                    eu = entry.get("url") or (f"https://www.youtube.com/watch?v={eid}" if eid else None)
-                    if eu and eu not in seen:
-                        seen.add(eu)
-                        expanded.append(eu)
+            loaded = False
+            for attempt in range(max_attempts):
+                try:
+                    proc = subprocess.run(
+                        ["yt-dlp", "--flat-playlist", "--dump-single-json", "--no-warnings", *extra, u],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        payload = json.loads(proc.stdout)
+                        for entry in payload.get("entries") or ():
+                            eid = entry.get("id")
+                            eu = entry.get("url") or (
+                                f"https://www.youtube.com/watch?v={eid}" if eid else None
+                            )
+                            if eu and eu not in seen:
+                                seen.add(eu)
+                                expanded.append(eu)
+                        loaded = True
+                        break
+                except Exception:
+                    pass
+                if attempt + 1 < max_attempts and retry_backoff_sec > 0:
+                    time.sleep(retry_backoff_sec * (2**attempt))
+            if loaded:
                 continue
         if u not in seen:
             seen.add(u)
@@ -376,32 +420,52 @@ def compact_raw_metadata(raw_meta: dict[str, Any]) -> dict[str, Any]:
     return {k: raw_meta.get(k) for k in _RAW_SUMMARY_KEYS if k in raw_meta}
 
 
-def fetch_video_metadata(url: str, *, timeout: int = 60) -> dict[str, Any]:
-    """Fetches single-video metadata JSON via `yt-dlp --skip-download --no-playlist`."""
-    try:
-        proc = subprocess.run(
-            [
-                "yt-dlp",
-                "--dump-single-json",
-                "--no-warnings",
-                "--skip-download",
-                "--no-playlist",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or f"yt-dlp exit {proc.returncode}").strip()
-            return {"id": extract_video_id(url), "original_url": url, "fetch_error": err[:500]}
-        raw = json.loads(proc.stdout)
-        raw.setdefault("original_url", url)
-        return raw
-    except Exception as exc:
-        return {"id": extract_video_id(url), "original_url": url, "fetch_error": str(exc)[:500]}
+def fetch_video_metadata(
+    url: str,
+    *,
+    timeout: int = 60,
+    retries: int = 3,
+    retry_backoff_sec: float = 2.0,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+    sleep_requests: float | None = None,
+) -> dict[str, Any]:
+    """Fetches single-video metadata JSON via `yt-dlp --skip-download --no-playlist` with retries."""
+    extra = _yt_dlp_extra_args(
+        cookies_from_browser=cookies_from_browser,
+        cookies_file=cookies_file,
+        sleep_requests=sleep_requests,
+    )
+    max_attempts = 1 + max(0, int(retries))
+    last_err = "unknown error"
+    for attempt in range(max_attempts):
+        try:
+            proc = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--dump-single-json",
+                    "--no-warnings",
+                    "--skip-download",
+                    "--no-playlist",
+                    *extra,
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+            if proc.returncode == 0:
+                raw = json.loads(proc.stdout)
+                raw.setdefault("original_url", url)
+                return raw
+            last_err = (proc.stderr or proc.stdout or f"yt-dlp exit {proc.returncode}").strip()
+        except Exception as exc:
+            last_err = str(exc)
+        if attempt + 1 < max_attempts and retry_backoff_sec > 0:
+            time.sleep(retry_backoff_sec * (2**attempt))
+    return {"id": extract_video_id(url), "original_url": url, "fetch_error": last_err[:500]}
 
 
 def fetch_metadata_batch(
@@ -410,9 +474,23 @@ def fetch_metadata_batch(
     max_workers: int = 6,
     save_dir: str | Path | None = None,
     timeout: int = 60,
+    retries: int = 3,
+    retry_backoff_sec: float = 2.0,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+    sleep_requests: float | None = None,
+    use_cache: bool = True,
 ) -> list[tuple[dict[str, Any], ExtractedRunMetadata]]:
-    """Concurrently fetches and parses metadata for all URLs, optionally saving JSON snapshots."""
-    expanded = expand_input_urls(urls, timeout=timeout)
+    """Concurrently fetches and parses metadata for all URLs, reusing cached JSON snapshots when valid."""
+    expanded = expand_input_urls(
+        urls,
+        timeout=timeout,
+        retries=retries,
+        retry_backoff_sec=retry_backoff_sec,
+        cookies_from_browser=cookies_from_browser,
+        cookies_file=cookies_file,
+        sleep_requests=sleep_requests,
+    )
     if not expanded:
         return []
 
@@ -420,8 +498,45 @@ def fetch_metadata_batch(
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
-        raw_list = list(ex.map(lambda u: fetch_video_metadata(u, timeout=timeout), expanded))
+    raw_by_idx: dict[int, dict[str, Any]] = {}
+    to_fetch: list[tuple[int, str]] = []
+    for idx, url in enumerate(expanded):
+        cached: dict[str, Any] | None = None
+        if use_cache and out_dir is not None:
+            cache_path = out_dir / f"{extract_video_id(url)}.json"
+            if cache_path.exists() and cache_path.stat().st_size > 0:
+                try:
+                    loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict) and not loaded.get("fetch_error") and loaded.get("title"):
+                        loaded.setdefault("original_url", url)
+                        cached = loaded
+                except Exception:
+                    cached = None
+        if cached is not None:
+            raw_by_idx[idx] = cached
+        else:
+            to_fetch.append((idx, url))
+
+    if to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+            fetched_vals = list(
+                ex.map(
+                    lambda item: fetch_video_metadata(
+                        item[1],
+                        timeout=timeout,
+                        retries=retries,
+                        retry_backoff_sec=retry_backoff_sec,
+                        cookies_from_browser=cookies_from_browser,
+                        cookies_file=cookies_file,
+                        sleep_requests=sleep_requests,
+                    ),
+                    to_fetch,
+                )
+            )
+        for (idx, _url), raw in zip(to_fetch, fetched_vals):
+            raw_by_idx[idx] = raw
+
+    raw_list = [raw_by_idx[i] for i in range(len(expanded))]
 
     paired: list[tuple[dict[str, Any], ExtractedRunMetadata]] = []
     index_rows: list[dict[str, Any]] = []

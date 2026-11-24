@@ -103,6 +103,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="When seed is absent from description, allow downloading if seed_ocr.pt exists to read end screen",
     )
+    p.add_argument(
+        "--stage1-workers",
+        type=int,
+        default=2,
+        help="Concurrent Stage-1 video scanner subprocesses (fed into serial GPU Stage 2; default: 2)",
+    )
+    p.add_argument(
+        "--stage1-threads-per-worker",
+        type=int,
+        default=None,
+        help="Template-matching threads per Stage-1 worker (auto-scaled when omitted)",
+    )
+    p.add_argument("--yt-dlp-retries", type=int, default=3)
+    p.add_argument("--yt-dlp-retry-backoff", type=float, default=3.0)
+    p.add_argument("--sleep-requests", type=float, default=None)
+    p.add_argument("--sleep-interval", type=float, default=None)
+    p.add_argument("--cookies-from-browser", type=str, default=None)
+    p.add_argument("--cookies-file", type=str, default=None)
+    p.add_argument(
+        "--metadata-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse valid saved metadata JSON files in work-dir/metadata (default: enabled)",
+    )
     p.add_argument("--skip-frames", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--conf-hand", type=float, default=0.50)
@@ -132,6 +156,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=bool(args.dry_run),
         allow_deck_template_fallback=bool(args.deck_template_fallback),
         allow_ocr_seed_fallback=bool(args.allow_ocr_seed_fallback),
+        stage1_workers=max(1, int(args.stage1_workers)),
+        stage1_threads_per_worker=args.stage1_threads_per_worker,
+        yt_dlp_retries=max(0, int(args.yt_dlp_retries)),
+        yt_dlp_retry_backoff_sec=max(0.0, float(args.yt_dlp_retry_backoff)),
+        sleep_requests=args.sleep_requests,
+        sleep_interval=args.sleep_interval,
+        cookies_from_browser=args.cookies_from_browser,
+        cookies_file=Path(args.cookies_file) if args.cookies_file else None,
+        use_metadata_cache=bool(args.metadata_cache),
         skip_frames=int(args.skip_frames),
         batch_size=int(args.batch_size),
         conf_hand=float(args.conf_hand),

@@ -282,6 +282,9 @@ function G.DATASET_MOD:create_random_joker_card(area, forced_center, allow_legen
 
     card.custom_art_variant = "vanilla_or_active"
     if variants and #variants > 0 then
+        if not card.edition and math.random() < 0.20 then
+            card:set_edition({negative = true}, true, true)
+        end
         -- Evenly disperse: 50% active/vanilla mod art, 50% split across historical BUMod variants
         if math.random() < 0.50 then
             local chosen_var = variants[math.random(#variants)]
@@ -1255,13 +1258,14 @@ function G.DATASET_MOD:populate_consumables_area()
     local is_perkeo = (math.random() < 0.10)
     self.is_perkeo_active = is_perkeo
 
-    -- Slot limit under deck / vouchers (1-3)
-    local slot_limit = math.random(1, 3)
+    -- Slot limit under deck / vouchers (1-3), biased toward multi-slot consumables
+    local r_slot = math.random()
+    local slot_limit = (r_slot < 0.20) and 1 or ((r_slot < 0.60) and 2 or 3)
 
     if not is_perkeo then
         -- Normal Circumstances (90% of the time):
-        -- 0, 1, or 2 cards
-        local num_cards = math.random(0, 2)
+        -- 0..slot_limit cards, with extra weight on full 3-card non-negative Crystal Ball / Magic Deck layouts
+        local num_cards = (slot_limit == 3 and math.random() < 0.50) and 3 or math.random(0, slot_limit)
         G.consumeables.config.card_limit = slot_limit
 
         -- 10% chance for Showman effect allowing duplicates

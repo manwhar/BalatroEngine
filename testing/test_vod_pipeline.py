@@ -9,10 +9,21 @@ import threading
 import time
 import unittest
 
+from unittest.mock import patch
+
 from game.balatro_models import Deck, Stake
 from vod_pipeline.deck_matcher import DeckVideoMatch
-from vod_pipeline.metadata import extract_run_metadata, extract_video_id
-from vod_pipeline.runner import PipelineConfig, run_batch_pipeline
+from vod_pipeline.metadata import (
+    extract_run_metadata,
+    extract_video_id,
+    fetch_metadata_batch,
+)
+from vod_pipeline.runner import (
+    PipelineConfig,
+    download_video,
+    process_downloaded_video,
+    run_batch_pipeline,
+)
 
 
 class TestVodMetadataAndBatchPipeline(unittest.TestCase):
@@ -379,6 +390,242 @@ class TestVodMetadataAndBatchPipeline(unittest.TestCase):
             set(pending.keys()),
             {"_MDwyFmIo5s", "9vDE86eVa0Y", "KwcBB0pDDJo"},
         )
+
+    def test_process_downloaded_video_reuses_actions_json_and_collects_cleanliness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "batch_runs"
+            actions_dir = work_dir / "actions"
+            traj_dir = work_dir / "trajectories"
+            dl_dir = work_dir / "downloads"
+            actions_dir.mkdir(parents=True, exist_ok=True)
+            traj_dir.mkdir(parents=True, exist_ok=True)
+            dl_dir.mkdir(parents=True, exist_ok=True)
+
+            vid = "dQw4w9WgXcQ"
+            video_path = dl_dir / f"{vid}.mp4"
+            video_path.write_bytes(b"mp4")
+            actions_path = actions_dir / f"{vid}_actions.json"
+            actions_path.write_text(
+                json.dumps({"key": {"Play Hand": 0}, "frames": {"100": {"action": 0}}}),
+                encoding="utf-8",
+            )
+            traj_path = traj_dir / f"{vid}_trajectory.json"
+            traj_path.write_text(
+                json.dumps(
+                    {
+                        "initial_state": {"ante": 1},
+                        "steps": [
+                            {"ante": 1, "action": {"metadata": {"corrupted": False, "corruption_reasons": []}}},
+                            {"ante": 7, "action": {"metadata": {"corrupted": True, "corruption_reasons": ["location_mismatch"]}}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            meta = extract_run_metadata(
+                {
+                    "id": vid,
+                    "title": "Blue Deck Gold Stake",
+                    "description": "Seed: ABCD1234",
+                },
+                url=f"https://www.youtube.com/watch?v={vid}",
+            )
+
+            seen_flags: list[tuple[bool, bool]] = []
+
+            def fake_run_end_to_end(args):
+                seen_flags.append((bool(args.actions_json), bool(args.full_video)))
+                return {
+                    "actions_json": args.actions_json or args.actions_out,
+                    "trajectory_json": str(traj_path),
+                    "trajectory": None,
+                    "state": None,
+                }
+
+            import main as vod_main
+
+            cfg_resume = PipelineConfig(work_dir=work_dir, resume=True)
+            with patch.object(vod_main, "run_end_to_end", side_effect=fake_run_end_to_end):
+                res_resume = process_downloaded_video(video_path, meta, cfg_resume)
+                self.assertTrue(res_resume["actions_reused"])
+                self.assertEqual(res_resume["clean_steps"], 1)
+                self.assertEqual(res_resume["total_steps"], 2)
+                self.assertEqual(res_resume["ante78_clean"], 0)
+                self.assertEqual(res_resume["ante78_total"], 1)
+
+                cfg_fresh = PipelineConfig(work_dir=work_dir, resume=False)
+                res_fresh = process_downloaded_video(video_path, meta, cfg_fresh)
+                self.assertFalse(res_fresh["actions_reused"])
+
+            self.assertEqual(seen_flags, [(True, False), (False, True)])
+
+    def test_download_video_retries_with_backoff_and_metadata_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            dl_dir = root / "downloads"
+            meta_dir = root / "metadata"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1) Retry + backoff recovery in download_video
+            attempt_count = [0]
+
+            class _FakePopen:
+                def __init__(self, cmd, **_kwargs):
+                    attempt_count[0] += 1
+                    self._attempt = attempt_count[0]
+                    if self._attempt >= 3:
+                        (dl_dir / "vidRetry123.mp4").write_bytes(b"ok_video")
+                    self.returncode = 0 if self._attempt >= 3 else 1
+
+                def poll(self):
+                    return self.returncode
+
+                def communicate(self):
+                    if self.returncode == 0:
+                        return str(dl_dir / "vidRetry123.mp4") + "\n", ""
+                    return "", "HTTP Error 429: Too Many Requests"
+
+            sleeps: list[float] = []
+            with (
+                patch("vod_pipeline.runner.subprocess.Popen", side_effect=lambda *a, **kw: _FakePopen(a[0], **kw)),
+                patch("vod_pipeline.runner._sleep_with_stop", side_effect=lambda s, _ev: sleeps.append(s)),
+            ):
+                out_path = download_video(
+                    "https://www.youtube.com/watch?v=vidRetry123",
+                    "vidRetry123",
+                    dl_dir,
+                    retries=2,
+                    retry_backoff_sec=1.5,
+                )
+            self.assertTrue(out_path.exists())
+            self.assertEqual(attempt_count[0], 3)
+            self.assertEqual(sleeps, [1.5, 3.0])
+
+            # 2) Cached metadata reuse in fetch_metadata_batch without calling fetch_video_metadata
+            cached_payload = {
+                "id": "cachedVid01",
+                "title": "Yellow Deck Gold Stake",
+                "description": "Seed: QWER5678",
+            }
+            (meta_dir / "cachedVid01.json").write_text(json.dumps(cached_payload), encoding="utf-8")
+            with patch(
+                "vod_pipeline.metadata.fetch_video_metadata",
+                side_effect=AssertionError("Should reuse valid cached metadata"),
+            ):
+                paired = fetch_metadata_batch(
+                    ["https://www.youtube.com/watch?v=cachedVid01"],
+                    save_dir=meta_dir,
+                    use_cache=True,
+                )
+            self.assertEqual(len(paired), 1)
+            self.assertTrue(paired[0][1].ready)
+            self.assertEqual(paired[0][1].deck, Deck.YELLOW_DECK)
+            self.assertEqual(paired[0][1].seed, "QWER5678")
+
+    def test_batch_pipeline_parallel_stage1_serial_stage2_and_cleanliness_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "batch_runs"
+            vids = ["par0", "par1", "par2", "par3"]
+            urls = [f"https://www.youtube.com/watch?v={v}" for v in vids]
+
+            def fake_fetch(input_urls, _cfg):
+                return [
+                    (
+                        {"id": v, "title": "Red Deck Gold Stake", "description": "Seed: AAAA1111"},
+                        extract_run_metadata(
+                            {"id": v, "title": "Red Deck Gold Stake", "description": "Seed: AAAA1111"},
+                            url=f"https://www.youtube.com/watch?v={v}",
+                        ),
+                    )
+                    for v in vids
+                ]
+
+            lock = threading.Lock()
+            active_s1 = [0]
+            max_active_s1 = [0]
+            active_s2 = [0]
+            max_active_s2 = [0]
+            max_files_on_disk = [0]
+
+            def fake_download(_url, video_id, downloads_dir, _cfg, _stop_event):
+                p = downloads_dir / f"{video_id}.mp4"
+                p.write_bytes(b"mp4")
+                with lock:
+                    on_disk = len(list(downloads_dir.glob("*.mp4")))
+                    max_files_on_disk[0] = max(max_files_on_disk[0], on_disk)
+                return p
+
+            def fake_stage1(_vpath, _meta, _cfg, actions_out: Path) -> float:
+                with lock:
+                    active_s1[0] += 1
+                    max_active_s1[0] = max(max_active_s1[0], active_s1[0])
+                time.sleep(0.08)
+                actions_out.write_text(json.dumps({"key": {}, "frames": {}}), encoding="utf-8")
+                with lock:
+                    active_s1[0] -= 1
+                return 0.08
+
+            def fake_stage2(_vpath, meta, _cfg, _actions_out: Path) -> dict:
+                with lock:
+                    active_s2[0] += 1
+                    max_active_s2[0] = max(max_active_s2[0], active_s2[0])
+                time.sleep(0.02)
+                with lock:
+                    active_s2[0] -= 1
+                traj_out = work_dir / "trajectories" / f"{meta.video_id}_trajectory.json"
+                traj_out.write_text("{}", encoding="utf-8")
+                return {
+                    "actions_json": str(work_dir / "actions" / f"{meta.video_id}_actions.json"),
+                    "trajectory_json": str(traj_out),
+                    "num_steps": 10,
+                    "clean_steps": 9,
+                    "total_steps": 10,
+                    "clean_pct": 90.0,
+                    "ante13_clean": 5,
+                    "ante13_total": 5,
+                    "ante46_clean": 3,
+                    "ante46_total": 3,
+                    "ante78_clean": 1,
+                    "ante78_total": 2,
+                    "ante78_pct": 50.0,
+                    "cascade_step": None,
+                    "corruption_reasons": {"large_ocr_override": 1},
+                    "stage2_sec": 0.02,
+                    "elapsed_sec": 0.1,
+                }
+
+            cfg = PipelineConfig(
+                work_dir=work_dir,
+                max_backlog=2,
+                download_workers=2,
+                stage1_workers=2,
+                keep_videos=False,
+            )
+            report = run_batch_pipeline(
+                urls,
+                cfg,
+                fetch_metadata_fn=fake_fetch,
+                download_fn=fake_download,
+                stage1_fn=fake_stage1,
+                stage2_fn=fake_stage2,
+            )
+
+            self.assertEqual(report["counts"]["processed"], 4)
+            self.assertEqual(report["counts"]["failed"], 0)
+            self.assertGreaterEqual(max_active_s1[0], 2)
+            self.assertEqual(max_active_s2[0], 1)
+            self.assertLessEqual(max_files_on_disk[0], 2)
+            self.assertEqual(list((work_dir / "downloads").glob("*.mp4")), [])
+
+            csum = report["cleanliness_summary"]
+            self.assertEqual(csum["clean_steps"], 36)
+            self.assertEqual(csum["total_steps"], 40)
+            self.assertEqual(csum["clean_pct"], 90.0)
+            self.assertEqual(csum["ante78_clean"], 4)
+            self.assertEqual(csum["ante78_total"], 8)
+            self.assertEqual(csum["ante78_pct"], 50.0)
+            self.assertEqual(csum["corruption_reasons"], {"large_ocr_override": 4})
 
 
 if __name__ == "__main__":

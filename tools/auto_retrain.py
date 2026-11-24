@@ -247,8 +247,9 @@ def launch_training(
     train_script: Path,
     model_type: str,
     stage: str = "all",
-    epochs_det: int = 15,
-    epochs_cls: int = 25,
+    epochs_det: int | None = None,
+    epochs_cls: int | None = None,
+    backbone: str | None = None,
     clean_sync: bool = False,
 ):
     print("\n" + "=" * 70)
@@ -260,11 +261,15 @@ def launch_training(
         str(train_script),
         sync_flag,
         "--stage", stage,
-        "--epochs-detector", str(epochs_det),
-        "--epochs-classifier", str(epochs_cls),
         "--batch-classifier", "512",
-        "--workers", "8"
+        "--workers", "8",
     ]
+    if epochs_det is not None:
+        cmd.extend(["--epochs-detector", str(epochs_det)])
+    if epochs_cls is not None:
+        cmd.extend(["--epochs-classifier", str(epochs_cls)])
+    if backbone:
+        cmd.extend(["--backbone", backbone])
     print(f"Executing: {' '.join(cmd)}\n" + "=" * 70 + "\n")
 
     # Run and stream output directly to terminal
@@ -285,8 +290,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="shop", choices=["shop", "card", "deck", "both", "auto"], help="Model(s) to train (default: shop)")
     parser.add_argument("--target", type=int, default=10000, help="Target image count (default: 10000)")
     parser.add_argument("--interval", type=int, default=5, help="Poll interval in seconds (default: 5)")
-    parser.add_argument("--epochs-detector", type=int, default=15, help="Stage 1 detector epochs (default: 15)")
-    parser.add_argument("--epochs-classifier", type=int, default=15, help="Stage 2 classifier epochs (default: 15)")
+    parser.add_argument("--epochs-detector", type=int, default=None, help="Stage 1 detector epochs (defaults to per-model train.py default)")
+    parser.add_argument("--epochs-classifier", type=int, default=None, help="Stage 2 classifier epochs (defaults to per-model train.py default)")
+    parser.add_argument("--backbone", type=str, default=None, choices=["mobilenet_v3_small", "mobilenet_v3_large", "resnet18"], help="Stage 2 classifier backbone override")
     parser.add_argument("--clean-shop", action="store_true", help="Delete existing shop & shop_crops datasets before monitoring/syncing (preserves hand card dataset)")
     parser.add_argument("--clean-deck", action="store_true", help="Delete existing View Deck datasets before monitoring/syncing (preserves hand card & shop datasets)")
     parser.add_argument("--shop-stage", type=str, default="all", choices=["all", "detector", "classifier"], help="Training stage for shop_classifier (default: all)")
@@ -312,6 +318,7 @@ if __name__ == "__main__":
             stage=args.shop_stage,
             epochs_det=args.epochs_detector,
             epochs_cls=args.epochs_classifier,
+            backbone=args.backbone,
             clean_sync=args.clean_shop,
         )
         # Never --clean-sync card_classifier here so existing hand card data is preserved
@@ -321,6 +328,7 @@ if __name__ == "__main__":
             stage=card_stage,
             epochs_det=args.epochs_detector,
             epochs_cls=args.epochs_classifier,
+            backbone=args.backbone,
             clean_sync=False,
         )
     else:
@@ -339,5 +347,6 @@ if __name__ == "__main__":
             stage=stage,
             epochs_det=args.epochs_detector,
             epochs_cls=args.epochs_classifier,
+            backbone=args.backbone,
             clean_sync=clean_sync,
         )

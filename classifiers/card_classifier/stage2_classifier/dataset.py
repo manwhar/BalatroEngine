@@ -129,6 +129,7 @@ class CardCropDataset(Dataset):
         cache_in_memory=True,
         max_cache_gb=12.0,
         max_deck_crops_per_frame: int | None = 16,
+        pad_ratio: float = 0.0,
     ):
         super().__init__()
         self.data_root = Path(data_root)
@@ -138,6 +139,9 @@ class CardCropDataset(Dataset):
         self.raw_tensor_mode = (transform is None)
         self.transform = transform
         self.max_deck_crops_per_frame = max_deck_crops_per_frame
+        self.pad_ratio = max(0.0, float(pad_ratio))
+        self.crop_w = int(round(CROP_WIDTH * (1.0 + 2.0 * self.pad_ratio))) if self.pad_ratio > 0 else CROP_WIDTH
+        self.crop_h = int(round(CROP_HEIGHT * (1.0 + 2.0 * self.pad_ratio))) if self.pad_ratio > 0 else CROP_HEIGHT
 
         # 1. Discover all matching hand frame image & json pairs
         valid_frames = []
@@ -253,13 +257,55 @@ class CardCropDataset(Dataset):
 
         self._cached_images = None
         self.uses_ram_cache = False
-        est_bytes = n * 3 * CROP_HEIGHT * CROP_WIDTH
+        est_bytes = n * 3 * self.crop_h * self.crop_w
         if cache_in_memory and self.raw_tensor_mode and n > 0 and est_bytes <= int(max_cache_gb * (1024 ** 3)):
             self._preload_crops_to_ram()
 
+    def _extract_resized_crop(self, img_rgb: Image.Image, box: list | tuple) -> Image.Image:
+        iw, ih = img_rgb.size
+        px, py, pw, ph = box
+        if self.pad_ratio <= 0.0:
+            if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+                crop = img_rgb
+            else:
+                x1 = max(0, min(iw - 1, int(round(px))))
+                y1 = max(0, min(ih - 1, int(round(py))))
+                x2 = max(x1 + 1, min(iw, int(round(px + pw))))
+                y2 = max(y1 + 1, min(ih, int(round(py + ph))))
+                crop = img_rgb.crop((x1, y1, x2, y2))
+            return crop.resize((self.crop_w, self.crop_h), Image.Resampling.BILINEAR)
+
+        pad_x = max(1, int(round(pw * self.pad_ratio)))
+        pad_y = max(1, int(round(ph * self.pad_ratio)))
+        if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+            arr = np.asarray(img_rgb, dtype=np.uint8)
+            arr = np.pad(arr, ((pad_y, pad_y), (pad_x, pad_x), (0, 0)), mode="edge")
+            crop = Image.fromarray(arr)
+        else:
+            tx1 = int(round(px - pad_x))
+            ty1 = int(round(py - pad_y))
+            tx2 = int(round(px + pw + pad_x))
+            ty2 = int(round(py + ph + pad_y))
+            cx1 = max(0, min(iw - 1, tx1))
+            cy1 = max(0, min(ih - 1, ty1))
+            cx2 = max(cx1 + 1, min(iw, tx2))
+            cy2 = max(cy1 + 1, min(ih, ty2))
+            sub = img_rgb.crop((cx1, cy1, cx2, cy2))
+            pl = max(0, cx1 - tx1)
+            pt = max(0, cy1 - ty1)
+            pr = max(0, tx2 - cx2)
+            pb = max(0, ty2 - cy2)
+            if pl or pt or pr or pb:
+                arr = np.asarray(sub, dtype=np.uint8)
+                arr = np.pad(arr, ((pt, pb), (pl, pr), (0, 0)), mode="edge")
+                crop = Image.fromarray(arr)
+            else:
+                crop = sub
+        return crop.resize((self.crop_w, self.crop_h), Image.Resampling.BILINEAR)
+
     def _preload_crops_to_ram(self):
         n = len(self.samples)
-        buf = torch.empty((n, 3, CROP_HEIGHT, CROP_WIDTH), dtype=torch.uint8)
+        buf = torch.empty((n, 3, self.crop_h, self.crop_w), dtype=torch.uint8)
         groups = defaultdict(list)
         for idx, s in enumerate(self.samples):
             groups[s["img_path"]].append((idx, s["box_pixel"]))
@@ -269,18 +315,8 @@ class CardCropDataset(Dataset):
             try:
                 with Image.open(img_path) as full_img:
                     img_rgb = full_img.convert("RGB")
-                    iw, ih = img_rgb.size
                     for idx, box in entries:
-                        px, py, pw, ph = box
-                        if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
-                            crop = img_rgb
-                        else:
-                            x1 = max(0, min(iw - 1, px))
-                            y1 = max(0, min(ih - 1, py))
-                            x2 = max(x1 + 1, min(iw, x1 + pw))
-                            y2 = max(y1 + 1, min(ih, y1 + ph))
-                            crop = img_rgb.crop((x1, y1, x2, y2))
-                        resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
+                        resized = self._extract_resized_crop(img_rgb, box)
                         arr = np.asarray(resized, dtype=np.uint8)
                         buf[idx].copy_(torch.from_numpy(arr).permute(2, 0, 1))
             except Exception:
@@ -304,25 +340,28 @@ class CardCropDataset(Dataset):
             item = self.samples[idx]
             try:
                 with Image.open(item["img_path"]) as full_img:
-                    full_img = full_img.convert("RGB")
-                    px, py, pw, ph = item["box_pixel"]
-                    iw, ih = full_img.size
-                    if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
-                        crop = full_img.copy()
+                    img_rgb = full_img.convert("RGB")
+                    if self.raw_tensor_mode:
+                        resized = self._extract_resized_crop(img_rgb, item["box_pixel"])
+                        tensor_img = torch.from_numpy(np.asarray(resized, dtype=np.uint8)).permute(2, 0, 1).contiguous()
                     else:
-                        x1 = max(0, min(iw - 1, px))
-                        y1 = max(0, min(ih - 1, py))
-                        x2 = max(x1 + 1, min(iw, x1 + pw))
-                        y2 = max(y1 + 1, min(ih, y1 + ph))
-                        crop = full_img.crop((x1, y1, x2, y2))
+                        iw, ih = img_rgb.size
+                        px, py, pw, ph = item["box_pixel"]
+                        if px == 0 and py == 0 and abs(pw - iw) <= 2 and abs(ph - ih) <= 2:
+                            crop = img_rgb.copy()
+                        else:
+                            x1 = max(0, min(iw - 1, px))
+                            y1 = max(0, min(ih - 1, py))
+                            x2 = max(x1 + 1, min(iw, x1 + pw))
+                            y2 = max(y1 + 1, min(ih, y1 + ph))
+                            crop = img_rgb.crop((x1, y1, x2, y2))
+                        tensor_img = self.transform(crop)
             except Exception:
-                crop = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (128, 128, 128))
-
-            if self.raw_tensor_mode:
-                resized = crop.resize((CROP_WIDTH, CROP_HEIGHT), Image.Resampling.BILINEAR)
-                tensor_img = torch.from_numpy(np.asarray(resized, dtype=np.uint8)).permute(2, 0, 1).contiguous()
-            else:
-                tensor_img = self.transform(crop)
+                crop = Image.new("RGB", (self.crop_w, self.crop_h), (128, 128, 128))
+                if self.raw_tensor_mode:
+                    tensor_img = torch.from_numpy(np.asarray(crop, dtype=np.uint8)).permute(2, 0, 1).contiguous()
+                else:
+                    tensor_img = self.transform(crop)
 
         targets = {k: v[idx] for k, v in self._targets.items()}
         return tensor_img, targets

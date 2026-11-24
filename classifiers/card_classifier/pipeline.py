@@ -24,14 +24,20 @@ try:
         CROP_WIDTH, CROP_HEIGHT
     )
     from classifiers.card_classifier.stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-    from classifiers.card_classifier.stage2_classifier.model import MultiHeadCardClassifier
+    from classifiers.card_classifier.stage2_classifier.model import (
+        MultiHeadCardClassifier,
+        infer_backbone_from_checkpoint,
+    )
 except ImportError:
     from stage2_classifier.config import (
         IDX_TO_RANK, IDX_TO_SUIT, IDX_TO_EDITION, IDX_TO_ENHANCEMENT, IDX_TO_SEAL,
         CROP_WIDTH, CROP_HEIGHT
     )
     from stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-    from stage2_classifier.model import MultiHeadCardClassifier
+    from stage2_classifier.model import (
+        MultiHeadCardClassifier,
+        infer_backbone_from_checkpoint,
+    )
 
 
 @dataclass
@@ -275,9 +281,10 @@ class CardRecognitionPipeline:
 
         self.detector = YOLO(str(detector_path))
         
-        self.classifier = MultiHeadCardClassifier(backbone_name=backbone, pretrained=False).to(self.device)
         ckpt = torch.load(str(classifier_path), map_location=self.device)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
+        resolved_backbone = infer_backbone_from_checkpoint(ckpt, default_backbone=backbone or "mobilenet_v3_small")
+        self.classifier = MultiHeadCardClassifier(backbone_name=resolved_backbone, pretrained=False).to(self.device)
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         # Filter out head_selected in case loading an older checkpoint prior to retraining
         filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("head_selected")}
         self.classifier.load_state_dict(filtered_state_dict, strict=False)

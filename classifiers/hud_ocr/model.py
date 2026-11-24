@@ -71,11 +71,14 @@ def ctc_greedy_decode(
         confs: list[float] = []
         prev_id = blank_idx
         for idx, prob in zip(seq_ids, seq_probs):
-            if idx != blank_idx and idx != prev_id:
-                ch = IDX_TO_CHAR.get(int(idx), "")
-                if ch:
-                    chars.append(ch)
-                    confs.append(float(prob))
+            if idx != blank_idx:
+                if idx != prev_id:
+                    ch = IDX_TO_CHAR.get(int(idx), "")
+                    if ch:
+                        chars.append(ch)
+                        confs.append(float(prob))
+                elif confs:
+                    confs[-1] = max(confs[-1], float(prob))
             prev_id = int(idx)
         text = "".join(chars)
         confidence = float(sum(confs) / len(confs)) if confs else float(max(seq_probs) if seq_probs else 0.0)

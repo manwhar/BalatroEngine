@@ -36,8 +36,13 @@ function G.DATASET_MOD:get_random_edition()
 end
 
 function G.DATASET_MOD:get_random_enhancement()
-    if math.random() < 0.5 then return nil end
-    local enhs = {'m_bonus', 'm_mult', 'm_wild', 'm_glass', 'm_steel', 'm_gold', 'm_lucky'}
+    if math.random() < 0.45 then return nil end
+    local enhs = {
+        'm_bonus', 'm_mult', 'm_wild',
+        'm_glass', 'm_glass',
+        'm_steel', 'm_steel',
+        'm_gold', 'm_lucky',
+    }
     return enhs[math.random(#enhs)]
 end
 

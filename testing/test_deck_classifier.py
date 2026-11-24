@@ -23,7 +23,15 @@ from classifiers.card_classifier.stage2_classifier.dataset import (
     CardCropDataset,
     _select_deck_cards_for_frame,
 )
-from classifiers.card_classifier.stage2_classifier.model import MultiHeadCardClassifier
+from classifiers.card_classifier.stage2_classifier.model import (
+    MultiHeadCardClassifier,
+    infer_backbone_from_checkpoint as infer_card_backbone,
+)
+from classifiers.shop_classifier.stage2_classifier.model import (
+    MultiHeadItemClassifier,
+    infer_backbone_from_checkpoint as infer_shop_backbone,
+)
+from classifiers.augmentations import apply_gpu_batch_augmentations
 from classifiers.common.dataset_sync import sync_mod_dataset
 from classifiers.deck_classifier.config import resolve_view_deck_roi
 from classifiers.deck_classifier.evaluate import compute_iou, match_predictions_to_gt
@@ -337,6 +345,37 @@ class TestDeckClassifier(unittest.TestCase):
             )
             roi = resolve_view_deck_roi(boxes_lua)
             self.assertEqual(roi, {"x": 612.5, "y": 215.25, "w": 1105.0, "h": 642.5})
+
+    def test_backbone_auto_detection_and_padded_crop_jitter(self) -> None:
+        # Both metadata-tagged and legacy unlabeled checkpoints resolve to exact backbone
+        small_card = MultiHeadCardClassifier(backbone_name="mobilenet_v3_small", pretrained=False)
+        large_card = MultiHeadCardClassifier(backbone_name="mobilenet_v3_large", pretrained=False)
+        self.assertEqual(infer_card_backbone({"model": small_card.state_dict()}), "mobilenet_v3_small")
+        self.assertEqual(
+            infer_card_backbone({"model": large_card.state_dict(), "backbone": "mobilenet_v3_large"}),
+            "mobilenet_v3_large",
+        )
+        self.assertEqual(infer_card_backbone({"model": large_card.state_dict()}), "mobilenet_v3_large")
+
+        small_shop = MultiHeadItemClassifier(backbone_name="mobilenet_v3_small", pretrained=False)
+        large_shop = MultiHeadItemClassifier(backbone_name="mobilenet_v3_large", pretrained=False)
+        self.assertEqual(infer_shop_backbone({"model_state_dict": small_shop.state_dict()}), "mobilenet_v3_small")
+        self.assertEqual(infer_shop_backbone({"model_state_dict": large_shop.state_dict()}), "mobilenet_v3_large")
+
+        # Padded crop batch -> exact target (CROP_HEIGHT=192, CROP_WIDTH=128) in train and eval modes
+        padded = torch.randint(0, 256, (4, 3, 223, 148), dtype=torch.uint8)
+        out_train = apply_gpu_batch_augmentations(
+            padded,
+            is_train=True,
+            compression_prob=0.0,
+            cursor_prob=0.0,
+            color_jitter=False,
+            geom_prob=0.5,
+            pad_crop_size=(192, 128),
+        )
+        out_val = apply_gpu_batch_augmentations(padded, is_train=False, pad_crop_size=(192, 128))
+        self.assertEqual(tuple(out_train.shape), (4, 3, 192, 128))
+        self.assertEqual(tuple(out_val.shape), (4, 3, 192, 128))
 
 
 if __name__ == "__main__":

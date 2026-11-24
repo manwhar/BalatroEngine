@@ -365,8 +365,10 @@ def detect_video_actions(
     cash_out_last_box: list[int] | None = None
     open_pack_visible_streak = 0
     open_pack_missing_streak = 0
+    blind_deck_tab_streak = 0
+    blind_deck_tab_x_thresh = int(0.468 * config.resolution.width)
     shop_last_activity_frame: int | None = None
-    shop_pack_fallback_frames = 90
+    shop_pack_fallback_frames = 45
 
     def _reset_cash_out_watch() -> None:
         nonlocal \
@@ -392,6 +394,7 @@ def detect_video_actions(
         nonlocal cash_out_visible_streak, cash_out_missing_streak
         nonlocal cash_out_first_missing_frame, cash_out_last_box
         nonlocal open_pack_visible_streak, open_pack_missing_streak
+        nonlocal blind_deck_tab_streak
         nonlocal shop_last_activity_frame
 
         prev_state = (
@@ -399,10 +402,26 @@ def detect_video_actions(
             screen_tracker.allow_play_game,
             screen_tracker.pre_pack_location,
             screen_tracker.last_cash_out_frame,
+            screen_tracker.last_held_item_action_frame,
         )
         if template_clicked is not None and clicked_name is not None:
             action_frames[frame_idx] = template_clicked
             screen_tracker.on_template_clicked(clicked_name, frame_idx=frame_idx)
+            if clicked_name == "Full Deck":
+                fd_box = template_clicked.get("box")
+                fd_view_mode = (template_clicked.get("metadata") or {}).get(
+                    "view_mode"
+                )
+                if fd_view_mode == "remaining" or (
+                    fd_box is not None and int(fd_box[0]) >= blind_deck_tab_x_thresh
+                ):
+                    blind_deck_tab_streak += 1
+                    if blind_deck_tab_streak >= 3:
+                        screen_tracker.on_blind_view_deck_observed()
+                else:
+                    blind_deck_tab_streak = 0
+            else:
+                blind_deck_tab_streak = 0
             _reset_open_pack_watch()
             if screen_tracker.state == CoarseScreenState.SHOP:
                 shop_last_activity_frame = frame_idx
@@ -421,6 +440,7 @@ def detect_video_actions(
             ):
                 _reset_cash_out_watch()
         else:
+            blind_deck_tab_streak = 0
             cash_box = metrics.get("cash_out_box")
             if screen_tracker.state in (
                 CoarseScreenState.BLIND,
@@ -487,6 +507,7 @@ def detect_video_actions(
             screen_tracker.allow_play_game,
             screen_tracker.pre_pack_location,
             screen_tracker.last_cash_out_frame,
+            screen_tracker.last_held_item_action_frame,
         )
         return cur_state != prev_state
 
@@ -551,17 +572,24 @@ def detect_video_actions(
                     while pending:
                         batch = pending
                         remainder: list[Any] = []
-                        if (
-                            screen_tracker.last_cash_out_frame is not None
-                            and pending[0].index
-                            < screen_tracker.last_cash_out_frame
-                            + screen_tracker.shop_next_round_cooldown_frames
-                            <= pending[-1].index
-                        ):
-                            cutoff = (
+                        cooldown_cutoffs: list[int] = []
+                        if screen_tracker.last_cash_out_frame is not None:
+                            cooldown_cutoffs.append(
                                 screen_tracker.last_cash_out_frame
                                 + screen_tracker.shop_next_round_cooldown_frames
                             )
+                        if screen_tracker.last_held_item_action_frame is not None:
+                            cooldown_cutoffs.append(
+                                screen_tracker.last_held_item_action_frame
+                                + screen_tracker.cash_out_after_held_item_cooldown_frames
+                            )
+                        matching_cutoffs = [
+                            c
+                            for c in cooldown_cutoffs
+                            if pending[0].index < c <= pending[-1].index
+                        ]
+                        if matching_cutoffs:
+                            cutoff = min(matching_cutoffs)
                             batch = [vf for vf in pending if vf.index < cutoff]
                             remainder = [vf for vf in pending if vf.index >= cutoff]
 

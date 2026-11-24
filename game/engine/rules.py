@@ -314,6 +314,8 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
     Note: Chip and mult score calculation (including The Flint's 0.5x base Chips/Mult) is
     intentionally omitted here because round scores are obtained via OCR.
     """
+    state._last_play_lucky_triggers = 0
+    state._last_play_lucky_money_hits = 0
     if state.current_blind == BlindName.THE_TOOTH and not state.boss_disabled:
         state.money -= len(played_cards)
 
@@ -409,6 +411,7 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
                     state.money += 3
                 extra = {}
                 if card.enhancement == Enhancement.LUCKY and state.rng:
+                    state._last_play_lucky_triggers += 1
                     hit = evaluate_lucky_hit(
                         state.rng, probability_modifier=get_oops_multiplier(state)
                     )
@@ -416,6 +419,7 @@ def _evaluate_played_cards(state, action: Action, played_cards: list) -> None:
                         card.bonus_mult = getattr(card, "bonus_mult", 0) + 20
                     if hit.money:
                         state.money += 20
+                        state._last_play_lucky_money_hits += 1
                     extra["lucky_triggered"] = hit.any_hit
 
                 ctx_ind = TriggerContext(

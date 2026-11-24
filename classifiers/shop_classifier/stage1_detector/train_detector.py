@@ -27,7 +27,7 @@ except ImportError:
 
 def run_train_detector(
     model_name="yolov8n.pt",
-    epochs=15,
+    epochs=25,
     imgsz=640,
     batch=16,
     name="shop_detector",
@@ -79,7 +79,9 @@ def run_train_detector(
         val=True,
         save=True,
         exist_ok=exist_ok,
-        verbose=True
+        verbose=True,
+        fliplr=0.0,
+        flipud=0.0,
     )
 
     actual_run_dir = Path(results.save_dir) if hasattr(results, "save_dir") else (RUNS_DIR / name)
@@ -96,7 +98,7 @@ def run_train_detector(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Stage 1 YOLO Shop Detector")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size")
     parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing run")

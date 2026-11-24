@@ -55,6 +55,7 @@ from game.balatro_models import (
     Rank,
     Seal,
     Spectral,
+    SpectralName,
     Stake,
     Suit,
     Tarot,
@@ -67,10 +68,15 @@ from game.engine.cv_stubs import (
     _convert_card_result_to_hand_card,
     _convert_items_of_type,
 )
-from game.engine.jokers import _get_visible_poker_hands, on_joker_added
+from game.engine.jokers import (
+    _get_visible_poker_hands,
+    on_joker_added,
+    resolve_copy_target,
+)
+from game.engine.poker_hands import evaluate_poker_hand, get_scoring_cards
 from game.engine.rng_sim.events import get_to_do_list_hand
 from game.engine.rules import _effective_ante, on_action, trigger_end_of_round_effects
-from game.gamestate import GameState, RunTrajectory, _cards_match
+from game.gamestate import GameState, RunTrajectory, _cards_match, calculate_target_chips
 
 
 ACTION_REMAP: dict[str, ActionType] = {
@@ -312,6 +318,60 @@ def filter_premature_next_rounds(
             ActionType.PLAY_HAND,
         ):
             last_cash_out_frame = None
+
+        filtered[frame_str] = entry
+
+    return filtered
+
+
+def filter_false_early_cash_outs(
+    frames: dict[str, int | dict],
+    key: dict[str, int],
+    *,
+    max_gap_frames: int = 15,
+    diag: dict[str, Any] | None = None,
+) -> dict[str, int | dict]:
+    """Filters false `Cash Out` detections fired right after `Use Consumable`/`Sell Card`.
+
+    Intended to run after `inject_end_round_actions` so `[PLAY_HAND, CASH_OUT]` windows remain
+    intact for round-end detection while subsequent `Use Consumable`/`Sell Card` actions remain
+    in `Location.CASH_OUT` until the first shop action triggers `preclicked_cash_out`.
+    """
+    inv_key = {v: k for k, v in key.items()}
+    ordered = sorted(frames.items(), key=lambda kv: int(kv[0]))
+    filtered: dict[str, int | dict] = {}
+    last_held_item_frame: int | None = None
+
+    for frame_str, entry in ordered:
+        frame_idx = int(frame_str)
+        raw_label = inv_key.get(_extract_action_id(entry))
+        action = _resolve_action(raw_label) if raw_label is not None else None
+
+        if action in (ActionType.USE_CONSUMABLE, ActionType.SELL_CARD):
+            last_held_item_frame = frame_idx
+        elif action == ActionType.CASH_OUT:
+            is_disappearance = (
+                isinstance(entry, dict)
+                and isinstance(entry.get("metadata"), dict)
+                and entry["metadata"].get("source") == "cash_out_disappearance"
+            )
+            if (
+                not is_disappearance
+                and last_held_item_frame is not None
+                and 0 < (frame_idx - last_held_item_frame) <= max_gap_frames
+            ):
+                if diag is not None:
+                    diag.setdefault("filtered_early_cash_outs", []).append(frame_idx)
+                continue
+            last_held_item_frame = None
+        elif action in (
+            ActionType.PLAY_HAND,
+            ActionType.DISCARD,
+            ActionType.SELECT_BLIND,
+            ActionType.SKIP_BLIND,
+            ActionType.NEXT_ROUND,
+        ):
+            last_held_item_frame = None
 
         filtered[frame_str] = entry
 
@@ -678,7 +738,7 @@ def match_button_to_item_index(
             continue
         if attach == "center_right":
             item_w = max(1.0, float(box[2] - box[0]))
-            anchor_x = float(box[2]) + 0.55 * item_w
+            anchor_x = float(box[2]) + 1.20 * item_w
             anchor_y = (box[1] + box[3]) / 2.0
         else:
             anchor_x = (box[0] + box[2]) / 2.0
@@ -937,6 +997,7 @@ def _init_diagnostics() -> dict[str, Any]:
         "end_round_segments_checked": 0,
         "end_rounds_injected": 0,
         "filtered_premature_next_rounds": [],
+        "filtered_early_cash_outs": [],
         "missing_frames": [],
         "hud_frames_checked": 0,
         "ocr_score_updates": 0,
@@ -962,8 +1023,14 @@ def _init_diagnostics() -> dict[str, Any]:
         "deck_constrained_remaps": 0,
         "face_down_plays_resolved": 0,
         "inferred_cash_outs": 0,
+        "inferred_next_rounds": 0,
         "inferred_skip_packs": 0,
         "inferred_joker_sells": 0,
+        "inferred_joker_buys": 0,
+        "rng_cons_reconciled": 0,
+        "rng_jokers_reconciled": 0,
+        "reconciled_lucky_money": 0,
+        "reconciled_rebate_money": 0,
         "shop_rescan_windows": 0,
         "shop_rescan_frames_scanned": 0,
         "shop_rescan_recovered": 0,
@@ -1039,6 +1106,13 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
             f"{len(premature_nr)} (frames {premature_nr[:10]})"
         )
 
+    early_co = diag.get("filtered_early_cash_outs", [])
+    if early_co:
+        print(
+            f"Filtered false early Cash Out detections (<=15f after held-item click): "
+            f"{len(early_co)} (frames {early_co[:10]})"
+        )
+
     missing_frames = diag.get("missing_frames", [])
     if missing_frames:
         print(
@@ -1091,9 +1165,7 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
 
     unexp_shop = diag.get("unexpected_shop_transitions", [])
     if unexp_shop:
-        print(
-            f"[WARN] Unexpected shop transitions: {len(unexp_shop)} time(s)"
-        )
+        print(f"[WARN] Unexpected shop transitions: {len(unexp_shop)} time(s)")
         for item in unexp_shop[:12]:
             reasons_str = "; ".join(item["reasons"])
             print(
@@ -1188,15 +1260,38 @@ def _print_expressive_report(diag: dict[str, Any]) -> None:
     remaps = diag.get("deck_constrained_remaps", 0)
     fd_resolved = diag.get("face_down_plays_resolved", 0)
     inf_co = diag.get("inferred_cash_outs", 0)
+    inf_nr = diag.get("inferred_next_rounds", 0)
     inf_sp = diag.get("inferred_skip_packs", 0)
     inf_js = diag.get("inferred_joker_sells", 0)
+    inf_jb = diag.get("inferred_joker_buys", 0)
+    rng_cr = diag.get("rng_cons_reconciled", 0)
+    rng_jr = diag.get("rng_jokers_reconciled", 0)
+    rec_lm = diag.get("reconciled_lucky_money", 0)
+    rec_rm = diag.get("reconciled_rebate_money", 0)
     rs_win = diag.get("shop_rescan_windows", 0)
     rs_rec = diag.get("shop_rescan_recovered", 0)
-    if remaps or fd_resolved or inf_co or inf_sp or inf_js or rs_win or rs_rec:
+    if (
+        remaps
+        or fd_resolved
+        or inf_co
+        or inf_nr
+        or inf_sp
+        or inf_js
+        or inf_jb
+        or rng_cr
+        or rng_jr
+        or rec_lm
+        or rec_rm
+        or rs_win
+        or rs_rec
+    ):
         print(
             f"Recovery hooks: deck_remaps={remaps}, fd_plays_resolved={fd_resolved}, "
-            f"inferred_cash_outs={inf_co}, inferred_skip_packs={inf_sp}, "
-            f"inferred_joker_sells={inf_js}, shop_rescans={rs_win} (+{rs_rec} frames)"
+            f"inferred_cash_outs={inf_co}, inferred_next_rounds={inf_nr}, inferred_skip_packs={inf_sp}, "
+            f"inferred_joker_sells={inf_js}, inferred_joker_buys={inf_jb}, "
+            f"rng_cons_reconciled={rng_cr}, rng_jokers_reconciled={rng_jr}, "
+            f"lucky_money={rec_lm}, rebate_money={rec_rm}, "
+            f"shop_rescans={rs_win} (+{rs_rec} frames)"
         )
     print("==============================================")
 
@@ -1330,6 +1425,63 @@ def _remap_softlocked_planets(raw_items: Sequence[Any], state: GameState) -> lis
     return out
 
 
+def _active_joker_copies(state: GameState, target_name: JokerName) -> int:
+    """Returns count of undebuffed `target_name` jokers plus Blueprint/Brainstorm copies."""
+    if not state.inventory or not state.inventory.jokers:
+        return 0
+    jokers = state.inventory.jokers
+    copies = 0
+    for j in jokers:
+        if j.debuffed:
+            continue
+        if j.name == target_name:
+            copies += 1
+        elif j.name in (JokerName.BLUEPRINT, JokerName.BRAINSTORM):
+            target = resolve_copy_target(j, jokers)
+            if target is not None and not target.debuffed and target.name == target_name:
+                copies += 1
+    return copies
+
+
+def _mail_in_rebate_payout_per_card(state: GameState) -> int:
+    """Returns active per-matching-discard dollar payout from all Mail-In Rebate & copy jokers."""
+    return 5 * _active_joker_copies(state, JokerName.MAIL_IN_REBATE)
+
+
+def _is_plausible_hud_round(
+    new_round: int,
+    cur_round: int,
+    cur_ante: int,
+    next_hud_round: int | None = None,
+    *,
+    ante_jumped: bool = False,
+) -> bool:
+    """Rejects CTC trailing-digit duplications (e.g. 18->188) and impossible jumps in hud_round."""
+    if new_round < 1 or new_round < cur_round:
+        return False
+    if (
+        cur_round > 0
+        and new_round >= 10 * cur_round
+        and str(new_round).startswith(str(cur_round))
+    ):
+        return False
+    if cur_ante <= 8 and new_round > 3 * max(1, cur_ante) + 6:
+        return False
+    if not ante_jumped and new_round > cur_round + 2:
+        if next_hud_round is None or next_hud_round < new_round:
+            return False
+    if new_round > cur_round and next_hud_round is not None:
+        if next_hud_round < new_round - 1:
+            return False
+        if (
+            not ante_jumped
+            and new_round == cur_round + 2
+            and next_hud_round < new_round
+        ):
+            return False
+    return True
+
+
 def _sync_hud_into_state(
     state: GameState,
     hud_out: Any,
@@ -1338,7 +1490,11 @@ def _sync_hud_into_state(
     *,
     has_end_round_after: bool = False,
     next_hud_money: int | None = None,
+    next_hud_moneys: Sequence[int] | None = None,
+    next_hud_round: int | None = None,
     stale_money_drop_guard: bool = False,
+    suppress_hands_discards: bool = False,
+    rebate_discard_info: tuple[Any, ...] | None = None,
     diag: dict[str, Any] | None = None,
 ) -> int | float | None:
     """Applies validated HUD OCR readings into `state`, falling back cleanly on `None`.
@@ -1386,19 +1542,134 @@ def _sync_hud_into_state(
                     state.to_do_poker_hand = state.last_hand_played
                     state.money += 4
                     break
+        lucky_reconciled = False
+        lucky_applied = False
+        lucky_triggers = int(getattr(state, "_last_play_lucky_triggers", 0) or 0)
+        sim_lucky_hits = int(getattr(state, "_last_play_lucky_money_hits", 0) or 0)
         if (
+            lucky_triggers > 0
+            and sa.ambient_location in (Location.BLIND, Location.CASH_OUT)
+            and sa.action_type != ActionType.SELECT_BLIND
+        ):
+            lucky_diff = new_money - state.money
+            lucky_k = int(round(lucky_diff / 20.0)) if lucky_diff != 0 else 0
+            lucky_res = abs(lucky_diff - 20 * lucky_k)
+            if (
+                lucky_k != 0
+                and lucky_res <= 5
+                and 0 <= sim_lucky_hits + lucky_k <= lucky_triggers
+            ):
+                if lucky_res == 0:
+                    state.money = new_money
+                    lucky_reconciled = True
+                else:
+                    state.money += 20 * lucky_k
+                lucky_applied = True
+                if state.inventory and state.inventory.jokers:
+                    for j in state.inventory.jokers:
+                        if j.name == JokerName.LUCKY_CAT and not j.debuffed:
+                            prev_xm = float(j.state.get("x_mult", 1.0))
+                            j.state["x_mult"] = round(
+                                max(1.0, prev_xm + 0.25 * lucky_k), 2
+                            )
+                state._last_play_lucky_triggers = 0
+                state._last_play_lucky_money_hits = 0
+                if diag is not None:
+                    diag["reconciled_lucky_money"] += 1
+
+        rebate_reconciled = False
+        if (
+            not lucky_applied
+            and rebate_discard_info is not None
+            and sa.ambient_location in (Location.BLIND, Location.CASH_OUT)
+            and sa.action_type != ActionType.SELECT_BLIND
+        ):
+            if len(rebate_discard_info) >= 5:
+                (
+                    rebate_round,
+                    rebate_unit,
+                    disc_rank_counts,
+                    sim_rebate_matches,
+                    n_fd_discards,
+                ) = rebate_discard_info[:5]
+            else:
+                (
+                    rebate_round,
+                    rebate_unit,
+                    disc_rank_counts,
+                    sim_rebate_matches,
+                ) = rebate_discard_info[:4]
+                n_fd_discards = 0
+            total_disc_non_stone = sum(disc_rank_counts.values()) + n_fd_discards
+            rebate_diff = new_money - state.money
+            if (
+                state.round == rebate_round
+                and rebate_unit > 0
+                and rebate_diff != 0
+                and rebate_diff % rebate_unit == 0
+            ):
+                true_matches = sim_rebate_matches + (rebate_diff // rebate_unit)
+                valid_rebate = (true_matches == 0 and sim_rebate_matches > 0) or (
+                    0 < true_matches <= total_disc_non_stone
+                    and (
+                        any(
+                            cnt <= true_matches <= cnt + n_fd_discards
+                            for cnt in disc_rank_counts.values()
+                        )
+                        or n_fd_discards >= true_matches
+                    )
+                )
+                if valid_rebate:
+                    if true_matches > 0 and true_matches > n_fd_discards:
+                        cand_ranks = [
+                            r
+                            for r, cnt in disc_rank_counts.items()
+                            if cnt <= true_matches <= cnt + n_fd_discards
+                        ]
+                        if len(cand_ranks) == 1:
+                            true_rank = cand_ranks[0]
+                            state.mail_card_rank = true_rank
+                            if state.inventory and state.inventory.jokers:
+                                for j in state.inventory.jokers:
+                                    if j.name == JokerName.MAIL_IN_REBATE:
+                                        j.state["target_rank"] = true_rank
+                    state.money = new_money
+                    state._rebate_reconciled = True
+                    rebate_reconciled = True
+                    if diag is not None:
+                        diag["reconciled_rebate_money"] += 1
+
+        next_money_window = (
+            list(next_hud_moneys)
+            if next_hud_moneys is not None
+            else ([next_hud_money] if next_hud_money is not None else [])
+        )
+        expected_after = state.money
+        if (
+            sa.action_type == ActionType.REROLL_SHOP
+            and getattr(state, "free_rerolls", 0) == 0
+        ):
+            expected_after = state.money - int(getattr(state, "reroll_cost", 5) or 0)
+
+        if lucky_reconciled or rebate_reconciled:
+            pass
+        elif (
             sa.action_type != ActionType.CASH_OUT
             and next_hud_money is not None
             and abs(new_money - state.money) >= 15
             and abs(next_hud_money - new_money) >= 15
-            and abs(next_hud_money - state.money) <= 10
+            and min(
+                abs(next_hud_money - state.money),
+                abs(next_hud_money - expected_after),
+            )
+            <= 10
         ):
             # Guard against single-frame rolling-digit OCR truncations (e.g. $58 -> $5 -> $55).
             new_money = state.money
         elif (
             stale_money_drop_guard
             and new_money < state.money
-            and (next_hud_money is None or next_hud_money >= state.money)
+            and (not next_money_window or max(next_money_window) >= state.money)
         ):
             # Ignore stale pre-animation money OCR right after Temperance/Hermit.
             new_money = state.money
@@ -1415,7 +1686,8 @@ def _sync_hud_into_state(
 
     hands_val = values.get("hud_hands")
     if (
-        hands_val is not None
+        not suppress_hands_discards
+        and hands_val is not None
         and sa.ambient_location == Location.BLIND
         and sa.action_type != ActionType.SELECT_BLIND
         and int(hands_val) >= 0
@@ -1433,7 +1705,8 @@ def _sync_hud_into_state(
 
     discards_val = values.get("hud_discards")
     if (
-        discards_val is not None
+        not suppress_hands_discards
+        and discards_val is not None
         and sa.ambient_location == Location.BLIND
         and sa.action_type != ActionType.SELECT_BLIND
         and int(discards_val) >= 0
@@ -1484,6 +1757,7 @@ def _sync_hud_into_state(
                 diag["ocr_score_updates"] += 1
             state.current_chips = round_score_val
 
+    prev_ante = state.ante
     ante_val = values.get("hud_ante")
     if (
         ante_val is not None
@@ -1504,14 +1778,20 @@ def _sync_hud_into_state(
         )
         state.ante = new_ante
 
+    ante_jumped = state.ante != prev_ante
     round_val = values.get("hud_round")
     if (
         round_val is not None
         and sa.ambient_location == Location.BLIND
         and sa.action_type != ActionType.END_ROUND
         and not getattr(state, "round_advanced", False)
-        and int(round_val) >= 1
-        and int(round_val) >= state.round
+        and _is_plausible_hud_round(
+            int(round_val),
+            state.round,
+            state.ante,
+            next_hud_round,
+            ante_jumped=ante_jumped,
+        )
     ):
         new_round = int(round_val)
         _record_ocr_override(
@@ -1608,7 +1888,10 @@ def _counter_diff_names(
 def _is_high_conf_bar_det(raw_item: Any) -> bool:
     """Returns True when a top-bar raw CV item meets minimum detection and class confidence."""
     confs = getattr(raw_item, "confidences", None) or {}
-    return float(confs.get("detection", 1.0)) >= 0.60 and float(confs.get("key", 1.0)) >= 0.85
+    return (
+        float(confs.get("detection", 1.0)) >= 0.60
+        and float(confs.get("key", 1.0)) >= 0.85
+    )
 
 
 def _pack_item_sig(item: Any) -> tuple[Any, ...] | None:
@@ -1698,9 +1981,7 @@ def _preserve_flickering_jokers(
     if missing:
         for orig_idx, prev_j in enumerate(prev_jokers):
             if missing[prev_j.name] > 0:
-                effective.insert(
-                    min(orig_idx, len(effective)), copy.deepcopy(prev_j)
-                )
+                effective.insert(min(orig_idx, len(effective)), copy.deepcopy(prev_j))
                 missing[prev_j.name] -= 1
     return effective
 
@@ -1735,12 +2016,24 @@ def _looks_like_face_down_joker_bar(
     if cert_obs >= 3 and cert_obs > held_counts.get(JokerName.CERTIFICATE, 0):
         return True
     missing_total = sum(
-        max(0, cnt - obs_joker_counts.get(name, 0))
-        for name, cnt in held_counts.items()
+        max(0, cnt - obs_joker_counts.get(name, 0)) for name, cnt in held_counts.items()
     )
     if missing_total >= 3 and sum(obs_joker_counts.values()) >= len(held_jokers) - 1:
         return True
     return False
+
+
+def _keep_matching_jokers_only(
+    existing: Sequence[Joker], observed: Sequence[Joker]
+) -> list[Joker]:
+    """Drops missing jokers in original slot order without admitting unconfirmed new jokers."""
+    rem = Counter(j.name for j in observed)
+    kept: list[Joker] = []
+    for prev_j in existing:
+        if rem[prev_j.name] > 0:
+            kept.append(prev_j)
+            rem[prev_j.name] -= 1
+    return kept
 
 
 def _sync_bars_into_state(
@@ -1752,7 +2045,13 @@ def _sync_bars_into_state(
     next_obs_cons_counts: Counter[tuple[Any, Any]] | None = None,
     next_obs_joker_counts: Counter[Any] | None = None,
     preserve_joker_flickers: bool = False,
+    suppress_joker_change_diag: bool = False,
     suppress_consumable_loss_diag: bool = False,
+    unconfirmed_rng_cons_ids: set[int] | None = None,
+    pending_rng_cons_budget: Counter[type] | None = None,
+    unconfirmed_rng_joker_ids: set[int] | None = None,
+    pending_rng_joker_budget: int = 0,
+    allow_new_jokers: bool = True,
     sync_jokers: bool = True,
     sync_consumables: bool = True,
 ) -> tuple[list[Any], list[Any]]:
@@ -1770,7 +2069,9 @@ def _sync_bars_into_state(
         )
         effective_obs_jokers = (
             _preserve_flickering_jokers(obs_jokers, prev_jokers, next_obs_joker_counts)
-            if preserve_joker_flickers and next_obs_joker_counts is not None and prev_jokers
+            if preserve_joker_flickers
+            and next_obs_joker_counts is not None
+            and prev_jokers
             else obs_jokers
         )
 
@@ -1791,17 +2092,54 @@ def _sync_bars_into_state(
                 if matched_ids:
                     if matched_ids != prev_joker_ids:
                         action.joker_order = matched_ids
-                else:
+                elif allow_new_jokers:
                     state.reconcile_cv_jokers(
                         effective_obs_jokers, trigger_added_hooks=False
                     )
-        elif effective_obs_jokers:
+                elif next_obs_joker_counts is not None:
+                    # On END_ROUND/eval screens, never admit bogus victory-overlay 'Joker's;
+                    # only drop jokers that are missing in the subsequent frame too.
+                    state.inventory.jokers = _keep_matching_jokers_only(
+                        state.inventory.jokers, effective_obs_jokers
+                    )
+        elif effective_obs_jokers and allow_new_jokers:
             state.reconcile_cv_jokers(effective_obs_jokers, trigger_added_hooks=False)
 
-        if diag is not None and state.inventory is not None:
+        if state.inventory is not None and unconfirmed_rng_joker_ids:
+            surviving_j_ids = {id(j) for j in state.inventory.jokers}
+            removed_unconf_jokers = [
+                j
+                for j in prev_jokers
+                if id(j) in unconfirmed_rng_joker_ids and id(j) not in surviving_j_ids
+            ]
+            for j in state.inventory.jokers:
+                unconfirmed_rng_joker_ids.discard(id(j))
+        else:
+            removed_unconf_jokers = []
+
+        if (
+            diag is not None
+            and state.inventory is not None
+            and not suppress_joker_change_diag
+        ):
             lost_jokers, gained_jokers = _counter_diff_names(
                 prev_jokers, state.inventory.jokers
             )
+            if removed_unconf_jokers:
+                unconfirmed_rng_joker_ids.difference_update(
+                    id(j) for j in removed_unconf_jokers
+                )
+                for rj in removed_unconf_jokers:
+                    rj_name = _display_card_name(rj)
+                    if rj_name in lost_jokers:
+                        lost_jokers.remove(rj_name)
+                    if gained_jokers:
+                        gained_jokers.pop(0)
+                diag["rng_jokers_reconciled"] += len(removed_unconf_jokers)
+            if not lost_jokers and gained_jokers and pending_rng_joker_budget > 0:
+                reconciled_n = min(len(gained_jokers), pending_rng_joker_budget)
+                del gained_jokers[:reconciled_n]
+                diag["rng_jokers_reconciled"] += reconciled_n
             if lost_jokers or gained_jokers:
                 diag["unexplained_joker_changes"].append(
                     (action.frame_idx, action.type.value, lost_jokers, gained_jokers)
@@ -1850,12 +2188,52 @@ def _sync_bars_into_state(
             elif next_obs_cons_counts is None or not next_obs_cons_counts:
                 state.inventory.consumables = []
 
+        if state.inventory is not None and unconfirmed_rng_cons_ids:
+            surviving_ids = {id(c) for c in state.inventory.consumables}
+            removed_unconf = [
+                c
+                for c in prev_cons
+                if id(c) in unconfirmed_rng_cons_ids and id(c) not in surviving_ids
+            ]
+            # Any unconfirmed RNG consumable preserved in state is now CV-confirmed.
+            for c in state.inventory.consumables:
+                unconfirmed_rng_cons_ids.discard(id(c))
+        else:
+            removed_unconf = []
+
         if diag is not None and state.inventory is not None:
             lost_cons, gained_cons = _counter_diff_names(
                 prev_cons, state.inventory.consumables
             )
+            if removed_unconf:
+                unconfirmed_rng_cons_ids.difference_update(
+                    id(c) for c in removed_unconf
+                )
+                for rc in removed_unconf:
+                    rc_name = _display_card_name(rc)
+                    if rc_name in lost_cons:
+                        lost_cons.remove(rc_name)
+                    if gained_cons:
+                        gained_cons.pop(0)
+                diag["rng_cons_reconciled"] += len(removed_unconf)
             if suppress_consumable_loss_diag:
                 lost_cons = []
+            if not lost_cons and gained_cons and pending_rng_cons_budget:
+                prev_id_set = {id(c) for c in prev_cons}
+                new_objs_by_name: dict[str, list[Any]] = {}
+                for c in state.inventory.consumables:
+                    if id(c) not in prev_id_set:
+                        new_objs_by_name.setdefault(_display_card_name(c), []).append(c)
+                remaining_gained: list[str] = []
+                for g_name in gained_cons:
+                    cands = new_objs_by_name.get(g_name)
+                    matched_type = type(cands.pop(0)) if cands else None
+                    if matched_type is not None and pending_rng_cons_budget[matched_type] > 0:
+                        pending_rng_cons_budget[matched_type] -= 1
+                        diag["rng_cons_reconciled"] += 1
+                    else:
+                        remaining_gained.append(g_name)
+                gained_cons = remaining_gained
             if lost_cons or gained_cons:
                 diag["unexplained_consumable_changes"].append(
                     (action.frame_idx, action.type.value, lost_cons, gained_cons)
@@ -2055,6 +2433,7 @@ def _sync_hand_into_state(
     action: Action | None = None,
     selected_slot_uid: int | None = None,
     apply_direct_order: bool = False,
+    pending_cert_card_ids: set[int] | None = None,
 ) -> int | None:
     """Reconciles CV-observed hand cards into `state.hand.cards` and populates Action fields.
 
@@ -2153,6 +2532,8 @@ def _sync_hand_into_state(
             if not obs.facing_back:
                 hc.facing_back = False
                 hc.card.debuffed = bool(obs.card.debuffed)
+            if pending_cert_card_ids and hc.card.id:
+                pending_cert_card_ids.discard(hc.card.id)
             continue
 
         if obs.facing_back:
@@ -2201,9 +2582,7 @@ def _sync_hand_into_state(
                 and state.discard_pile
             ):
                 played_ids = {
-                    c.id
-                    for c in state.played_cards_this_round
-                    if getattr(c, "id", 0)
+                    c.id for c in state.played_cards_this_round if getattr(c, "id", 0)
                 }
                 for d_idx, disc_card in enumerate(state.discard_pile):
                     if (
@@ -2221,12 +2600,38 @@ def _sync_hand_into_state(
                 )
                 if is_corrupt_crop:
                     continue
-                rem_match = copy.deepcopy(obs.card)
-                rem_match.id = next_deck_id
-                next_deck_id += 1
-                state.full_deck.append(rem_match)
+                if (
+                    pending_cert_card_ids
+                    and not obs.facing_back
+                    and obs.card.seal != Seal.NONE
+                ):
+                    cert_match = next(
+                        (
+                            dc
+                            for dc in state.full_deck
+                            if dc.id in pending_cert_card_ids
+                            and dc.id not in claimed_deck_ids
+                        ),
+                        None,
+                    )
+                    if cert_match is not None:
+                        cert_match.rank = obs.card.rank
+                        cert_match.suit = obs.card.suit
+                        cert_match.seal = obs.card.seal
+                        cert_match.enhancement = obs.card.enhancement
+                        cert_match.edition = obs.card.edition
+                        cert_match.debuffed = bool(obs.card.debuffed)
+                        pending_cert_card_ids.discard(cert_match.id)
+                        rem_match = cert_match
+                if rem_match is None:
+                    rem_match = copy.deepcopy(obs.card)
+                    rem_match.id = next_deck_id
+                    next_deck_id += 1
+                    state.full_deck.append(rem_match)
             else:
                 rem_match.debuffed = bool(obs.card.debuffed)
+            if pending_cert_card_ids and rem_match.id:
+                pending_cert_card_ids.discard(rem_match.id)
             claimed_deck_ids.add(rem_match.id)
             new_hc = HandCard(
                 card=rem_match,
@@ -2268,6 +2673,7 @@ def _sync_full_deck_into_state(
     *,
     obs_suit_confs: Sequence[float | None] | None = None,
     view_mode: str = "full_deck",
+    phantom_adds: int = 0,
     diag: dict[str, Any] | None = None,
     frame_id: int = 0,
     reasons: Sequence[str] = (),
@@ -2295,12 +2701,18 @@ def _sync_full_deck_into_state(
         return None
 
     before_len = len(state.full_deck)
+    extra_phantom = max(0, int(phantom_adds))
     if view_mode == "remaining":
         cur_rem_len = len(state.remaining_deck)
         if not (max(0, cur_rem_len - 12) <= len(clean_obs) <= cur_rem_len + 12):
             return None
     else:
-        if not (max(5, before_len - 8) <= len(clean_obs) <= before_len + 12):
+        min_allowed = max(5, before_len - 8 - extra_phantom)
+        if extra_phantom > 0 and len(clean_obs) < min(
+            15, max(5, before_len - extra_phantom)
+        ):
+            return None
+        if not (min_allowed <= len(clean_obs) <= before_len + 12):
             return None
 
     active_hand_ids = {hc.card.id for hc in state.hand.cards if hc.card.id}
@@ -2336,7 +2748,10 @@ def _sync_full_deck_into_state(
         key=lambda idx: (
             0
             if (
-                (state.full_deck[idx].id != 0 and state.full_deck[idx].id in (active_hand_ids | discard_ids))
+                (
+                    state.full_deck[idx].id != 0
+                    and state.full_deck[idx].id in (active_hand_ids | discard_ids)
+                )
                 or id(state.full_deck[idx]) in (active_hand_ptrs | discard_ptrs)
             )
             else 1,
@@ -2350,9 +2765,7 @@ def _sync_full_deck_into_state(
     obs_match_order = sorted(
         range(len(clean_obs)),
         key=lambda i: (
-            0
-            if (clean_suit_confs[i] is None or clean_suit_confs[i] >= 0.90)
-            else 1,
+            0 if (clean_suit_confs[i] is None or clean_suit_confs[i] >= 0.90) else 1,
             i,
         ),
     )
@@ -2418,7 +2831,7 @@ def _sync_full_deck_into_state(
     added_cnt = len(new_obs_indices)
     after_len_est = before_len - removed_cnt + added_cnt
     net_shrink = before_len - after_len_est
-    if removed_cnt > 6 and net_shrink > 4:
+    if removed_cnt > (6 + extra_phantom) and net_shrink > (4 + extra_phantom):
         return None
 
     updated_cnt = 0
@@ -2580,13 +2993,21 @@ def _detect_unexpected_shop_transition(
     if n_reroll == 0:
         if len(prev_obs["cards"]) - len(cur_cards) > n_buy:
             reasons.append(f"cards_lost={c_lost} (buys={n_buy})")
-        if c_gain and n_redeem == 0 and (
-            len(cur_cards) > len(prev_obs["cards"])
-            or len(c_lost) > n_buy
-            or (len(prev_obs["cards"]) >= 2 and len(c_gain) >= 2)
+        if (
+            c_gain
+            and n_redeem == 0
+            and (
+                len(cur_cards) > len(prev_obs["cards"])
+                or len(c_lost) > n_buy
+                or (len(prev_obs["cards"]) >= 2 and len(c_gain) >= 2)
+            )
         ):
             # Ignore single-card slot refills/swaps after a Buy/Buy-and-Use without net shop growth
-            if not (n_buy >= 1 and len(cur_cards) <= len(prev_obs["cards"]) and len(c_gain) == 1):
+            if not (
+                n_buy >= 1
+                and len(cur_cards) <= len(prev_obs["cards"])
+                and len(c_gain) == 1
+            ):
                 reasons.append(f"cards_gained={c_gain} (rerolls=0)")
     if len(v_lost) > n_redeem:
         reasons.append(f"vouchers_lost={v_lost} (redeems={n_redeem})")
@@ -2619,11 +3040,17 @@ _CLS_HEADS: tuple[str, ...] = ("rank", "suit", "enhancement", "edition", "seal")
 
 
 def _playing_card_cls_labels(card: PlayingCard) -> dict[str, str]:
-    rank_lbl = "Stone" if card.enhancement == Enhancement.STONE else (
-        "None" if card.rank == Rank.NONE else card.rank.value
+    rank_lbl = (
+        "Stone"
+        if card.enhancement == Enhancement.STONE
+        else ("None" if card.rank == Rank.NONE else card.rank.value)
     )
     suit_lbl = _SUIT_CLS_LABELS.get(card.suit, "None")
-    enh_lbl = "None" if card.enhancement == Enhancement.NONE else card.enhancement.value.capitalize()
+    enh_lbl = (
+        "None"
+        if card.enhancement == Enhancement.NONE
+        else card.enhancement.value.capitalize()
+    )
     ed_lbl = _EDITION_CLS_LABELS.get(card.edition, "None")
     seal_lbl = "None" if card.seal == Seal.NONE else card.seal.value.capitalize()
     return {
@@ -2639,7 +3066,9 @@ def _card_attr_sig(card: PlayingCard) -> tuple[Rank, Suit, Enhancement, Edition,
     return (card.rank, card.suit, card.enhancement, card.edition, card.seal)
 
 
-def _raw_head_prob(raw_card: Any, head_name: str, target_label: str, top1_label: str) -> float:
+def _raw_head_prob(
+    raw_card: Any, head_name: str, target_label: str, top1_label: str
+) -> float:
     top_probs = getattr(raw_card, "top_probs", None) or {}
     head_dict = top_probs.get(head_name)
     if isinstance(head_dict, dict) and target_label in head_dict:
@@ -2685,9 +3114,8 @@ def _check_over_15_hand_size(
         else state.hand.max_size
     )
     in_hand_view = (
-        (state.location == Location.BLIND and not state.round_won and has_hand_cv)
-        or len(obs_cards) > 0
-    )
+        state.location == Location.BLIND and not state.round_won and has_hand_cv
+    ) or len(obs_cards) > 0
     if not in_hand_view or (expected_hand <= 15 and len(obs_cards) <= 15):
         return False
 
@@ -2696,7 +3124,12 @@ def _check_over_15_hand_size(
     _flag_corrupted_action(action, "hand_size_over_15", diag=diag)
     if diag is not None:
         diag["hand_size_over_15_actions"].append(
-            (action.frame_idx, action.type.value, int(expected_hand), int(len(obs_cards)))
+            (
+                action.frame_idx,
+                action.type.value,
+                int(expected_hand),
+                int(len(obs_cards)),
+            )
         )
     return True
 
@@ -2739,7 +3172,12 @@ def _scan_and_quarantine_corrupted_segments(
             for idx_a, (lost_a, gained_a) in enumerate(entries):
                 if (s, idx_a) in reconciled_idxs:
                     continue
-                if ignore_equal_count_swaps and lost_a and gained_a and len(lost_a) == len(gained_a):
+                if (
+                    ignore_equal_count_swaps
+                    and lost_a
+                    and gained_a
+                    and len(lost_a) == len(gained_a)
+                ):
                     continue
                 if lost_a and not gained_a:
                     matched = False
@@ -2801,7 +3239,7 @@ def _scan_and_quarantine_corrupted_segments(
 
     # 3. Compute earliest permanent-tail quarantine watermark `t_perm`
     t_perm: int | None = None
-    t_deck_perm: int | None = None
+    deck_perm_starts: set[int] = set()
     t_non_deck_perm: int | None = None
 
     def _update_t_perm(cand: int) -> None:
@@ -2809,10 +3247,8 @@ def _scan_and_quarantine_corrupted_segments(
         if t_perm is None or cand < t_perm:
             t_perm = cand
 
-    def _update_t_deck_perm(cand: int) -> None:
-        nonlocal t_deck_perm
-        if t_deck_perm is None or cand < t_deck_perm:
-            t_deck_perm = cand
+    def _record_deck_perm(cand: int) -> None:
+        deck_perm_starts.add(cand)
 
     def _update_t_non_deck_perm(cand: int) -> None:
         nonlocal t_non_deck_perm
@@ -2825,7 +3261,7 @@ def _scan_and_quarantine_corrupted_segments(
         end = min(n_steps, start + win_size)
         add_steps = [k for k in range(start, end) if u_adds_by_step[k] > 0]
         if len(add_steps) >= 2 or sum(u_adds_by_step[k] for k in add_steps) >= 3:
-            _update_t_deck_perm(add_steps[0])
+            _record_deck_perm(add_steps[0])
 
     # Group step indices into contiguous round segments (preserves order even if ante/round repeats)
     round_groups: list[list[int]] = []
@@ -2850,7 +3286,7 @@ def _scan_and_quarantine_corrupted_segments(
         prev_adds = [k for k in g_prev if u_adds_by_step[k] > 0]
         next_adds = [k for k in g_next if u_adds_by_step[k] > 0]
         if prev_adds and next_adds:
-            _update_t_deck_perm(prev_adds[0])
+            _record_deck_perm(prev_adds[0])
 
     # Rule C2: hand_size_over_15 combined with deck mutation or hand/target failure in same round
     for grp in round_groups:
@@ -2864,7 +3300,9 @@ def _scan_and_quarantine_corrupted_segments(
             _update_t_non_deck_perm(h15_steps[0])
 
     # Rule C3: Multi-signal anomaly co-occurrence (>= 2 distinct categories) in 5-step window or same round
-    _DECK_ONLY_CATS = frozenset({"unexpected_deck_addition", "large_ocr_override", "unexplained_cons"})
+    _DECK_ONLY_CATS = frozenset(
+        {"unexpected_deck_addition", "large_ocr_override", "unexplained_cons"}
+    )
     for start in range(1, n_steps):
         end = min(n_steps, start + win_size)
         win_cats: set[str] = set()
@@ -2876,7 +3314,7 @@ def _scan_and_quarantine_corrupted_segments(
                 win_cats.update(cats_by_step[k])
         if len(win_cats) >= 2 and first_anomalous is not None:
             if win_cats <= _DECK_ONLY_CATS:
-                _update_t_deck_perm(first_anomalous)
+                _record_deck_perm(first_anomalous)
             else:
                 _update_t_non_deck_perm(first_anomalous)
 
@@ -2890,7 +3328,7 @@ def _scan_and_quarantine_corrupted_segments(
                 grp_cats.update(cats_by_step[k])
         if len(grp_cats) >= 2 and first_anomalous is not None:
             if grp_cats <= _DECK_ONLY_CATS:
-                _update_t_deck_perm(first_anomalous)
+                _record_deck_perm(first_anomalous)
             else:
                 _update_t_non_deck_perm(first_anomalous)
 
@@ -2928,31 +3366,36 @@ def _scan_and_quarantine_corrupted_segments(
         ):
             _update_t_non_deck_perm(s)
 
-    # De-escalate pure deck-drift quarantine when a subsequent verified Full Deck CV sync restores accuracy
-    bounded_deck_range: tuple[int, int] | None = None
-    full_deck_sync_steps = [
+    # De-escalate pure deck-drift episodes per segment when a subsequent Full Deck CV sync stabilizes
+    bounded_deck_ranges: list[tuple[int, int]] = []
+    full_deck_sync_steps = sorted(
         s for s, rec in enumerate(step_records) if rec.get("full_deck_synced")
-    ]
-    if t_deck_perm is not None:
-        recovered_sync: int | None = None
-        for t_sync in full_deck_sync_steps:
-            if t_sync < t_deck_perm:
+    )
+    if deck_perm_starts:
+        covered_until = -1
+        for d_start in sorted(deck_perm_starts):
+            if d_start < covered_until:
                 continue
-            downstream_clean = not any(
-                u_adds_by_step[k] > 0 or "large_ocr_override" in cats_by_step[k]
-                for k in range(t_sync + 1, n_steps)
-            )
-            if downstream_clean:
-                recovered_sync = t_sync
+            recovered_sync = None
+            for t_sync in full_deck_sync_steps:
+                if t_sync <= d_start:
+                    continue
+                if not any(
+                    u_adds_by_step[k] > 0
+                    for k in range(t_sync + 1, min(n_steps, t_sync + 3))
+                ):
+                    recovered_sync = t_sync
+                    break
+            if recovered_sync is not None:
+                bounded_deck_ranges.append((d_start, recovered_sync))
+                covered_until = recovered_sync
+                if diag is not None:
+                    diag["full_deck_quarantine_recoveries"] = (
+                        diag.get("full_deck_quarantine_recoveries", 0) + 1
+                    )
+            else:
+                _update_t_perm(d_start)
                 break
-        if recovered_sync is not None:
-            bounded_deck_range = (t_deck_perm, recovered_sync)
-            if diag is not None:
-                diag["full_deck_quarantine_recoveries"] = (
-                    diag.get("full_deck_quarantine_recoveries", 0) + 1
-                )
-        else:
-            _update_t_perm(t_deck_perm)
 
     if t_non_deck_perm is not None:
         _update_t_perm(t_non_deck_perm)
@@ -2978,8 +3421,8 @@ def _scan_and_quarantine_corrupted_segments(
             _flag_step(s, "location_mismatch")
         if u_adds_by_step[s] >= 2:
             _flag_step(s, "unexpected_deck_addition")
-    if bounded_deck_range is not None:
-        for s in range(bounded_deck_range[0], bounded_deck_range[1]):
+    for b_start, b_end in bounded_deck_ranges:
+        for s in range(b_start, b_end):
             _flag_step(s, "deck_drift_before_full_deck_resync")
 
     # Scope B (round-scoped through end of current round)
@@ -3102,12 +3545,24 @@ def _resolve_hand_with_deck_constraints(
             p_enh = _raw_head_prob(
                 raw, "enhancement", cand_lbl["enhancement"], obs_lbl["enhancement"]
             )
-            p_ed = _raw_head_prob(raw, "edition", cand_lbl["edition"], obs_lbl["edition"])
+            p_ed = _raw_head_prob(
+                raw, "edition", cand_lbl["edition"], obs_lbl["edition"]
+            )
             p_seal = _raw_head_prob(raw, "seal", cand_lbl["seal"], obs_lbl["seal"])
+            min_enh_prob = (
+                0.02
+                if (
+                    has_conflict
+                    and diffs == ["enhancement"]
+                    and obs_lbl["enhancement"] == "None"
+                    and cand_lbl["enhancement"] == "Glass"
+                )
+                else 0.10
+            )
             if not (
                 p_r >= 0.03
                 and p_s >= 0.10
-                and p_enh >= 0.10
+                and p_enh >= min_enh_prob
                 and p_ed >= 0.10
                 and p_seal >= 0.10
             ):
@@ -3122,8 +3577,7 @@ def _resolve_hand_with_deck_constraints(
             )
             if has_conflict or top1_diff_conf < 0.985:
                 cost_matrix[r_idx][c_idx] = sum(
-                    -math.log(max(val, 1e-6))
-                    for val in (p_r, p_s, p_enh, p_ed, p_seal)
+                    -math.log(max(val, 1e-6)) for val in (p_r, p_s, p_enh, p_ed, p_seal)
                 )
 
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
@@ -3167,9 +3621,7 @@ def _collect_play_area_probes(
             else sa.frame_id + 120
         )
         probes = [
-            sa.frame_id + off
-            for off in (40, 65, 90)
-            if sa.frame_id + off < next_bound
+            sa.frame_id + off for off in (40, 65, 90) if sa.frame_id + off < next_bound
         ]
         if not probes and (next_bound - sa.frame_id) >= 12:
             probes = [sa.frame_id + (next_bound - sa.frame_id) // 2]
@@ -3212,9 +3664,7 @@ def _run_play_area_cv_for_face_down_plays(
     from classifiers.inference import batch_recognize_hands
 
     ordered_ids = sorted(probe_frames_by_idx.keys())
-    frame_inputs = [
-        (probe_frames_by_idx[fid], fid, fid / fps) for fid in ordered_ids
-    ]
+    frame_inputs = [(probe_frames_by_idx[fid], fid, fid / fps) for fid in ordered_ids]
     outs = batch_recognize_hands(
         frame_inputs,
         conf_threshold=conf_threshold_hand,
@@ -3306,16 +3756,12 @@ def _resolve_played_face_down_cards(
             used_rev.add(hit)
 
     remaining_fd_hcs = [hc for hc in selected_hcs if hc.facing_back]
-    remaining_rev_hcs = [
-        rev for j, rev in enumerate(revealed_hcs) if j not in used_rev
-    ]
+    remaining_rev_hcs = [rev for j, rev in enumerate(revealed_hcs) if j not in used_rev]
     if len(remaining_fd_hcs) != len(remaining_rev_hcs):
         return False
 
     claimed_ids: set[int] = {
-        hc.card.id
-        for hc in state.hand.cards
-        if not hc.facing_back and hc.card.id != 0
+        hc.card.id for hc in state.hand.cards if not hc.facing_back and hc.card.id != 0
     }
     claimed_ids.update(
         hc._real_card.id
@@ -3324,7 +3770,9 @@ def _resolve_played_face_down_cards(
     )
     next_deck_id = max((c.id for c in state.full_deck), default=0) + 1
 
-    def _find_matching_deck_card(target: PlayingCard, cands: Sequence[PlayingCard]) -> PlayingCard | None:
+    def _find_matching_deck_card(
+        target: PlayingCard, cands: Sequence[PlayingCard]
+    ) -> PlayingCard | None:
         for dc in cands:
             if (
                 not getattr(dc, "destroyed", False)
@@ -3384,9 +3832,7 @@ def _sync_on_screen_to_do_list(
 ) -> None:
     """Ensures every visible To Do List in shop/pack has a single deterministic `'to_do'` roll."""
     todo_jokers = [
-        c
-        for c in cards_list
-        if isinstance(c, Joker) and c.name == JokerName.TO_DO_LIST
+        c for c in cards_list if isinstance(c, Joker) and c.name == JokerName.TO_DO_LIST
     ]
     if not todo_jokers:
         return
@@ -3572,23 +4018,58 @@ def _rescan_unexpected_shop_windows(
         else:
             merged_intervals.append([lo, hi])
 
+    effective_max_total = (
+        max(max_total_frames, 6000) if include_blind_transitions else max_total_frames
+    )
+
+    def _select_window_frames(lo: int, hi: int) -> list[int]:
+        span = hi - lo + 1
+        if span <= max_frames_per_window:
+            return list(range(lo, hi + 1))
+        if not include_blind_transitions:
+            return list(range(hi - max_frames_per_window + 1, hi + 1))
+        edge = min(max_frames_per_window // 2, 1200)
+        prefix_end = min(hi, lo + edge - 1)
+        suffix_start = max(prefix_end + 1, hi - edge + 1)
+        selected = list(range(lo, prefix_end + 1))
+        if suffix_start > prefix_end + 1:
+            mid_span = suffix_start - (prefix_end + 1)
+            mid_budget = max(
+                0,
+                max_frames_per_window - len(selected) - (hi - suffix_start + 1),
+            )
+            stride = (
+                2 if mid_budget <= 0 else max(2, math.ceil(mid_span / mid_budget))
+            )
+            selected.extend(range(prefix_end + 1, suffix_start, stride))
+        selected.extend(range(suffix_start, hi + 1))
+        return selected
+
     existing_frames = d.get("frames") or {}
     candidate_frames: list[int] = []
+    seen_candidates: set[int] = set()
     for lo, hi in merged_intervals:
-        for f in range(lo, hi + 1):
+        for f in _select_window_frames(lo, hi):
+            if f in seen_candidates:
+                continue
             if (
                 str(f) in existing_frames
                 or str(f - 1) in existing_frames
                 or str(f + 1) in existing_frames
             ):
                 continue
+            seen_candidates.add(f)
             candidate_frames.append(f)
-            if len(candidate_frames) >= max_total_frames:
+            if len(candidate_frames) >= effective_max_total:
                 break
-        if len(candidate_frames) >= max_total_frames:
+        if len(candidate_frames) >= effective_max_total:
             break
 
-    stats = {"windows": len(merged_intervals), "frames_scanned": len(candidate_frames), "recovered_frames": 0}
+    stats = {
+        "windows": len(merged_intervals),
+        "frames_scanned": len(candidate_frames),
+        "recovered_frames": 0,
+    }
     if not candidate_frames:
         return None, stats
 
@@ -3638,7 +4119,9 @@ def _rescan_unexpected_shop_windows(
         for t in active_tmpls:
             res = eval_tmpl(t, img, img_gray, cfg, img_gray_half=img_gray_half)
             if res.found and res.clicked:
-                cand_conf = float(res.match.confidence) if res.match is not None else 1.0
+                cand_conf = (
+                    float(res.match.confidence) if res.match is not None else 1.0
+                )
                 if cand_conf > best_conf:
                     best_conf = cand_conf
                     best_name = res.template_name
@@ -3720,6 +4203,9 @@ def _build_run_trajectory_with_plan(
             0, len(cleaned_input["frames"]) - pre_frames_count
         )
 
+    cleaned_input["frames"] = filter_false_early_cash_outs(
+        cleaned_input["frames"], cleaned_input["key"], diag=diag
+    )
     plan = plan_action_pipeline(cleaned_input)
     full_deck_observations = _extract_full_deck_observations(
         d.get("frames") or {},
@@ -3846,7 +4332,9 @@ def _build_run_trajectory_with_plan(
                 ],
                 "unexplained_cons": [
                     (lost, gained)
-                    for _, _, lost, gained in new_slices["unexplained_consumable_changes"]
+                    for _, _, lost, gained in new_slices[
+                        "unexplained_consumable_changes"
+                    ]
                 ],
                 "unmatched_target": bool(new_slices["unmatched_button_targets"]),
                 "location_mismatch": bool(new_slices["location_mismatches"]),
@@ -3860,6 +4348,32 @@ def _build_run_trajectory_with_plan(
             ante_8_end_step_idx = len(trajectory.deltas) - 1
             ante_8_diag_snap = _snapshot_diag_state(diag)
             ocr_saw_ante_9_in_sim9 = False
+        cur_rec = step_records[-1]
+        cur_has_large_ocr = bool(cur_rec["large_ocr_override"])
+        cur_has_non_swap_cons = any(
+            not (lost_c and gained_c and len(lost_c) == len(gained_c))
+            for lost_c, gained_c in cur_rec["unexplained_cons"]
+        )
+        if cur_has_large_ocr or cur_has_non_swap_cons:
+            n_recs = len(step_records)
+            cur_rk = cur_rec["round_key"]
+            recent_indices = set(range(max(1, n_recs - 5), n_recs))
+            k = n_recs - 1
+            while k >= 1 and step_records[k]["round_key"] == cur_rk:
+                recent_indices.add(k)
+                k -= 1
+            seen_ocr = any(
+                step_records[i]["large_ocr_override"] for i in recent_indices
+            )
+            seen_cons = any(
+                any(
+                    not (lc and gc and len(lc) == len(gc))
+                    for lc, gc in step_records[i]["unexplained_cons"]
+                )
+                for i in recent_indices
+            )
+            if seen_ocr and seen_cons:
+                _mark_deck_suspect("ocr_and_consumable_cooccurrence")
 
     def _maybe_halt_ante_9(
         cur_sa_idx: int, cur_sa: ScheduledAction, hud_ante_val: int | None
@@ -3960,6 +4474,17 @@ def _build_run_trajectory_with_plan(
                 return int(m)
         return None
 
+    def _next_k_hud_money(cur_idx: int, k: int = 3) -> list[int]:
+        vals: list[int] = []
+        for j in range(cur_idx + 1, len(scheduled_actions)):
+            nxt_hud = hud_res_by_frame.get(scheduled_actions[j].target_frame)
+            m = _get_hud_val(nxt_hud, "hud_money")
+            if m is not None:
+                vals.append(int(m))
+                if len(vals) >= k:
+                    break
+        return vals
+
     def _next_same_blind_hud_money(cur_idx: int) -> int | None:
         for j in range(cur_idx + 1, len(scheduled_actions)):
             nxt = scheduled_actions[j]
@@ -3970,6 +4495,14 @@ def _build_run_trajectory_with_plan(
             nxt_hud = hud_res_by_frame.get(nxt.target_frame)
             m = _get_hud_val(nxt_hud, "hud_money")
             return int(m) if m is not None else None
+        return None
+
+    def _next_hud_round(cur_idx: int) -> int | None:
+        for j in range(cur_idx + 1, len(scheduled_actions)):
+            nxt_hud = hud_res_by_frame.get(scheduled_actions[j].target_frame)
+            r = _get_hud_val(nxt_hud, "hud_round")
+            if r is not None:
+                return int(r)
         return None
 
     last_consumable_mutated_frame: int = -1
@@ -3991,7 +4524,13 @@ def _build_run_trajectory_with_plan(
     fd_obs_idx = 0
     deck_suspect = False
     deck_suspect_reasons: list[str] = []
-    last_rebate_discard_info: tuple[int, int, int] | None = None
+    phantom_deck_adds_since_sync = 0
+    unconfirmed_rng_cons_ids: set[int] = set()
+    pending_rng_cons_budget: Counter[type] = Counter()
+    unconfirmed_rng_joker_ids: set[int] = set()
+    pending_rng_joker_budget = 0
+    pending_cert_card_ids: set[int] = set()
+    last_rebate_discard_info: tuple[int, int, Counter[Rank], int, int] | None = None
     halted_ante_9 = False
 
     def _mark_deck_suspect(reason: str) -> None:
@@ -4003,7 +4542,7 @@ def _build_run_trajectory_with_plan(
     def _run_lazy_full_deck_obs(
         obs: FullDeckObservation, target_action: Action | None
     ) -> bool:
-        nonlocal deck_suspect
+        nonlocal deck_suspect, phantom_deck_adds_since_sync
         if not deck_suspect or obs.view_mode == "remaining":
             if diag is not None:
                 diag["full_deck_views_skipped"] += 1
@@ -4036,23 +4575,36 @@ def _build_run_trajectory_with_plan(
         from eval_template import detect_view_deck_tab_mode
 
         view_mode = obs.view_mode
+        chosen_frame = obs.sample_frame
+        used_alt_for_mode = False
         if view_mode == "unknown":
             view_mode = detect_view_deck_tab_mode(frame_img, obs.box)
             if view_mode != "full_deck":
-                if diag is not None:
-                    diag["full_deck_views_skipped"] += 1
-                return False
+                if (
+                    alt_frame is not None
+                    and alt_frame in extracted
+                    and detect_view_deck_tab_mode(extracted[alt_frame], obs.box)
+                    == "full_deck"
+                ):
+                    frame_img = extracted[alt_frame]
+                    chosen_frame = alt_frame
+                    view_mode = "full_deck"
+                    used_alt_for_mode = True
+                else:
+                    if diag is not None:
+                        diag["full_deck_views_skipped"] += 1
+                    return False
 
         deck_out = recognize_full_deck(
-            (frame_img, obs.sample_frame, obs.sample_frame / resolved_fps),
+            (frame_img, chosen_frame, chosen_frame / resolved_fps),
             view_mode=view_mode,
             device=device,
         )
-        chosen_frame = obs.sample_frame
         raw_deck_cards = list(getattr(deck_out, "cards", None) or ())
 
         if (
-            alt_frame is not None
+            not used_alt_for_mode
+            and alt_frame is not None
             and alt_frame in extracted
             and abs(len(raw_deck_cards) - len(state.full_deck)) > 2
         ):
@@ -4091,6 +4643,7 @@ def _build_run_trajectory_with_plan(
             obs_playing_cards,
             obs_suit_confs=obs_suit_confs,
             view_mode=getattr(deck_out, "view_mode", view_mode),
+            phantom_adds=phantom_deck_adds_since_sync,
             diag=diag,
             frame_id=chosen_frame,
             reasons=deck_suspect_reasons,
@@ -4098,6 +4651,7 @@ def _build_run_trajectory_with_plan(
         if summary is not None:
             deck_suspect = False
             deck_suspect_reasons.clear()
+            phantom_deck_adds_since_sync = 0
             if target_action is not None:
                 target_action.metadata["full_deck_synced"] = summary
             return True
@@ -4316,6 +4870,92 @@ def _build_run_trajectory_with_plan(
             if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
                 break
 
+        # Infer missed Next Round (and verified zero-skip Select Blind) when entering SELECT/BLIND from SHOP
+        def _step_inferred_next_round(nr_frame: int) -> None:
+            nonlocal shop_visit_active, shop_visit_cashout_frame, last_shop_obs
+            nonlocal shop_visit_actions, shop_visit_opens, last_cash_out_frame, steps_since_cash_out
+            synth_nr = Action(
+                type=A.NEXT_ROUND,
+                frame_idx=nr_frame,
+                timestamp=nr_frame / resolved_fps,
+                metadata={"inferred": True, "source": "preclicked_next_round"},
+            )
+            state.frame_idx = synth_nr.frame_idx
+            state.timestamp = synth_nr.timestamp
+            on_action(state, synth_nr)
+            _record_tracked_step(state, synth_nr)
+            shop_visit_active = False
+            shop_visit_cashout_frame = None
+            last_shop_obs = None
+            shop_visit_actions = []
+            shop_visit_opens = 0
+            last_cash_out_frame = -1
+            steps_since_cash_out = 999
+            if diag is not None:
+                diag["inferred_next_rounds"] += 1
+
+        if (
+            state.location == Location.SHOP
+            and sa.ambient_location == Location.SELECT
+            and sa.action_type != A.NEXT_ROUND
+        ):
+            prev_fid = scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+            inferred_nr_frame = max(prev_fid + 1, sa.frame_id - 1)
+            _step_inferred_next_round(inferred_nr_frame)
+            if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
+                halted_ante_9 = True
+                break
+        elif (
+            state.location == Location.SHOP
+            and sa.ambient_location == Location.BLIND
+            and sa.action_type in (A.PLAY_HAND, A.DISCARD, A.SORT_RANK, A.SORT_SUIT)
+        ):
+            exp_ante = (
+                state.ante + 1
+                if state.current_blind not in (BlindName.SMALL, BlindName.BIG)
+                else state.ante
+            )
+            if state.current_blind == BlindName.SMALL:
+                exp_blind = BlindName.BIG
+            elif state.current_blind == BlindName.BIG:
+                exp_blind = state.boss_blind or BlindName.THE_HOOK
+            else:
+                exp_blind = BlindName.SMALL
+            exp_target = calculate_target_chips(
+                ante=exp_ante,
+                round=state.round,
+                stake=state.stake,
+                blind=exp_blind,
+                deck=state.deck,
+            )
+            hud_ante_chk = _get_hud_val(hud_peek, "hud_ante")
+            hud_round_chk = _get_hud_val(hud_peek, "hud_round")
+            hud_target_chk = _get_hud_val(hud_peek, "hud_blind_target")
+            if (
+                hud_target_chk is not None
+                and int(hud_target_chk) == exp_target
+                and (hud_ante_chk is None or int(hud_ante_chk) == exp_ante)
+                and (hud_round_chk is None or int(hud_round_chk) == state.round)
+            ):
+                prev_fid = scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+                inferred_nr_frame = max(prev_fid + 1, sa.frame_id - 2)
+                _step_inferred_next_round(inferred_nr_frame)
+                inferred_sb_frame = max(inferred_nr_frame + 1, sa.frame_id - 1)
+                synth_sb = Action(
+                    type=A.SELECT_BLIND,
+                    frame_idx=inferred_sb_frame,
+                    timestamp=inferred_sb_frame / resolved_fps,
+                    metadata={"inferred": True, "source": "preclicked_select_blind"},
+                )
+                state.hand.cards.clear()
+                state.frame_idx = synth_sb.frame_idx
+                state.timestamp = synth_sb.timestamp
+                on_action(state, synth_sb)
+                _record_tracked_step(state, synth_sb)
+                if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
+                    halted_ante_9 = True
+                    break
+
         shop_out = shop_res_by_frame.get(sa.target_frame)
         if state.location == Location.PACK and sa.ambient_location in (
             Location.SHOP,
@@ -4355,11 +4995,8 @@ def _build_run_trajectory_with_plan(
                 _consumable_sig(c)
                 for c in (state.inventory.consumables if state.inventory else ())
             )
-            cons_gained_in_pack = (
-                obs_cons_here is not None
-                and any(
-                    obs_cons_here[sig] > held_cons_here[sig] for sig in obs_cons_here
-                )
+            cons_gained_in_pack = obs_cons_here is not None and any(
+                obs_cons_here[sig] > held_cons_here[sig] for sig in obs_cons_here
             )
             if (
                 not recovered_buffoon_pick
@@ -4405,16 +5042,35 @@ def _build_run_trajectory_with_plan(
             and sa.target_frame <= last_consumable_mutated_frame + 10
         )
         if shop_out is not None:
+            cur_cons_counts = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())
+            if (
+                unconfirmed_rng_cons_ids
+                and state.inventory
+                and state.inventory.consumables
+            ):
+                rem_obs_cons = Counter(cur_cons_counts)
+                # Confirm already-confirmed slots first so an unconfirmed duplicate doesn't steal confirmation.
+                for held_c in state.inventory.consumables:
+                    if id(held_c) not in unconfirmed_rng_cons_ids:
+                        sig = _consumable_sig(held_c)
+                        if rem_obs_cons[sig] > 0:
+                            rem_obs_cons[sig] -= 1
+                for held_c in state.inventory.consumables:
+                    if id(held_c) in unconfirmed_rng_cons_ids:
+                        sig = _consumable_sig(held_c)
+                        if rem_obs_cons[sig] > 0:
+                            rem_obs_cons[sig] -= 1
+                            unconfirmed_rng_cons_ids.discard(id(held_c))
+
             # Retroactively infer missed USE_CONSUMABLE actions when a held consumable
             # disappears in both the current and next observed CV frame.
             if (
                 not stale_cons_frame
-                and sa.action_type not in (A.USE_CONSUMABLE, A.SELL_CARD)
+                and sa.action_type != A.SELL_CARD
                 and next_cons_counts is not None
                 and state.inventory
                 and state.inventory.consumables
             ):
-                cur_cons_counts = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())
                 prev_frame_id = (
                     scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
                 )
@@ -4426,7 +5082,11 @@ def _build_run_trajectory_with_plan(
                 orig_consumables = list(state.inventory.consumables)
                 for held_c in orig_consumables:
                     idx_cursor = next(
-                        (i for i, c in enumerate(state.inventory.consumables) if c is held_c),
+                        (
+                            i
+                            for i, c in enumerate(state.inventory.consumables)
+                            if c is held_c
+                        ),
                         None,
                     )
                     if idx_cursor is None:
@@ -4440,18 +5100,50 @@ def _build_run_trajectory_with_plan(
                     next_count = next_cons_counts[sig]
                     c_name = getattr(held_c, "name", None)
                     inv_len = len(state.inventory.consumables)
+                    if id(held_c) in unconfirmed_rng_cons_ids:
+                        if (
+                            sa.action_type != A.USE_CONSUMABLE
+                            and cur_cons_counts[sig] < held_sig_total
+                            and next_count < held_sig_total
+                            and cur_cons_total < inv_len
+                            and next_cons_total < inv_len
+                        ):
+                            state.inventory.consumables.pop(idx_cursor)
+                            unconfirmed_rng_cons_ids.discard(id(held_c))
+                            if diag is not None:
+                                diag["rng_cons_reconciled"] += 1
+                        continue
+                    if sa.action_type == A.USE_CONSUMABLE:
+                        if not (isinstance(held_c, Planet) or isinstance(c_name, PlanetName)):
+                            continue
+                        if cur_cons_total < 1:
+                            continue
+                        if cur_cons_counts[sig] > 0:
+                            if next_count >= cur_cons_counts[sig]:
+                                continue
+                        elif next_count != 0:
+                            continue
+                    sell_val = max(1, int(getattr(held_c, "sell_value", 1)))
+                    is_buy_replace_sell = (
+                        sa.action_type == A.BUY_CARD
+                        and cur_cons_total < inv_len
+                        and hud_money_val is not None
+                        and hud_money_val == state.money + sell_val
+                        and c_name not in (TarotName.HERMIT, TarotName.TEMPERANCE)
+                    )
                     if (
                         cur_cons_counts[sig] < held_sig_total
                         and next_count < held_sig_total
                         and cur_cons_total < inv_len
-                        and next_cons_total < inv_len
+                        and (next_cons_total < inv_len or is_buy_replace_sell)
                     ):
-                        sell_val = max(1, int(getattr(held_c, "sell_value", 1)))
-                        is_sell = (
+                        is_sell = is_buy_replace_sell or (
                             hud_money_val is not None
                             and hud_money_val >= state.money + sell_val
                             and c_name not in (TarotName.HERMIT, TarotName.TEMPERANCE)
                         )
+                        if sa.action_type == A.USE_CONSUMABLE and is_sell:
+                            continue
                         if is_sell:
                             joker_offset = len(state.inventory.jokers)
                             inferred_action = Action(
@@ -4507,68 +5199,198 @@ def _build_run_trajectory_with_plan(
                 and next_joker_counts is not None
             ):
                 held_j_counts = Counter(j.name for j in state.inventory.jokers)
-                rem_need = {
-                    name: max(0, cnt - max(cur_joker_counts[name], next_joker_counts[name]))
-                    for name, cnt in held_j_counts.items()
-                }
-                sell_candidates: list[Joker] = []
-                for held_j in state.inventory.jokers:
-                    if not held_j.eternal and rem_need.get(held_j.name, 0) > 0:
-                        sell_candidates.append(held_j)
-                        rem_need[held_j.name] -= 1
-                if 0 < len(sell_candidates) < 3:
+                held_total = len(state.inventory.jokers)
+                shop_joker_names: set[Any] = set()
+                if (
+                    state.location == Location.SHOP
+                    and sa.ambient_location == Location.SHOP
+                ):
+                    for sc in state.shop_cards or ():
+                        if isinstance(sc, Joker):
+                            shop_joker_names.add(sc.name)
+                    for obs_sj in _convert_items_of_type(
+                        list(getattr(shop_out, "shop_items", None) or []), Joker
+                    ):
+                        shop_joker_names.add(obs_sj.name)
+                cur_shop_buy_gains = sum(
+                    max(
+                        0,
+                        min(cur_joker_counts[n], next_joker_counts[n])
+                        - held_j_counts[n],
+                    )
+                    for n in shop_joker_names
+                )
+                next_shop_buy_gains = sum(
+                    max(0, next_joker_counts[n] - held_j_counts[n])
+                    for n in shop_joker_names
+                )
+                is_buffoon_pick = (
+                    sa.action_type == A.USE_IN_PACK
+                    and state.active_pack is not None
+                    and state.active_pack.booster_type == BoosterType.BUFFOON
+                )
+                next_allowed_gain = next_shop_buy_gains
+                if (
+                    sa.action_type == A.BUY_CARD and shop_joker_names
+                ) or is_buffoon_pick:
+                    next_allowed_gain = max(1, next_allowed_gain)
+                eff_cur_total = sum(cur_joker_counts.values()) - cur_shop_buy_gains
+                eff_next_total = sum(next_joker_counts.values()) - next_allowed_gain
+                if eff_cur_total < held_total and eff_next_total < held_total:
+                    rem_need = {
+                        name: max(
+                            0,
+                            cnt - max(cur_joker_counts[name], next_joker_counts[name]),
+                        )
+                        for name, cnt in held_j_counts.items()
+                    }
+                    sell_candidates: list[Joker] = []
+                    for held_j in state.inventory.jokers:
+                        if (
+                            not held_j.eternal
+                            and id(held_j) not in unconfirmed_rng_joker_ids
+                            and rem_need.get(held_j.name, 0) > 0
+                        ):
+                            sell_candidates.append(held_j)
+                            rem_need[held_j.name] -= 1
+                    if 0 < len(sell_candidates) < 3:
+                        prev_frame_id = (
+                            scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
+                        )
+                        inferred_frame = max(prev_frame_id + 1, sa.frame_id - 1)
+                        hud_money_val = _get_hud_val(
+                            hud_res_by_frame.get(sa.target_frame), "hud_money"
+                        )
+                        has_astronomer = any(
+                            jj.name == JokerName.ASTRONOMER and not jj.debuffed
+                            for jj in state.inventory.jokers
+                        )
+                        for held_j in sell_candidates:
+                            if held_j.name in _SELF_DESTROY_JOKERS:
+                                sell_val = held_j.get_sell_value(
+                                    discount_percent=state.discount_percent,
+                                    inflation=state.inflation,
+                                    astronomer=has_astronomer,
+                                )
+                                if (
+                                    hud_money_val is None
+                                    or hud_money_val < state.money + sell_val
+                                ):
+                                    continue
+                            j_cursor = next(
+                                (
+                                    i
+                                    for i, j in enumerate(state.inventory.jokers)
+                                    if j is held_j
+                                ),
+                                None,
+                            )
+                            if j_cursor is None:
+                                continue
+                            j_name = held_j.name
+                            inferred_sell = Action(
+                                type=A.SELL_CARD,
+                                frame_idx=inferred_frame,
+                                timestamp=inferred_frame / resolved_fps,
+                                target_idx=j_cursor,
+                                metadata={
+                                    "inferred": True,
+                                    "source": "missing_joker_bar",
+                                    "target_card": str(
+                                        getattr(j_name, "value", j_name)
+                                    ),
+                                },
+                            )
+                            state.frame_idx = inferred_sell.frame_idx
+                            state.timestamp = inferred_sell.timestamp
+                            on_action(state, inferred_sell)
+                            _record_tracked_step(state, inferred_sell)
+                            if diag is not None:
+                                diag["inferred_joker_sells"] += 1
+
+            # Retroactively infer missed BUY_CARD actions when a Joker seen on the shop shelf
+            # vanishes from shop_items and appears in joker_bar in current and next CV frames.
+            if (
+                state.location == Location.SHOP
+                and sa.ambient_location == Location.SHOP
+                and sa.action_type != A.END_ROUND
+                and (
+                    sa.action_type != A.BUY_CARD
+                    or match_button_to_item_index(
+                        sa.button_box,
+                        list(getattr(shop_out, "shop_items", None) or []),
+                        attach="bottom_center",
+                    )
+                    is not None
+                )
+                and not is_amber_hidden
+                and state.inventory is not None
+                and state.shop_cards
+            ):
+                prev_shop_jokers = [c for c in state.shop_cards if isinstance(c, Joker)]
+                if prev_shop_jokers:
+                    cur_shop_joker_counts = Counter(
+                        j.name
+                        for j in _convert_items_of_type(
+                            list(getattr(shop_out, "shop_items", None) or []), Joker
+                        )
+                    )
+                    prev_shop_joker_counts = Counter(j.name for j in prev_shop_jokers)
+                    held_j_counts = Counter(j.name for j in state.inventory.jokers)
                     prev_frame_id = (
                         scheduled_actions[sa_idx - 1].frame_id if sa_idx > 0 else 0
                     )
-                    inferred_frame = max(prev_frame_id + 1, sa.frame_id - 1)
-                    hud_money_val = _get_hud_val(
-                        hud_res_by_frame.get(sa.target_frame), "hud_money"
-                    )
-                    has_astronomer = any(
-                        jj.name == JokerName.ASTRONOMER and not jj.debuffed
-                        for jj in state.inventory.jokers
-                    )
-                    for held_j in sell_candidates:
-                        if held_j.name in _SELF_DESTROY_JOKERS:
-                            sell_val = held_j.get_sell_value(
-                                discount_percent=state.discount_percent,
-                                inflation=state.inflation,
-                                astronomer=has_astronomer,
+                    inferred_buy_frame = max(prev_frame_id + 1, sa.frame_id - 1)
+                    for shop_j in prev_shop_jokers:
+                        j_name = shop_j.name
+                        if (
+                            prev_shop_joker_counts[j_name]
+                            > cur_shop_joker_counts[j_name]
+                            and cur_joker_counts[j_name] > held_j_counts[j_name]
+                            and (
+                                next_joker_counts is None
+                                or next_joker_counts[j_name] > held_j_counts[j_name]
                             )
-                            if (
-                                hud_money_val is None
-                                or hud_money_val < state.money + sell_val
-                            ):
+                        ):
+                            s_idx = next(
+                                (
+                                    i
+                                    for i, c in enumerate(state.shop_cards)
+                                    if c is shop_j
+                                ),
+                                None,
+                            )
+                            if s_idx is None:
                                 continue
-                        j_cursor = next(
-                            (
-                                i
-                                for i, j in enumerate(state.inventory.jokers)
-                                if j is held_j
-                            ),
-                            None,
-                        )
-                        if j_cursor is None:
-                            continue
-                        j_name = held_j.name
-                        inferred_sell = Action(
-                            type=A.SELL_CARD,
-                            frame_idx=inferred_frame,
-                            timestamp=inferred_frame / resolved_fps,
-                            target_idx=j_cursor,
-                            metadata={
-                                "inferred": True,
-                                "source": "missing_joker_bar",
-                                "target_card": str(getattr(j_name, "value", j_name)),
-                            },
-                        )
-                        state.frame_idx = inferred_sell.frame_idx
-                        state.timestamp = inferred_sell.timestamp
-                        on_action(state, inferred_sell)
-                        _record_tracked_step(state, inferred_sell)
-                        if diag is not None:
-                            diag["inferred_joker_sells"] += 1
+                            inferred_buy = Action(
+                                type=A.BUY_CARD,
+                                frame_idx=inferred_buy_frame,
+                                timestamp=inferred_buy_frame / resolved_fps,
+                                target_idx=s_idx,
+                                metadata={
+                                    "inferred": True,
+                                    "source": "shop_to_joker_bar",
+                                    "target_card": str(
+                                        getattr(j_name, "value", j_name)
+                                    ),
+                                },
+                            )
+                            state.frame_idx = inferred_buy.frame_idx
+                            state.timestamp = inferred_buy.timestamp
+                            on_action(state, inferred_buy)
+                            state.ensure_joker_ids()
+                            _record_tracked_step(state, inferred_buy)
+                            if shop_visit_active:
+                                shop_visit_actions.append(A.BUY_CARD)
+                            if diag is not None:
+                                diag["inferred_joker_buys"] += 1
+                            prev_shop_joker_counts[j_name] -= 1
+                            held_j_counts[j_name] += 1
 
+            cur_hud_money = _get_hud_val(
+                hud_res_by_frame.get(sa.target_frame), "hud_money"
+            )
+            sync_cons_now = sa.action_type != A.END_ROUND and not stale_cons_frame
             raw_jokers, raw_cons = _sync_bars_into_state(
                 state,
                 shop_out,
@@ -4576,12 +5398,30 @@ def _build_run_trajectory_with_plan(
                 diag=diag,
                 next_obs_cons_counts=next_cons_counts,
                 next_obs_joker_counts=next_joker_counts,
-                preserve_joker_flickers=(sa.action_type == A.END_ROUND),
-                sync_jokers=True,
-                sync_consumables=(
-                    sa.action_type != A.END_ROUND and not stale_cons_frame
+                preserve_joker_flickers=(
+                    sa.action_type == A.END_ROUND
+                    or (
+                        sa.action_type != A.SELL_CARD
+                        and not ankh_hex_cooldown
+                        and not (
+                            state.location == Location.SHOP
+                            and cur_hud_money is not None
+                            and cur_hud_money > state.money
+                        )
+                    )
                 ),
+                suppress_joker_change_diag=ankh_hex_cooldown,
+                unconfirmed_rng_cons_ids=unconfirmed_rng_cons_ids,
+                pending_rng_cons_budget=pending_rng_cons_budget,
+                unconfirmed_rng_joker_ids=unconfirmed_rng_joker_ids,
+                pending_rng_joker_budget=pending_rng_joker_budget,
+                allow_new_jokers=(sa.action_type != A.END_ROUND),
+                sync_jokers=True,
+                sync_consumables=sync_cons_now,
             )
+            pending_rng_joker_budget = 0
+            if sync_cons_now:
+                pending_rng_cons_budget.clear()
 
         # Sync main shop shelves before matching/stepping shop actions
         if sa.ambient_location == Location.SHOP and shop_out is not None:
@@ -4739,12 +5579,10 @@ def _build_run_trajectory_with_plan(
                             0 <= c_idx < len(state.inventory.consumables)
                             and nxt_idx in obs_cons_counts_by_sa_idx
                         ):
-                            c_sig = _consumable_sig(
-                                state.inventory.consumables[c_idx]
-                            )
-                            cur_cnt = obs_cons_counts_by_sa_idx.get(
-                                sa_idx, Counter()
-                            )[c_sig]
+                            c_sig = _consumable_sig(state.inventory.consumables[c_idx])
+                            cur_cnt = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())[
+                                c_sig
+                            ]
                             nxt_cnt = obs_cons_counts_by_sa_idx[nxt_idx][c_sig]
                             if cur_cnt > 0 and nxt_cnt >= cur_cnt and money_not_gained:
                                 continue
@@ -4758,34 +5596,91 @@ def _build_run_trajectory_with_plan(
             if nxt_idx is not None:
                 nxt = scheduled_actions[nxt_idx]
                 if (
-                    nxt.action_type == A.USE_CONSUMABLE
-                    and 0 < (nxt.frame_id - sa.frame_id) <= 60
+                    nxt.frame_id > sa.frame_id
+                    and (
+                        nxt.ambient_location == sa.ambient_location
+                        or (nxt.frame_id - sa.frame_id) <= 300
+                    )
                     and nxt.target_frame > sa.frame_id
                     and nxt_idx in obs_cons_counts_by_sa_idx
                 ):
-                    c_sig = _consumable_sig(
-                        state.inventory.consumables[action.target_idx]
+                    c_obj = state.inventory.consumables[action.target_idx]
+                    c_name = getattr(c_obj, "name", None)
+                    c_sig = _consumable_sig(c_obj)
+                    cur_obs_c = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())
+                    nxt_obs_c = obs_cons_counts_by_sa_idx[nxt_idx]
+                    cur_cnt = cur_obs_c[c_sig]
+                    nxt_cnt = nxt_obs_c[c_sig]
+                    cur_m = _get_hud_val(hud_peek, "hud_money")
+                    nxt_m = _get_hud_val(
+                        hud_res_by_frame.get(nxt.target_frame), "hud_money"
                     )
-                    cur_cnt = obs_cons_counts_by_sa_idx.get(sa_idx, Counter())[c_sig]
-                    nxt_cnt = obs_cons_counts_by_sa_idx[nxt_idx][c_sig]
-                    same_btn = False
-                    if sa.button_box and nxt.button_box:
-                        cx1 = (sa.button_box[0] + sa.button_box[2]) * 0.5
-                        cy1 = (sa.button_box[1] + sa.button_box[3]) * 0.5
-                        cx2 = (nxt.button_box[0] + nxt.button_box[2]) * 0.5
-                        cy2 = (nxt.button_box[1] + nxt.button_box[3]) * 0.5
-                        same_btn = abs(cx1 - cx2) <= 60 and abs(cy1 - cy2) <= 60
-                    nxt2_idx = _next_non_sort_idx(nxt_idx)
-                    after_only_one_consumed = (
-                        nxt2_idx is not None
-                        and nxt2_idx in obs_cons_counts_by_sa_idx
-                        and obs_cons_counts_by_sa_idx[nxt2_idx][c_sig] >= cur_cnt - 1
+                    money_gained = (
+                        cur_m is not None
+                        and nxt_m is not None
+                        and int(nxt_m) > int(cur_m)
                     )
-                    if (
-                        cur_cnt > 0
-                        and nxt_cnt >= cur_cnt
-                        and (same_btn or cur_cnt == 1 or after_only_one_consumed)
+                    econ_blocked = (
+                        c_name
+                        in (
+                            TarotName.HERMIT,
+                            TarotName.TEMPERANCE,
+                            SpectralName.IMMOLATE,
+                        )
+                        and money_gained
+                    )
+                    drop_cancelled_use = False
+                    if nxt.action_type == A.USE_CONSUMABLE:
+                        same_btn = False
+                        if sa.button_box and nxt.button_box:
+                            cx1 = (sa.button_box[0] + sa.button_box[2]) * 0.5
+                            cy1 = (sa.button_box[1] + sa.button_box[3]) * 0.5
+                            cx2 = (nxt.button_box[0] + nxt.button_box[2]) * 0.5
+                            cy2 = (nxt.button_box[1] + nxt.button_box[3]) * 0.5
+                            same_btn = abs(cx1 - cx2) <= 60 and abs(cy1 - cy2) <= 60
+                        nxt2_idx = _next_non_sort_idx(nxt_idx)
+                        after_only_one_consumed = (
+                            nxt2_idx is not None
+                            and nxt2_idx in obs_cons_counts_by_sa_idx
+                            and obs_cons_counts_by_sa_idx[nxt2_idx][c_sig] >= cur_cnt - 1
+                        )
+                        drop_cancelled_use = (
+                            cur_cnt > 0
+                            and nxt_cnt >= cur_cnt
+                            and not econ_blocked
+                            and (same_btn or cur_cnt == 1 or after_only_one_consumed)
+                        )
+                    elif nxt.action_type == A.SELL_CARD:
+                        drop_cancelled_use = (
+                            cur_cnt > 0
+                            and nxt_cnt >= cur_cnt
+                            and sum(nxt_obs_c.values()) >= sum(cur_obs_c.values())
+                        )
+                    elif nxt.action_type in (
+                        A.USE_IN_PACK,
+                        A.SKIP_PACK,
+                        A.PLAY_HAND,
+                        A.DISCARD,
+                        A.REROLL_SHOP,
+                        A.BUY_CARD,
+                        A.BUY_AND_USE,
+                        A.OPEN_PACK,
+                        A.REDEEM_VOUCHER,
+                        A.NEXT_ROUND,
+                        A.SELECT_BLIND,
                     ):
+                        drop_cancelled_use = (
+                            cur_cnt > 0
+                            and c_name
+                            not in (
+                                TarotName.EMPEROR,
+                                TarotName.HIGH_PRIESTESS,
+                                TarotName.FOOL,
+                            )
+                            and nxt_obs_c == cur_obs_c
+                            and not econ_blocked
+                        )
+                    if drop_cancelled_use:
                         for hc in state.hand.cards:
                             hc.selected = False
                         continue
@@ -4798,7 +5693,9 @@ def _build_run_trajectory_with_plan(
             if nxt_idx is not None:
                 nxt = scheduled_actions[nxt_idx]
                 if (
-                    nxt.action_type == A.USE_IN_PACK
+                    nxt.action_type
+                    in (A.USE_IN_PACK, A.SKIP_PACK, A.USE_CONSUMABLE, A.SELL_CARD)
+                    and nxt.ambient_location == Location.PACK
                     and nxt.target_frame > sa.frame_id
                     and nxt_idx in obs_pack_counts_by_sa_idx
                 ):
@@ -4844,6 +5741,73 @@ def _build_run_trajectory_with_plan(
                         and (cur_m is None or nxt_m is None or int(nxt_m) >= int(cur_m))
                     ):
                         continue
+        elif (
+            sa.ambient_location == Location.SHOP
+            and sa.action_type in (A.BUY_CARD, A.BUY_AND_USE)
+            and action.target_idx is not None
+            and 0 <= action.target_idx < len(state.shop_cards)
+        ):
+            nxt_idx = _next_non_sort_idx(sa_idx)
+            if nxt_idx is not None:
+                nxt = scheduled_actions[nxt_idx]
+                if (
+                    nxt.ambient_location == Location.SHOP
+                    and nxt.target_frame > sa.frame_id
+                ):
+                    cur_shop_out = shop_res_by_frame.get(sa.target_frame)
+                    nxt_shop_out = shop_res_by_frame.get(nxt.target_frame)
+                    cur_shop_cnt = Counter(
+                        (getattr(it, "card_type", None), getattr(it, "key", None))
+                        for it in (getattr(cur_shop_out, "shop_items", None) or ())
+                    )
+                    nxt_shop_cnt = Counter(
+                        (getattr(it, "card_type", None), getattr(it, "key", None))
+                        for it in (getattr(nxt_shop_out, "shop_items", None) or ())
+                    )
+                    shelf_still_present = sum(cur_shop_cnt.values()) > 0 and all(
+                        nxt_shop_cnt[k] >= v for k, v in cur_shop_cnt.items()
+                    )
+                    if shelf_still_present:
+                        cur_m = _get_hud_val(hud_peek, "hud_money")
+                        nxt_m = _get_hud_val(
+                            hud_res_by_frame.get(nxt.target_frame), "hud_money"
+                        )
+                        money_unchanged = (
+                            cur_m is None
+                            or nxt_m is None
+                            or (
+                                int(nxt_m) >= int(cur_m)
+                                if sa.action_type == A.BUY_CARD
+                                else int(nxt_m) == int(cur_m)
+                            )
+                        )
+                        if money_unchanged:
+                            bought_item = state.shop_cards[action.target_idx]
+                            inv_unchanged = True
+                            if (
+                                isinstance(bought_item, Joker)
+                                and nxt_idx in obs_joker_counts_by_sa_idx
+                            ):
+                                cur_jc = obs_joker_counts_by_sa_idx.get(
+                                    sa_idx, Counter()
+                                )[bought_item.name]
+                                nxt_jc = obs_joker_counts_by_sa_idx[nxt_idx][
+                                    bought_item.name
+                                ]
+                                inv_unchanged = nxt_jc <= cur_jc
+                            elif (
+                                sa.action_type == A.BUY_CARD
+                                and not isinstance(bought_item, PlayingCard)
+                                and nxt_idx in obs_cons_counts_by_sa_idx
+                            ):
+                                c_sig = _consumable_sig(bought_item)
+                                cur_cc = obs_cons_counts_by_sa_idx.get(
+                                    sa_idx, Counter()
+                                )[c_sig]
+                                nxt_cc = obs_cons_counts_by_sa_idx[nxt_idx][c_sig]
+                                inv_unchanged = nxt_cc <= cur_cc
+                            if inv_unchanged:
+                                continue
 
         # Hand synchronization & sort handling
         step_full_deck_synced = _consume_full_deck_views_up_to(sa.frame_id, action)
@@ -4864,11 +5828,17 @@ def _build_run_trajectory_with_plan(
                 pre_sync_deck_len = (
                     len(state.full_deck) if state.full_deck is not None else 0
                 )
-                pre_selected_uid = _sync_hand_into_state(state, obs_pre, action=action)
+                pre_selected_uid = _sync_hand_into_state(
+                    state,
+                    obs_pre,
+                    action=action,
+                    pending_cert_card_ids=pending_cert_card_ids,
+                )
                 if state.full_deck is not None:
                     added_now = max(0, len(state.full_deck) - pre_sync_deck_len)
                     if added_now > 0:
                         step_unexpected_adds += added_now
+                        phantom_deck_adds_since_sync += added_now
                         diag["unexpected_deck_additions"].append(
                             (action.frame_idx, action.type.value, added_now)
                         )
@@ -4879,12 +5849,13 @@ def _build_run_trajectory_with_plan(
             # If a round transition was missed, return prior round's discard/played cards
             # to draw_pile before syncing the new round's hand so full_deck doesn't bloat.
             hud_pre = hud_res_by_frame.get(sa.target_frame)
-            hud_r_val = (
-                getattr(hud_pre, "hud_round", None) if hud_pre is not None else None
-            )
+            hud_r_val = _get_hud_val(hud_pre, "hud_round")
             if (
                 hud_r_val is not None
                 and hud_r_val > state.round
+                and _is_plausible_hud_round(
+                    int(hud_r_val), state.round, state.ante, _next_hud_round(sa_idx)
+                )
                 and (state.discard_pile or state.played_cards_this_round)
             ):
                 state.hand.cards.clear()
@@ -4914,7 +5885,12 @@ def _build_run_trajectory_with_plan(
                 pre_sync_deck_len = (
                     len(state.full_deck) if state.full_deck is not None else 0
                 )
-                _sync_hand_into_state(state, obs_cards, action=action)
+                _sync_hand_into_state(
+                    state,
+                    obs_cards,
+                    action=action,
+                    pending_cert_card_ids=pending_cert_card_ids,
+                )
                 if (
                     sa.action_type == A.PLAY_HAND
                     and sa_idx in play_area_res_by_sa
@@ -4932,6 +5908,7 @@ def _build_run_trajectory_with_plan(
                     added_now = max(0, len(state.full_deck) - pre_sync_deck_len)
                     if added_now > 0:
                         step_unexpected_adds += added_now
+                        phantom_deck_adds_since_sync += added_now
                         diag["unexpected_deck_additions"].append(
                             (action.frame_idx, action.type.value, added_now)
                         )
@@ -4988,6 +5965,12 @@ def _build_run_trajectory_with_plan(
         hud_out = hud_res_by_frame.get(sa.target_frame)
         deferred_round_score: int | float | None = None
         if hud_out is not None:
+            state._rebate_reconciled = False
+            next_ns_idx = _next_non_sort_idx(sa_idx)
+            is_end_round_victory_risk = sa.action_type == A.END_ROUND and (
+                next_ns_idx is None
+                or scheduled_actions[next_ns_idx].ambient_location == Location.CASH_OUT
+            )
             deferred_round_score = _sync_hud_into_state(
                 state,
                 hud_out,
@@ -4995,10 +5978,12 @@ def _build_run_trajectory_with_plan(
                 action,
                 has_end_round_after=_has_end_round_after(scheduled_actions, sa_idx),
                 next_hud_money=_next_hud_money(sa_idx),
+                next_hud_moneys=_next_k_hud_money(sa_idx, k=3),
+                next_hud_round=_next_hud_round(sa_idx),
                 stale_money_drop_guard=(
                     (
                         last_money_consumable_frame >= 0
-                        and sa.frame_id <= last_money_consumable_frame + 30
+                        and sa.frame_id <= last_money_consumable_frame + 120
                     )
                     or (
                         last_cash_out_frame >= 0
@@ -5009,8 +5994,13 @@ def _build_run_trajectory_with_plan(
                         )
                     )
                 ),
+                suppress_hands_discards=is_end_round_victory_risk,
+                rebate_discard_info=last_rebate_discard_info,
                 diag=diag,
             )
+            if getattr(state, "_rebate_reconciled", False):
+                last_rebate_discard_info = None
+                state._rebate_reconciled = False
 
         if (
             sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK)
@@ -5117,9 +6107,7 @@ def _build_run_trajectory_with_plan(
             post_fool_held = Counter(
                 _consumable_sig(c)
                 for idx, c in enumerate(state.inventory.consumables)
-                if not (
-                    sa.action_type == A.USE_CONSUMABLE and idx == action.target_idx
-                )
+                if not (sa.action_type == A.USE_CONSUMABLE and idx == action.target_idx)
             )
             new_sigs = [
                 sig
@@ -5130,13 +6118,281 @@ def _build_run_trajectory_with_plan(
             ]
             if len(new_sigs) == 1:
                 state.last_tarot_planet = new_sigs[0][0]
+        pre_cons_obj_ids = (
+            {id(c) for c in state.inventory.consumables}
+            if state.inventory is not None
+            else set()
+        )
+        pre_joker_obj_ids = (
+            {id(j) for j in state.inventory.jokers}
+            if state.inventory is not None
+            else set()
+        )
+        has_active_cert = bool(
+            sa.action_type == A.SELECT_BLIND
+            and state.inventory is not None
+            and any(
+                j.name == JokerName.CERTIFICATE and not j.debuffed
+                for j in state.inventory.jokers
+            )
+        )
+        pre_cert_deck_ids = (
+            {c.id for c in state.full_deck} if has_active_cert else set()
+        )
+        selected_hand_snapshot = [hc for hc in state.hand.cards if hc.selected]
+        held_hand_snapshot = [hc for hc in state.hand.cards if not hc.selected]
+        pre_action_money = state.money
+        hud_money_before = _get_hud_val(hud_out, "hud_money")
+        deck_has_purple = any(
+            c.seal == Seal.PURPLE and not getattr(c, "debuffed", False)
+            for c in state.full_deck
+        )
+        deck_has_blue = any(
+            c.seal == Seal.BLUE and not getattr(c, "debuffed", False)
+            for c in state.full_deck
+        )
+        if sa.action_type == A.DISCARD and state.inventory is not None:
+            rebate_unit = _mail_in_rebate_payout_per_card(state)
+            if rebate_unit > 0:
+                disc_rank_counts = Counter(
+                    hc.card.rank
+                    for hc in state.hand.cards
+                    if hc.selected
+                    and not hc.facing_back
+                    and not hc.card.debuffed
+                    and hc.card.enhancement != Enhancement.STONE
+                    and hc.card.rank != Rank.NONE
+                )
+                n_fd_discards = sum(
+                    1
+                    for hc in state.hand.cards
+                    if hc.selected and hc.facing_back and not hc.card.debuffed
+                )
+                sim_rebate_matches = disc_rank_counts.get(state.mail_card_rank, 0)
+                last_rebate_discard_info = (
+                    state.round,
+                    rebate_unit,
+                    disc_rank_counts,
+                    sim_rebate_matches,
+                    n_fd_discards,
+                )
+            else:
+                last_rebate_discard_info = None
+        elif sa.action_type in (
+            A.SELECT_BLIND,
+            A.SKIP_BLIND,
+            A.END_ROUND,
+            A.CASH_OUT,
+            A.NEXT_ROUND,
+            A.PLAY_HAND,
+        ):
+            last_rebate_discard_info = None
+
         on_action(state, action)
+        target_card_name = action.metadata.get("target_card")
+        new_sim_cons: list[Any] = []
+        if (
+            sa.action_type
+            in (A.SELECT_BLIND, A.PLAY_HAND, A.DISCARD, A.OPEN_PACK, A.END_ROUND)
+            or (
+                sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK, A.BUY_AND_USE)
+                and target_card_name
+                in (TarotName.EMPEROR.value, TarotName.HIGH_PRIESTESS.value)
+            )
+        ) and state.inventory is not None:
+            for c in state.inventory.consumables:
+                if id(c) not in pre_cons_obj_ids:
+                    unconfirmed_rng_cons_ids.add(id(c))
+                    new_sim_cons.append(c)
+
+        if state.inventory is not None and (
+            sa.action_type in (A.SELECT_BLIND, A.SKIP_BLIND)
+            or (
+                sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK, A.BUY_AND_USE)
+                and target_card_name
+                in (
+                    TarotName.JUDGEMENT.value,
+                    SpectralName.WRAITH.value,
+                    SpectralName.THE_SOUL.value,
+                )
+            )
+        ):
+            new_sim_joker_count = 0
+            for j in state.inventory.jokers:
+                if id(j) not in pre_joker_obj_ids:
+                    unconfirmed_rng_joker_ids.add(id(j))
+                    new_sim_joker_count += 1
+            free_j_slots = max(
+                0, state.inventory.max_jokers - len(state.inventory.jokers)
+            )
+            if (
+                sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK, A.BUY_AND_USE)
+                and new_sim_joker_count == 0
+                and free_j_slots > 0
+            ):
+                pending_rng_joker_budget += 1
+            elif sa.action_type == A.SELECT_BLIND:
+                rr_copies = _active_joker_copies(state, JokerName.RIFF_RAFF)
+                if rr_copies > 0 and free_j_slots > 0:
+                    pending_rng_joker_budget += min(free_j_slots, 2 * rr_copies)
+
+        if state.inventory is not None:
+            free_c_slots = max(
+                0, state.inventory.max_consumables - len(state.inventory.consumables)
+            )
+            if free_c_slots > 0:
+                if sa.action_type == A.OPEN_PACK:
+                    halu = _active_joker_copies(state, JokerName.HALLUCINATION)
+                    if halu > 0:
+                        pending_rng_cons_budget[Tarot] += min(free_c_slots, halu)
+                elif sa.action_type == A.SELECT_BLIND:
+                    cart = _active_joker_copies(state, JokerName.CARTOMANCER)
+                    if cart > 0:
+                        pending_rng_cons_budget[Tarot] += min(free_c_slots, cart)
+                elif sa.action_type == A.PLAY_HAND and selected_hand_snapshot:
+                    vag = _active_joker_copies(state, JokerName.VAGABOND)
+                    if vag > 0 and (
+                        pre_action_money <= 4
+                        or (hud_money_before is not None and int(hud_money_before) <= 4)
+                    ):
+                        pending_rng_cons_budget[Tarot] += min(free_c_slots, vag)
+                    eb = _active_joker_copies(state, JokerName.EIGHT_BALL)
+                    if eb > 0:
+                        n_8 = sum(
+                            1
+                            for hc in selected_hand_snapshot
+                            if hc.facing_back
+                            or (
+                                hc.card.rank == Rank.EIGHT
+                                and hc.card.enhancement != Enhancement.STONE
+                                and not hc.card.debuffed
+                            )
+                        )
+                        if n_8 > 0:
+                            pending_rng_cons_budget[Tarot] += min(
+                                free_c_slots, eb * n_8
+                            )
+                    has_fd_play = any(hc.facing_back for hc in selected_hand_snapshot)
+                    sup = _active_joker_copies(state, JokerName.SUPERPOSITION)
+                    sea = _active_joker_copies(state, JokerName.SEANCE)
+                    if (sup > 0 or sea > 0) and selected_hand_snapshot:
+                        jokers_now = state.inventory.jokers
+                        if has_fd_play:
+                            if sup > 0:
+                                pending_rng_cons_budget[Tarot] += min(
+                                    free_c_slots, sup
+                                )
+                            if sea > 0:
+                                pending_rng_cons_budget[Spectral] += min(
+                                    free_c_slots, sea
+                                )
+                        else:
+                            played_cards_now = [hc.card for hc in selected_hand_snapshot]
+                            p_hand = evaluate_poker_hand(played_cards_now, jokers_now)
+                            if (
+                                sup > 0
+                                and p_hand
+                                in (PokerHand.STRAIGHT, PokerHand.STRAIGHT_FLUSH)
+                                and any(
+                                    c.rank == Rank.ACE
+                                    and c.enhancement != Enhancement.STONE
+                                    for c in get_scoring_cards(
+                                        played_cards_now, jokers_now
+                                    )
+                                )
+                            ):
+                                pending_rng_cons_budget[Tarot] += min(
+                                    free_c_slots, sup
+                                )
+                            if sea > 0 and p_hand == PokerHand.STRAIGHT_FLUSH:
+                                pending_rng_cons_budget[Spectral] += min(
+                                    free_c_slots, sea
+                                )
+                    has_sixth = any(
+                        j.name == JokerName.SIXTH_SENSE and not j.debuffed
+                        for j in state.inventory.jokers
+                    )
+                    if (
+                        has_sixth
+                        and state.hands_played_this_round <= 1
+                        and len(selected_hand_snapshot) == 1
+                        and (
+                            selected_hand_snapshot[0].facing_back
+                            or (
+                                selected_hand_snapshot[0].card.rank == Rank.SIX
+                                and selected_hand_snapshot[0].card.enhancement
+                                != Enhancement.STONE
+                            )
+                        )
+                    ):
+                        pending_rng_cons_budget[Spectral] += min(free_c_slots, 1)
+                elif sa.action_type == A.DISCARD and selected_hand_snapshot:
+                    purple_cnt = sum(
+                        1
+                        for hc in selected_hand_snapshot
+                        if (not hc.card.debuffed and hc.card.seal == Seal.PURPLE)
+                        or (hc.facing_back and deck_has_purple)
+                    )
+                    if purple_cnt > 0:
+                        pending_rng_cons_budget[Tarot] += min(
+                            free_c_slots, purple_cnt
+                        )
+
+                if (
+                    sa.action_type == A.END_ROUND
+                    or (sa.action_type == A.PLAY_HAND and state.round_won)
+                ) and held_hand_snapshot:
+                    blue_cnt = sum(
+                        1
+                        for hc in held_hand_snapshot
+                        if (not hc.card.debuffed and hc.card.seal == Seal.BLUE)
+                        or (hc.facing_back and deck_has_blue)
+                    )
+                    if blue_cnt > 0:
+                        mimes = _active_joker_copies(state, JokerName.MIME)
+                        pending_rng_cons_budget[Planet] += min(
+                            free_c_slots, blue_cnt * (2 + mimes)
+                        )
+
+                if sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK, A.BUY_AND_USE):
+                    if target_card_name == TarotName.EMPEROR.value:
+                        rem_cap = min(free_c_slots, max(0, 2 - len(new_sim_cons)))
+                        if rem_cap > 0:
+                            pending_rng_cons_budget[Tarot] += rem_cap
+                    elif target_card_name == TarotName.HIGH_PRIESTESS.value:
+                        rem_cap = min(free_c_slots, max(0, 2 - len(new_sim_cons)))
+                        if rem_cap > 0:
+                            pending_rng_cons_budget[Planet] += rem_cap
+
+            if sa.action_type == A.NEXT_ROUND and state.inventory.consumables:
+                perkeo = _active_joker_copies(state, JokerName.PERKEO)
+                if perkeo > 0 and not new_sim_cons:
+                    for c_type in {type(c) for c in state.inventory.consumables}:
+                        pending_rng_cons_budget[c_type] += perkeo
+        if has_active_cert:
+            for c in state.full_deck:
+                if c.id not in pre_cert_deck_ids and c.id:
+                    pending_cert_card_ids.add(c.id)
+        if sa.action_type in (
+            A.SELECT_BLIND,
+            A.SKIP_BLIND,
+            A.CASH_OUT,
+            A.NEXT_ROUND,
+        ):
+            state._last_play_lucky_triggers = 0
+            state._last_play_lucky_money_hits = 0
+        if sa.action_type in (A.END_ROUND, A.CASH_OUT, A.NEXT_ROUND):
+            pending_cert_card_ids.clear()
         if _maybe_halt_ante_9(sa_idx, sa, cur_hud_ante):
             halted_ante_9 = True
             break
-        if bought_shop_td_k is not None and 0 <= bought_shop_td_k < len(shop_todo_unbought):
+        if bought_shop_td_k is not None and 0 <= bought_shop_td_k < len(
+            shop_todo_unbought
+        ):
             shop_todo_unbought.pop(bought_shop_td_k)
-        if bought_pack_td_k is not None and 0 <= bought_pack_td_k < len(pack_todo_unbought):
+        if bought_pack_td_k is not None and 0 <= bought_pack_td_k < len(
+            pack_todo_unbought
+        ):
             pack_todo_unbought.pop(bought_pack_td_k)
         if sa.action_type == A.REROLL_SHOP:
             shop_reroll_seq += 1
@@ -5187,15 +6443,16 @@ def _build_run_trajectory_with_plan(
             sa.action_type == A.SELL_CARD and post_cons_len < prev_cons_len
         ):
             last_consumable_mutated_frame = action.frame_idx
-        if sa.action_type == A.USE_CONSUMABLE and action.metadata.get("target_card") in (
+        if sa.action_type == A.USE_CONSUMABLE and action.metadata.get(
+            "target_card"
+        ) in (
             TarotName.HERMIT.value,
             TarotName.TEMPERANCE.value,
         ):
             last_money_consumable_frame = action.frame_idx
-        if (
-            sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK)
-            and action.metadata.get("target_card") in ("Ankh", "Hex")
-        ):
+        if sa.action_type in (A.USE_CONSUMABLE, A.USE_IN_PACK) and action.metadata.get(
+            "target_card"
+        ) in ("Ankh", "Hex"):
             last_joker_destroy_frame = action.frame_idx
         action.metadata.pop("_surviving_hand_ids", None)
         action.metadata.pop("_hook_discard_ids", None)
@@ -5210,9 +6467,12 @@ def _build_run_trajectory_with_plan(
                 action,
                 diag=diag,
                 next_obs_cons_counts=next_cons_counts,
+                unconfirmed_rng_cons_ids=unconfirmed_rng_cons_ids,
+                pending_rng_cons_budget=pending_rng_cons_budget,
                 sync_jokers=False,
                 sync_consumables=True,
             )
+            pending_rng_cons_budget.clear()
         if deferred_round_score is not None:
             if diag is not None and state.current_chips != deferred_round_score:
                 diag["ocr_score_updates"] += 1
@@ -5258,15 +6518,46 @@ def _build_run_trajectory_with_plan(
     _scan_and_quarantine_corrupted_segments(trajectory, step_records, diag=diag)
     trajectory.impute_retroactive_boss_blinds()
 
+    rescan_targets: list[dict[str, Any]] = list(
+        diag.get("unexpected_shop_transitions") or ()
+    )
+    loc_mm_list = diag.get("location_mismatches") or ()
+    if loc_mm_list and video_path is not None:
+        mm_covered_until = -1
+        for mm_fid, _mm_act, exp_loc, got_loc in loc_mm_list:
+            if mm_fid <= mm_covered_until or got_loc != Location.SHOP.value:
+                continue
+            if exp_loc not in (Location.BLIND.value, Location.SELECT.value):
+                continue
+            mm_idx = next(
+                (i for i, sa_item in enumerate(scheduled_actions) if sa_item.frame_id == mm_fid),
+                None,
+            )
+            if mm_idx is None:
+                continue
+            prev_shop_fid = 0
+            for j in range(mm_idx - 1, -1, -1):
+                if scheduled_actions[j].ambient_location == Location.SHOP:
+                    prev_shop_fid = scheduled_actions[j].frame_id
+                    break
+            rescan_targets.append(
+                {
+                    "prev_frame": prev_shop_fid,
+                    "frame": mm_fid,
+                    "reasons": ["vouchers_gained=location_mismatch"],
+                }
+            )
+            mm_covered_until = mm_fid
+
     if (
         rescan_shop_transitions
         and not _is_rescan_pass
         and video_path is not None
-        and diag.get("unexpected_shop_transitions")
+        and rescan_targets
     ):
         t_rs = time.perf_counter()
         merged_payload, rs_stats = _rescan_unexpected_shop_windows(
-            d, video_path, diag["unexpected_shop_transitions"]
+            d, video_path, rescan_targets
         )
         rs_elapsed = time.perf_counter() - t_rs
         if merged_payload is not None:

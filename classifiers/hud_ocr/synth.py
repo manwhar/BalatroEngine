@@ -108,13 +108,16 @@ def sample_hud_text(rng: random.Random, field_name: str | None = None) -> tuple[
         return field_name, text
 
     if field_name == "hud_money":
-        if rng.random() < 0.08:
+        if rng.random() < 0.18:
             val = rng.randint(1, 35)
             return field_name, f"-{val}"
-        if rng.random() < 0.75:
-            val = rng.randint(0, 199)
+        r_m = rng.random()
+        if r_m < 0.45:
+            val = rng.randint(0, 99)
+        elif r_m < 0.85:
+            val = rng.randint(100, 999)
         else:
-            val = rng.randint(200, 2999)
+            val = rng.randint(1000, 2999)
         return field_name, str(val)
 
     if field_name in ("hud_hands", "hud_discards"):
@@ -394,7 +397,7 @@ class BalatroHudSynthesizer:
         if is_empty_sample:
             display_text = rng.choice(("", "SHOP", "Reroll", "Blind", "Play Hand"))
         elif chosen_field == "hud_money":
-            display_text = f"-${target_text[1:]}" if target_text.startswith("-") else f"${target_text}"
+            display_text = f"${target_text}"
         elif chosen_field == "hud_reroll_cost":
             display_text = f"${target_text}"
         else:

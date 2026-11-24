@@ -26,7 +26,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from classifiers.card_classifier.pipeline import CardResult, decode_card_prediction
 from classifiers.card_classifier.stage2_classifier.config import CROP_HEIGHT, CROP_WIDTH
 from classifiers.card_classifier.stage2_classifier.dataset import IMAGENET_MEAN, IMAGENET_STD
-from classifiers.card_classifier.stage2_classifier.model import MultiHeadCardClassifier
+from classifiers.card_classifier.stage2_classifier.model import (
+    MultiHeadCardClassifier,
+    infer_backbone_from_checkpoint,
+)
 
 
 def is_valid_deck_card_box(box: list[int] | tuple[int, int, int, int]) -> bool:
@@ -115,9 +118,10 @@ class DeckRecognitionPipeline:
 
         self.detector = YOLO(str(detector_path))
 
-        self.classifier = MultiHeadCardClassifier(backbone_name=backbone, pretrained=False).to(self.device)
         ckpt = torch.load(str(classifier_path), map_location=self.device)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
+        resolved_backbone = infer_backbone_from_checkpoint(ckpt, default_backbone=backbone or "mobilenet_v3_small")
+        self.classifier = MultiHeadCardClassifier(backbone_name=resolved_backbone, pretrained=False).to(self.device)
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith("head_selected")}
         self.classifier.load_state_dict(filtered_state_dict, strict=False)
         self.classifier.eval()
