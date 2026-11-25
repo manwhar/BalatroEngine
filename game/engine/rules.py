@@ -909,9 +909,18 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
         elif c_name == TarotName.JUDGEMENT:
             _spawn_joker_to_inventory(state, key_append="jud")
         elif c_name == TarotName.HANGED_MAN:
-            selected = [hc.card for hc in state.hand.cards if hc.selected]
+            selected = [
+                (hc._real_card if hc.facing_back and hc._real_card else hc.card)
+                for hc in state.hand.cards
+                if hc.selected
+            ]
+            is_inferred = bool(
+                action and action.metadata and action.metadata.get("inferred")
+            )
             to_destroy = (
-                selected[:2] if selected else [hc.card for hc in state.hand.cards[:2]]
+                selected[:2]
+                if selected
+                else ([] if is_inferred else [hc.card for hc in state.hand.cards[:2]])
             )
             for dc in to_destroy:
                 state.remove_card_from_deck(dc, shattered=True)
@@ -924,8 +933,17 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
             if len(selected) >= 2:
                 left, right = selected[0], selected[1]
                 source_card = right._real_card if right._real_card else right.card
-                if source_card.rank != Rank.NONE:
+                if (
+                    source_card.rank != Rank.NONE
+                    or source_card.enhancement == Enhancement.STONE
+                ):
                     left.resolve_face_down(source_card, preserve_id=True)
+                    state.sync_card_to_deck(
+                        left._real_card
+                        if left.facing_back and left._real_card
+                        else left.card,
+                        rebind_hand_card=left,
+                    )
                 if right.facing_back:
                     right.reveal_temporarily()
                 state.update_face_down_candidates()
@@ -959,6 +977,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                     hc.reveal_temporarily()
                 elif hc.card.rank in next_rank:
                     hc.card.rank = next_rank[hc.card.rank]
+                state.sync_card_to_deck(
+                    hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                    rebind_hand_card=hc,
+                )
             state.update_face_down_candidates()
         elif c_name in (
             TarotName.MAGICIAN,
@@ -1002,6 +1024,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                     hc.reveal_temporarily()
                 elif hc.bounds:
                     hc.bounds.possible_enhancements = {target_enh}
+                state.sync_card_to_deck(
+                    hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                    rebind_hand_card=hc,
+                )
             state.update_face_down_candidates()
         elif c_name in (TarotName.SUN, TarotName.MOON, TarotName.STAR, TarotName.WORLD):
             suit_map = {
@@ -1020,6 +1046,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                     hc.reveal_temporarily()
                 elif hc.bounds:
                     hc.bounds.possible_suits = {target_suit}
+                state.sync_card_to_deck(
+                    hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                    rebind_hand_card=hc,
+                )
             state.update_face_down_candidates()
         elif c_name == TarotName.WHEEL_OF_FORTUNE:
             if state.rng:
@@ -1101,6 +1131,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                 hc.reveal_temporarily()
             elif hc.bounds:
                 hc.bounds.possible_ranks = {rank}
+            state.sync_card_to_deck(
+                hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                rebind_hand_card=hc,
+            )
         state.hand.max_size = max(0, state.hand.max_size - 1)
         state.update_face_down_candidates()
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.ECTOPLASM:
@@ -1134,18 +1168,28 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                     state.pending_cv_checks.add("jokers")
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.CRYPTID:
         selected = [c for c in state.hand.cards if c.selected]
+        is_inferred = bool(
+            action and action.metadata and action.metadata.get("inferred")
+        )
         target_hc = (
             selected[0]
             if selected
-            else (state.hand.cards[0] if state.hand.cards else None)
+            else (
+                None
+                if is_inferred
+                else (state.hand.cards[0] if state.hand.cards else None)
+            )
         )
         if target_hc:
             if target_hc.facing_back:
                 target_hc.reveal_temporarily()
             source = target_hc._real_card or target_hc.card
-            state.add_card_to_deck(copy.deepcopy(source), add_to_hand=True)
-            state.add_card_to_deck(copy.deepcopy(source), add_to_hand=True)
-        else:
+            if source.rank != Rank.NONE or source.enhancement == Enhancement.STONE:
+                state.add_card_to_deck(copy.deepcopy(source), add_to_hand=True)
+                state.add_card_to_deck(copy.deepcopy(source), add_to_hand=True)
+            else:
+                state.deck_cards_count += 2
+        elif not is_inferred:
             state.deck_cards_count += 2
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.AURA:
         selected = [hc for hc in state.hand.cards if hc.selected][:1]
@@ -1159,6 +1203,12 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                 target_hc._real_card.edition = ed
             if target_hc.facing_back:
                 target_hc.reveal_temporarily()
+            state.sync_card_to_deck(
+                target_hc._real_card
+                if target_hc.facing_back and target_hc._real_card
+                else target_hc.card,
+                rebind_hand_card=target_hc,
+            )
             state.update_face_down_candidates()
     elif c_type == CardType.SPECTRAL and c_name == SpectralName.SIGIL:
         suit = Suit.SPADES
@@ -1174,6 +1224,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                 hc.reveal_temporarily()
             elif hc.bounds:
                 hc.bounds.possible_suits = {suit}
+            state.sync_card_to_deck(
+                hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                rebind_hand_card=hc,
+            )
         state.update_face_down_candidates()
     elif c_type == CardType.SPECTRAL and c_name in (
         SpectralName.GRIM,
@@ -1262,6 +1316,10 @@ def _apply_consumable_state(state, card, action: Action | None = None) -> None:
                 hc.reveal_temporarily()
             elif hc.bounds:
                 hc.bounds.possible_seals = {target_seal}
+            state.sync_card_to_deck(
+                hc._real_card if hc.facing_back and hc._real_card else hc.card,
+                rebind_hand_card=hc,
+            )
         state.update_face_down_candidates()
 
 
@@ -1379,6 +1437,7 @@ def on_action(state, action: Action):
                 c.forced_selection = False
                 if c.selected and c.facing_back and c._real_card:
                     c.resolve_face_down(c._real_card, lift_facing_back=True)
+                    state.sync_card_to_deck(c.card, rebind_hand_card=c)
 
             if state.current_blind == BlindName.THE_FISH and not state.boss_disabled:
                 state.fish_prepped = True
@@ -1446,6 +1505,7 @@ def on_action(state, action: Action):
             for c in state.hand.cards:
                 if c.selected and c.facing_back and c._real_card:
                     c.resolve_face_down(c._real_card, lift_facing_back=True)
+                    state.sync_card_to_deck(c.card, rebind_hand_card=c)
 
             discarded_cards = [c.card for c in state.hand.cards if c.selected]
             _apply_discard_cards(state, action, discarded_cards, is_hook=is_hook)

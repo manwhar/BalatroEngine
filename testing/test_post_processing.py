@@ -4026,6 +4026,65 @@ class TestViewDeckIntegrationAndHookFix(unittest.TestCase):
             )
         )
 
+        # Low-confidence rank (< 0.94) + phantom-only guard prevent View-Deck occlusion churn from poisoning full_deck
+        state_ph = gs.GameState(
+            deck=bm.Deck.BLUE_DECK, stake=bm.Stake.GOLD, seed="IVDB_PH"
+        )
+        seven_mult = next(
+            c for c in state_ph.full_deck if c.rank == bm.Rank.SEVEN and c.suit == bm.Suit.SPADES
+        )
+        seven_mult.enhancement = bm.Enhancement.MULT
+        phantom = bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.SPADES, id=999)
+        state_ph.full_deck.append(phantom)
+
+        obs_noisy: list[bm.PlayingCard] = []
+        r_confs: list[float] = []
+        for c in state_ph.full_deck:
+            if c.id == 999:
+                continue  # Phantom card is absent in real View Deck
+            if c is seven_mult:
+                # Occluded rank corner misread as Ace of Spades Mult with low rank conf
+                obs_noisy.append(
+                    bm.PlayingCard(
+                        rank=bm.Rank.ACE,
+                        suit=bm.Suit.SPADES,
+                        enhancement=bm.Enhancement.MULT,
+                    )
+                )
+                r_confs.append(0.72)
+            elif c.rank == bm.Rank.EIGHT and c.suit == bm.Suit.SPADES:
+                # High-conf occlusion misread on 8S -> 5S
+                obs_noisy.append(bm.PlayingCard(rank=bm.Rank.FIVE, suit=bm.Suit.SPADES))
+                r_confs.append(0.96)
+            else:
+                obs_noisy.append(bm.PlayingCard(rank=c.rank, suit=c.suit, enhancement=c.enhancement))
+                r_confs.append(0.99)
+
+        summary_ph = pp._sync_full_deck_into_state(
+            state_ph,
+            obs_noisy,
+            obs_rank_confs=r_confs,
+            view_mode="full_deck",
+            phantom_adds=1,
+            phantom_card_ids={999},
+            reasons=("unexpected_deck_addition",),
+        )
+        self.assertIsNotNone(summary_ph)
+        self.assertEqual(summary_ph["removed"], 1)
+        self.assertEqual(summary_ph["added"], 0)
+        self.assertNotIn(999, {c.id for c in state_ph.full_deck})
+        self.assertTrue(
+            any(
+                c.rank == bm.Rank.SEVEN
+                and c.suit == bm.Suit.SPADES
+                and c.enhancement == bm.Enhancement.MULT
+                for c in state_ph.full_deck
+            )
+        )
+        self.assertTrue(
+            any(c.rank == bm.Rank.EIGHT and c.suit == bm.Suit.SPADES for c in state_ph.full_deck)
+        )
+
     def test_lazy_full_deck_skipped_when_healthy_and_recovers_quarantine_on_drift(
         self,
     ) -> None:
@@ -6763,6 +6822,284 @@ class TestUrls2AuditFixes(unittest.TestCase):
         self.assertEqual(len(diag["unexplained_consumable_changes"]), 1)  # only initial pickup at f=100
         self.assertEqual(diag["large_ocr_overrides"], [])
         self.assertFalse(any(dl.action and dl.action.frame_idx >= 400 and dl.action.metadata.get("corrupted") for dl in traj.deltas))
+
+    def test_death_three_selected_re_solved_to_two_most_raised_cards(self) -> None:
+        from classifiers.inference import HudRecognitionOutput
+
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Open Pack": 4,
+                "Use In Pack": 5,
+                "Next Round": 6,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [705, 907, 912, 1032]},
+                "300": {"action": 2, "box": [500, 500, 600, 550]},
+                "400": {"action": 3, "box": [400, 300, 600, 370]},
+                "500": {"action": 4, "box": [1110, 910, 1210, 960]},
+                "600": {"action": 5, "box": [740, 810, 820, 850]},
+                "700": {"action": 6, "box": [550, 420, 680, 480]},
+            },
+        }
+        img0 = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        dummy = {f: img0 for f in (98, 200, 298, 398, 498, 500, 598, 600, 698, 700)}
+
+        # Translate exact xPGzf7YJlxM step-215 pack_hand boxes into full-frame coords (roi=[490, 300, 1100, 340])
+        pack_roi = (490, 300, 1100, 340)
+        s215_specs = [
+            ("6", "Clubs", False, [19, 115, 127, 340]),
+            ("7", "Clubs", True, [141, 44, 246, 281]),      # left selected card
+            ("5", "Spades", True, [264, 57, 358, 291]),     # false-positive 3rd card (y1=57)
+            ("3", "Hearts", False, [395, 76, 476, 307]),
+            ("3", "Clubs", False, [515, 84, 596, 313]),
+            ("King", "Hearts", True, [632, 36, 721, 267]),  # right selected card (y1=36)
+            ("2", "Diamonds", False, [744, 75, 855, 311]),
+            ("4", "Diamonds", False, [862, 84, 973, 327]),
+        ]
+        s215_cards = []
+        for rnk, st_suit, sel, (x1, y1, x2, y2) in s215_specs:
+            c = _make_card_res(rnk, st_suit, selected=sel)
+            c.box = [490 + x1, 300 + y1, 490 + x2, 300 + y2]
+            s215_cards.append(c)
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f, timestamp_seconds=ts, mode=mode)
+                if f in (498, 500):
+                    out.boosters = [_make_shop_item("p_arcana_normal_1", "Booster", [1090, 730, 1230, 900])]
+                elif f in (598, 600):
+                    out.pack_items = [_make_shop_item("c_death", "Tarot", [710, 600, 850, 790])]
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            outs = []
+            for _, f, ts in frames:
+                if f == 200:
+                    outs.append(
+                        HandRecognitionOutput(
+                            frame_index=f,
+                            timestamp_seconds=ts,
+                            cards=[_make_card_res("Ace", "Spades", selected=True)],
+                        )
+                    )
+                elif f in (598, 600):
+                    outs.append(
+                        HandRecognitionOutput(
+                            frame_index=f,
+                            timestamp_seconds=ts,
+                            cards=s215_cards,
+                            roi=pack_roi,
+                        )
+                    )
+                else:
+                    outs.append(HandRecognitionOutput(frame_index=f, timestamp_seconds=ts, cards=[]))
+            return outs
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f, ts in frames:
+                flds = list((fields_by_frame or {}).get(f, ()))
+                vals = {k: None for k in flds}
+                if f == 200:
+                    vals.update({"hud_money": 4, "hud_hands": 4})
+                elif f == 298:
+                    vals.update({"hud_round_score": 400, "hud_blind_target": 300})
+                elif f in (498, 500):
+                    vals.update({"hud_money": 10})
+                elif f in (598, 600, 698, 700):
+                    vals.update({"hud_money": 6})
+                outs.append(HudRecognitionOutput(frame_index=f, timestamp_seconds=ts, values=vals))
+            return outs
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+        ):
+            st, traj, plan = pp._build_run_trajectory_with_plan(
+                d, deck=bm.Deck.RED_DECK, seed="DEATH2SEL", preloaded_frames=dummy, fps=60.0, expressive=True, rescan_shop_transitions=False
+            )
+        death_actions = [dl.action for dl in traj.deltas[1:] if dl.action and dl.action.type == bm.ActionType.USE_IN_PACK]
+        self.assertEqual(len(death_actions), 1)
+        sel_pairs = [(c.rank, c.suit) for c in death_actions[0].selected_cards]
+        self.assertEqual(sel_pairs, [(bm.Rank.SEVEN, bm.Suit.CLUBS), (bm.Rank.KING, bm.Suit.HEARTS)])
+        king_hearts = [c for c in st.full_deck if c.rank == bm.Rank.KING and c.suit == bm.Suit.HEARTS]
+        seven_clubs = [c for c in st.full_deck if c.rank == bm.Rank.SEVEN and c.suit == bm.Suit.CLUBS]
+        self.assertEqual(len(king_hearts), 2)
+        self.assertEqual(len(seven_clubs), 0)
+        self.assertFalse(any(dl.action and dl.action.metadata.get("corrupted") for dl in traj.deltas))
+
+    def test_impossible_shop_hand_tarot_dropped_and_inferred_deck_tarot_quarantined(self) -> None:
+        from classifiers.inference import DeckRecognitionOutput, HudRecognitionOutput
+
+        d = {
+            "key": {
+                "Select Blind": 0,
+                "Play Hand": 1,
+                "End Round": 2,
+                "Cash Out": 3,
+                "Buy Card": 4,
+                "Use Consumable": 5,
+                "Next Round": 6,
+                "Full Deck": 7,
+            },
+            "frames": {
+                "100": {"action": 0, "box": [300, 200, 420, 250]},
+                "200": {"action": 1, "box": [705, 907, 912, 1032]},
+                "300": {"action": 2, "box": [500, 500, 600, 550]},
+                "400": {"action": 3, "box": [400, 300, 600, 370]},
+                "450": {"action": 4, "box": [860, 580, 950, 630]},  # Buy The Devil
+                "480": {"action": 5, "box": [1490, 120, 1570, 180]},  # Impossible Use Devil in SHOP -> dropped!
+                "550": {"action": 6, "box": [550, 420, 680, 480]},
+                "600": {"action": 0, "box": [300, 200, 420, 250]},
+                "650": {"action": 1, "box": [705, 907, 912, 1032]},  # Devil vanished -> inferred Use Devil!
+                "700": {
+                    "action": 7,
+                    "box": [1100, 120, 1260, 165],
+                    "metadata": {"view_mode": "full_deck"},
+                },  # Full Deck View
+                "760": {"action": 1, "box": [705, 907, 912, 1032]},  # Clean post-sync Play Hand
+            },
+        }
+        img0 = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        needed = (98, 200, 298, 398, 450, 478, 548, 598, 650, 700, 760)
+        dummy = {f: img0 for f in needed}
+        devil_box = [1390, 35, 1520, 215]
+
+        def fake_shops(frames, mode="shop", **kwargs):
+            outs = []
+            for _, f, ts in frames:
+                out = ShopRecognitionOutput(frame_index=f, timestamp_seconds=ts, mode=mode)
+                if f == 450:
+                    out.shop_items = [_make_shop_item("c_devil", "Tarot", [840, 370, 970, 550])]
+                elif f in (478, 548, 598):
+                    out.consumeables = [_make_shop_item("c_devil", "Tarot", devil_box)]
+                # At f=650 and f=760, The Devil has vanished (used between 600 and 650)
+                outs.append(out)
+            return outs
+
+        def fake_hands(frames, **kwargs):
+            return [
+                HandRecognitionOutput(
+                    frame_index=f,
+                    timestamp_seconds=ts,
+                    cards=[_make_card_res("Ace", "Spades", selected=True)] if f in (200, 650, 760) else [],
+                )
+                for _, f, ts in frames
+            ]
+
+        def fake_hud(frames, fields_by_frame=None, **kwargs):
+            outs = []
+            for _, f, ts in frames:
+                flds = list((fields_by_frame or {}).get(f, ()))
+                vals = {k: None for k in flds}
+                if f == 200:
+                    vals.update({"hud_money": 4, "hud_hands": 4})
+                elif f == 298:
+                    vals.update({"hud_round_score": 400, "hud_blind_target": 300})
+                elif f == 450:
+                    vals.update({"hud_money": 10})
+                elif f in (478, 548, 598, 650, 760):
+                    vals.update({"hud_money": 7})
+                outs.append(HudRecognitionOutput(frame_index=f, timestamp_seconds=ts, values=vals))
+            return outs
+
+        base_deck = gs.GameState(deck=bm.Deck.RED_DECK, seed="DEVIL1").full_deck
+
+        def fake_deck(frame_tuple, view_mode="full_deck", **kwargs):
+            _, f_idx, ts = frame_tuple
+            cards = [
+                _make_card_res(
+                    c.rank.value,
+                    c.suit.value.capitalize(),
+                    enhancement="Gold" if idx == 0 else "None",
+                )
+                for idx, c in enumerate(base_deck)
+            ]
+            return DeckRecognitionOutput(frame_index=f_idx, timestamp_seconds=ts, view_mode="full_deck", cards=cards)
+
+        with (
+            patch("classifiers.inference.batch_recognize_shops", side_effect=fake_shops),
+            patch("classifiers.inference.batch_recognize_hands", side_effect=fake_hands),
+            patch("classifiers.inference.batch_recognize_hud", side_effect=fake_hud),
+            patch("classifiers.inference.recognize_full_deck", side_effect=fake_deck) as mock_fd,
+        ):
+            _, traj, plan = pp._build_run_trajectory_with_plan(
+                d, deck=bm.Deck.RED_DECK, seed="DEVIL1", preloaded_frames=dummy, fps=60.0, expressive=True, rescan_shop_transitions=False
+            )
+
+        # 1. Impossible Use Consumable at f=480 in SHOP was dropped
+        self.assertFalse(any(dl.action and dl.action.frame_idx == 480 for dl in traj.deltas[1:]))
+        # 2. Inferred Use Consumable before f=650 triggered lazy Full Deck sync and quarantined [inferred..sync)
+        self.assertEqual(mock_fd.call_count, 1)
+        self.assertIn("inferred_deck_mutating_consumable", plan["diagnostics"]["full_deck_syncs"][0]["reasons"])
+        inferred_use = next(dl.action for dl in traj.deltas[1:] if dl.action and dl.action.type == bm.ActionType.USE_CONSUMABLE)
+        self.assertTrue(inferred_use.metadata.get("inferred"))
+        self.assertTrue(inferred_use.metadata.get("corrupted"))
+        step_760 = next(dl.action for dl in traj.deltas[1:] if dl.action and dl.action.frame_idx == 760)
+        self.assertFalse(step_760.metadata.get("corrupted", False))
+
+    def test_serpent_h15_post_round_recovery_button_bob_and_invis_joker_reconcile(self) -> None:
+        # 1. 22 px button-bob across 10 frames collapses to final release frame
+        dedup = pp.remove_duplicates(
+            {
+                "89618": {"action": 1, "box": [1648, 146, 1721, 212]},
+                "89628": {"action": 1, "box": [1638, 168, 1711, 234]},
+                "89632": {"action": 1, "box": [1638, 168, 1711, 234]},
+            }
+        )
+        self.assertEqual(list(dedup.keys()), ["89632"])
+
+        # 2. hand_size_over_15 + unexpected_deck_addition does NOT recover mid-round,
+        #    but DOES recover once a Full Deck sync occurs after the round ends.
+        def _rec(s: int, rk: tuple[int, int]) -> dict[str, Any]:
+            return {
+                "step_idx": s,
+                "round_key": rk,
+                "location": bm.Location.BLIND,
+                "round_won": False,
+                "hand_over_15": False,
+                "unexpected_adds": 0,
+                "full_deck_synced": False,
+                "unobserved_deck_tarot": False,
+                "fd_deck_tarot": False,
+                "unexplained_joker": [],
+                "unexplained_cons": [],
+                "unmatched_target": False,
+                "location_mismatch": False,
+                "cashout_no_round_won": False,
+                "empty_hand_cv": False,
+                "missing_shop_cv": False,
+                "large_ocr_override": False,
+            }
+
+        traj = gs.RunTrajectory()
+        st = gs.GameState()
+        traj.record_step(st, None)
+        rks = [(7, 23), (7, 23), (7, 23), (8, 24), (8, 24)]
+        recs = [_rec(0, (7, 23))]
+        for idx, rk in enumerate(rks, 1):
+            traj.record_step(st, bm.Action(type=bm.ActionType.PLAY_HAND, frame_idx=idx * 100))
+            recs.append(_rec(idx, rk))
+        recs[1]["hand_over_15"] = True
+        recs[1]["unexpected_adds"] = 1
+        recs[2]["full_deck_synced"] = True  # Mid-round sync while still in (7, 23) -> not sufficient alone!
+        recs[4]["full_deck_synced"] = True  # Post-round sync in (8, 24) -> recovers step 4 & 5!
+
+        wm = pp._scan_and_quarantine_corrupted_segments(traj, recs)
+        self.assertIsNone(wm)
+        self.assertTrue(traj.deltas[1].action.metadata.get("corrupted"))
+        self.assertTrue(traj.deltas[2].action.metadata.get("corrupted"))
+        self.assertTrue(traj.deltas[3].action.metadata.get("corrupted"))
+        self.assertFalse(traj.deltas[4].action.metadata.get("corrupted", False))
+        self.assertFalse(traj.deltas[5].action.metadata.get("corrupted", False))
 
 
 def _convert_for_test(raw):

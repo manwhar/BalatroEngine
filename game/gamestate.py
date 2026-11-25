@@ -917,6 +917,7 @@ class GameState:
             hc.card.debuffed = False
             if hc.facing_back and hc._real_card:
                 hc.resolve_face_down(hc._real_card, lift_facing_back=True)
+                self.sync_card_to_deck(hc.card, rebind_hand_card=hc)
             else:
                 hc.facing_back = False
         if self.full_deck:
@@ -967,6 +968,30 @@ class GameState:
             return 25
         return 0
 
+    def sync_card_to_deck(
+        self,
+        card: PlayingCard | None,
+        *,
+        rebind_hand_card: HandCard | None = None,
+    ) -> PlayingCard | None:
+        """Propagates in-place mutations on a hand/played card back to its matching `full_deck` entry by `id`."""
+        if card is None or card.id == 0 or not self.full_deck:
+            return None
+        for dc in self.full_deck:
+            if dc.id == card.id:
+                if dc is not card:
+                    dc.rank = card.rank
+                    dc.suit = card.suit
+                    dc.enhancement = card.enhancement
+                    dc.edition = card.edition
+                    dc.seal = card.seal
+                    dc.bonus_chips = card.bonus_chips
+                    dc.debuffed = card.debuffed
+                if rebind_hand_card is not None and not rebind_hand_card.facing_back:
+                    rebind_hand_card.card = dc
+                return dc
+        return None
+
     def add_card_to_deck(self, card: PlayingCard, add_to_hand: bool = False) -> None:
         """Adds a card to the run's full deck (and optionally hand) and triggers Hologram."""
         existing_ids = {c.id for c in self.full_deck}
@@ -985,12 +1010,20 @@ class GameState:
         """Removes a single matching card from full deck, discard pile, and hand when destroyed."""
         removed = False
         popped_card: PlayingCard | None = None
-        for i, c in enumerate(self.full_deck):
-            if _cards_match(c, card):
-                popped_card = self.full_deck.pop(i)
-                popped_card.destroyed = True
-                removed = True
-                break
+        if card.id != 0:
+            for i, c in enumerate(self.full_deck):
+                if c.id == card.id:
+                    popped_card = self.full_deck.pop(i)
+                    popped_card.destroyed = True
+                    removed = True
+                    break
+        if not removed:
+            for i, c in enumerate(self.full_deck):
+                if _cards_match(c, card):
+                    popped_card = self.full_deck.pop(i)
+                    popped_card.destroyed = True
+                    removed = True
+                    break
         if not removed:
             for i, c in enumerate(self.full_deck):
                 if c.rank == card.rank and c.suit == card.suit:
@@ -1003,13 +1036,22 @@ class GameState:
             popped_card.destroyed = True
             removed = True
         for i, c in enumerate(self.discard_pile):
-            if _cards_match(c, card):
+            if (card.id != 0 and c.id == card.id) or _cards_match(c, card):
                 self.discard_pile.pop(i)
                 break
-        for i, hc in enumerate(self.hand.cards):
-            if _cards_match(hc.card, card):
-                self.hand.cards.pop(i)
-                break
+        hand_removed = False
+        if card.id != 0:
+            for i, hc in enumerate(self.hand.cards):
+                hc_id = hc._real_card.id if (hc.facing_back and hc._real_card) else hc.card.id
+                if hc_id == card.id:
+                    self.hand.cards.pop(i)
+                    hand_removed = True
+                    break
+        if not hand_removed:
+            for i, hc in enumerate(self.hand.cards):
+                if _cards_match(hc.card, card):
+                    self.hand.cards.pop(i)
+                    break
         card.destroyed = True
         destroyed_id = (
             popped_card.id if popped_card and popped_card.id else card.id

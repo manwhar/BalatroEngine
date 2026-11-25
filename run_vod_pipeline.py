@@ -132,6 +132,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--conf-hand", type=float, default=0.50)
     p.add_argument("--conf-shop", type=float, default=0.15)
     p.add_argument("--conf-ocr", type=float, default=0.90)
+    p.add_argument(
+        "--min-duration-minutes",
+        type=float,
+        default=30.0,
+        help="Skip videos shorter than this duration in minutes (default: 30; set 0 to disable)",
+    )
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--expressive", action="store_true")
     return p
@@ -170,6 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         conf_hand=float(args.conf_hand),
         conf_shop=float(args.conf_shop),
         conf_ocr=float(args.conf_ocr),
+        min_duration_sec=max(0.0, float(args.min_duration_minutes) * 60.0),
         device=args.device,
         expressive=bool(args.expressive),
     )

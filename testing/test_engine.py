@@ -3229,6 +3229,31 @@ class TestNewEngineFeatures(unittest.TestCase):
         self.assertEqual(determine_card_selection(_mk_boxes([20]), 322), [True])
         self.assertEqual(determine_card_selection(_mk_boxes([65]), 322), [False])
 
+        # xPGzf7YJlxM step 334 (Hanged Man): left-edge occluded King (#0) + 9 (#1)
+        s334_boxes = [
+            [19, 66, 128, 305], [143, 44, 243, 279], [269, 74, 361, 307], [393, 77, 478, 309],
+            [515, 83, 596, 313], [630, 79, 721, 310], [749, 75, 854, 311], [866, 89, 978, 329],
+        ]
+        self.assertEqual(
+            determine_card_selection(s334_boxes, 340),
+            [True, True, False, False, False, False, False, False],
+        )
+        self.assertEqual(
+            determine_card_selection(s334_boxes, 340, min_selected=1, max_selected=2),
+            [True, True, False, False, False, False, False, False],
+        )
+
+        # xPGzf7YJlxM step 215 (Death): Glass card #2 under JokerDisplay overlaps slightly high (y1=57),
+        # but enforcing Death's exact (2, 2) cardinality cleanly picks #1 (y1=44) and #5 (y1=36).
+        s215_boxes = [
+            [19, 115, 127, 340], [141, 44, 246, 281], [264, 57, 358, 291], [395, 76, 476, 307],
+            [515, 84, 596, 313], [632, 36, 721, 267], [744, 75, 855, 311], [862, 84, 973, 327],
+        ]
+        self.assertEqual(
+            determine_card_selection(s215_boxes, 340, min_selected=2, max_selected=2),
+            [False, True, False, False, False, True, False, False],
+        )
+
     def test_death_tarot_preserves_left_card_deck_id(self):
         left_card = bm.PlayingCard(rank=bm.Rank.TWO, suit=bm.Suit.CLUBS, id=1)
         right_card = bm.PlayingCard(
@@ -3666,6 +3691,116 @@ class TestNewEngineFeatures(unittest.TestCase):
         discard_ids = {c.id for c in state.discard_pile}
         self.assertIn(30, discard_ids)
         self.assertIn(31, discard_ids)  # Remainder filled by PRNG when only 1 override ID supplied
+
+    def test_tarot_and_joker_mutations_propagate_to_full_deck_after_face_down_resolve(self) -> None:
+        """Tarot/Spectral/Joker mutations on face-down or resolved orphan HandCards update full_deck by id."""
+        import copy
+        from game.balatro_models import (
+            Action,
+            ActionType,
+            Edition,
+            Enhancement,
+            Hand,
+            HandCard,
+            Inventory,
+            Joker,
+            JokerName,
+            Location,
+            PlayingCard,
+            Rank,
+            Seal,
+            Spectral,
+            SpectralName,
+            Suit,
+            Tarot,
+            TarotName,
+        )
+        from game.engine.rules import on_action
+        from game.gamestate import GameState
+
+        c9 = PlayingCard(rank=Rank.ACE, suit=Suit.CLUBS, enhancement=Enhancement.MULT, id=9)
+        c20 = PlayingCard(
+            rank=Rank.FIVE,
+            suit=Suit.CLUBS,
+            enhancement=Enhancement.GLASS,
+            seal=Seal.RED,
+            edition=Edition.POLYCHROME,
+            id=20,
+        )
+        c38 = PlayingCard(rank=Rank.QUEEN, suit=Suit.HEARTS, id=38)
+        c_stone = PlayingCard(rank=Rank.NONE, suit=Suit.NONE, enhancement=Enhancement.STONE, id=44)
+
+        # Simulate cards previously drawn face-down (severing hc.card pointer via HandCard.__post_init__)
+        hc9 = HandCard(card=c9, facing_back=True)
+        hc9.resolve_face_down(copy.deepcopy(c9), lift_facing_back=True)
+        self.assertIsNot(hc9.card, c9)  # Orphan clone prior to Tarot
+
+        hc20 = HandCard(card=c20)
+        hc38_fd = HandCard(card=c38, facing_back=True)  # Still face-down with _real_card copy!
+        hc_stone = HandCard(card=c_stone)
+
+        state = GameState(
+            location=Location.BLIND,
+            full_deck=[c9, c20, c38, c_stone],
+            hand=Hand(cards=[hc9, hc20, hc38_fd, hc_stone]),
+            inventory=Inventory(
+                consumables=[
+                    Tarot(name=TarotName.DEATH),
+                    Tarot(name=TarotName.STRENGTH),
+                    Tarot(name=TarotName.CHARIOT),
+                    Spectral(name=SpectralName.DEJA_VU),
+                    Tarot(name=TarotName.DEATH),
+                    Tarot(name=TarotName.HANGED_MAN),
+                ]
+            ),
+        )
+
+        # 1. Death on orphan hc9 (left) + hc20 (right) updates c9 in state.full_deck and rebinds hc9.card
+        hc9.selected = True
+        hc20.selected = True
+        on_action(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual(c9.rank, Rank.FIVE)
+        self.assertEqual(c9.enhancement, Enhancement.GLASS)
+        self.assertEqual(c9.seal, Seal.RED)
+        self.assertEqual(c9.edition, Edition.POLYCHROME)
+        self.assertIs(hc9.card, c9)
+
+        # 2. Strength + Chariot + Deja Vu on face-down hc38_fd propagate rank/enh/seal to c38 in full_deck
+        hc9.selected = False
+        hc20.selected = False
+        hc38_fd.selected = True
+        on_action(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))  # Strength: Q -> K
+        on_action(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))  # Chariot: Steel
+        on_action(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))  # Deja Vu: Red Seal
+        self.assertEqual(c38.rank, Rank.KING)
+        self.assertEqual(c38.enhancement, Enhancement.STEEL)
+        self.assertEqual(c38.seal, Seal.RED)
+
+        # 3. Death cloning a CV Stone card (rank=NONE, enhancement=STONE) onto hc20 updates c20
+        hc38_fd.selected = False
+        hc20.selected = True
+        hc_stone.selected = True
+        on_action(state, Action(type=ActionType.USE_CONSUMABLE, target_idx=0))
+        self.assertEqual(c20.enhancement, Enhancement.STONE)
+
+        # 4. Inferred Hanged Man with zero selected cards does NOT blindly destroy hand.cards[:2]
+        for hc in state.hand.cards:
+            hc.selected = False
+        on_action(
+            state,
+            Action(type=ActionType.USE_CONSUMABLE, target_idx=0, metadata={"inferred": True}),
+        )
+        self.assertEqual(len(state.full_deck), 4)
+
+        # 5. Midas Mask + Hiker on deserialized/orphan played card propagate to full_deck by id
+        orphan_king = copy.deepcopy(c38)
+        orphan_king.enhancement = Enhancement.NONE
+        c38.enhancement = Enhancement.NONE
+        state.hand.cards = [HandCard(card=orphan_king, selected=True)]
+        state.inventory.jokers = [Joker(name=JokerName.MIDAS_MASK), Joker(name=JokerName.HIKER)]
+        on_action(state, Action(type=ActionType.PLAY_HAND))
+        self.assertEqual(c38.enhancement, Enhancement.GOLD)
+        self.assertGreaterEqual(c38.bonus_chips, 5)
 
 
 def run_synthetic_test() -> None:

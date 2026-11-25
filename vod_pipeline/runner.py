@@ -68,6 +68,7 @@ class PipelineConfig:
     conf_ocr: float = 0.90
     device: str | None = None
     expressive: bool = False
+    min_duration_sec: float = 1800.0
     metadata_timeout_sec: int = 60
     download_timeout_sec: int = 3600
 
@@ -754,6 +755,18 @@ def run_batch_pipeline(
             row = meta.to_dict()
             row["skip_reason"] = "already_processed"
             row["trajectory_json"] = str(traj_path)
+            skipped.append(row)
+            continue
+
+        if (
+            cfg.min_duration_sec > 0
+            and meta.duration_seconds is not None
+            and meta.duration_seconds < cfg.min_duration_sec
+        ):
+            row = meta.to_dict()
+            row["skip_reason"] = (
+                f"too_short_under_{int(round(cfg.min_duration_sec / 60))}m"
+            )
             skipped.append(row)
             continue
 

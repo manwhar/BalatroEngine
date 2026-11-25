@@ -736,6 +736,8 @@ def handle_hiker(joker: Joker, ctx: TriggerContext):
     if ctx.event == TriggerEvent.INDIVIDUAL_CARD_SCORED:
         if ctx.target_card and not getattr(ctx.target_card, "debuffed", False):
             ctx.target_card.bonus_chips += 5
+            if ctx.state:
+                ctx.state.sync_card_to_deck(ctx.target_card)
     elif ctx.event == TriggerEvent.AFTER_PLAY:
         if ctx.extra and ctx.extra.get("batch_hiker"):
             scoring = ctx.scoring_cards or (
@@ -746,6 +748,8 @@ def handle_hiker(joker: Joker, ctx: TriggerContext):
             for card in scoring:
                 if not getattr(card, "debuffed", False):
                     card.bonus_chips += 5
+                    if ctx.state:
+                        ctx.state.sync_card_to_deck(card)
 
 
 @joker_hook(JokerName.HOLOGRAM)
@@ -792,6 +796,8 @@ def handle_vampire(joker: Joker, ctx: TriggerContext):
         for card in scoring:
             if card.enhancement != Enhancement.NONE and not getattr(card, "debuffed", False):
                 card.enhancement = Enhancement.NONE
+                if ctx.state:
+                    ctx.state.sync_card_to_deck(card)
                 joker.state["x_mult"] = round(joker.state.get("x_mult", 1.0) + 0.1, 2)
 
 
@@ -1460,6 +1466,8 @@ def handle_midas_mask(joker: Joker, ctx: TriggerContext):
         for c in scoring:
             if is_card_face(c, jokers):
                 c.enhancement = Enhancement.GOLD
+                if ctx.state:
+                    ctx.state.sync_card_to_deck(c)
 
 
 @joker_hook(JokerName.ROUGH_GEM)

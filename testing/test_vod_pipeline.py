@@ -371,6 +371,7 @@ class TestVodMetadataAndBatchPipeline(unittest.TestCase):
                 work_dir=Path(tmpdir) / "batch_runs",
                 dry_run=True,
                 allow_deck_template_fallback=True,
+                min_duration_sec=0.0,
             )
             report = run_batch_pipeline(
                 ["https://www.youtube.com/watch?v=dummy"],
@@ -626,6 +627,95 @@ class TestVodMetadataAndBatchPipeline(unittest.TestCase):
             self.assertEqual(csum["ante78_total"], 8)
             self.assertEqual(csum["ante78_pct"], 50.0)
             self.assertEqual(csum["corruption_reasons"], {"large_ocr_override": 4})
+
+    def test_min_duration_filter_skips_short_videos_prior_to_download(self) -> None:
+        raw_items = [
+            {
+                "id": "short_ready",
+                "webpage_url": "https://www.youtube.com/watch?v=short_ready",
+                "title": "Red Deck quick loss",
+                "description": "Red Deck:\n\nAAAA1111",
+                "duration": 1799,
+            },
+            {
+                "id": "short_fallback",
+                "webpage_url": "https://www.youtube.com/watch?v=short_fallback",
+                "title": "Mystery loss",
+                "description": "Seed: BBBB2222",
+                "duration": 600,
+            },
+            {
+                "id": "exact_30m",
+                "webpage_url": "https://www.youtube.com/watch?v=exact_30m",
+                "title": "Blue Deck full run",
+                "description": "Blue Deck:\n\nCCCC3333",
+                "duration": 1800,
+            },
+        ]
+
+        def fake_fetch(urls, cfg):
+            return [(raw, extract_run_metadata(raw)) for raw in raw_items]
+
+        downloaded_ids: list[str] = []
+
+        def fake_download(url, vid, ddir, cfg, stop_ev):
+            downloaded_ids.append(vid)
+            p = ddir / f"{vid}.mp4"
+            p.write_bytes(b"mp4")
+            return p
+
+        def fake_process(vpath, meta, cfg, **kwargs):
+            traj_out = cfg.work_dir / "trajectories" / f"{meta.video_id}_trajectory.json"
+            traj_out.write_text("{}", encoding="utf-8")
+            return {"trajectory_json": str(traj_out), "num_steps": 5}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp) / "batch_runs"
+            cfg = PipelineConfig(
+                work_dir=work_dir,
+                allow_deck_template_fallback=True,
+                allow_ocr_seed_fallback=True,
+                keep_videos=True,
+            )
+            report = run_batch_pipeline(
+                [r["webpage_url"] for r in raw_items],
+                cfg,
+                fetch_metadata_fn=fake_fetch,
+                download_fn=fake_download,
+                process_fn=fake_process,
+            )
+            self.assertEqual(report["counts"]["processed"], 1)
+            self.assertEqual(report["counts"]["skipped"], 2)
+            self.assertEqual(downloaded_ids, ["exact_30m"])
+            skipped_by_id = {s["video_id"]: s for s in report["skipped"]}
+            self.assertEqual(skipped_by_id["short_ready"]["skip_reason"], "too_short_under_30m")
+            self.assertEqual(skipped_by_id["short_fallback"]["skip_reason"], "too_short_under_30m")
+
+        # Setting min_duration_sec=0 disables the filter
+        downloaded_all: list[str] = []
+
+        def fake_download_all(url, vid, ddir, cfg, stop_ev):
+            downloaded_all.append(vid)
+            p = ddir / f"{vid}.mp4"
+            p.write_bytes(b"mp4")
+            return p
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            cfg_off = PipelineConfig(
+                work_dir=Path(tmp2) / "batch_runs",
+                min_duration_sec=0.0,
+                allow_deck_template_fallback=False,
+            )
+            report_off = run_batch_pipeline(
+                [r["webpage_url"] for r in raw_items],
+                cfg_off,
+                fetch_metadata_fn=fake_fetch,
+                download_fn=fake_download_all,
+                process_fn=fake_process,
+            )
+            self.assertEqual(sorted(downloaded_all), ["exact_30m", "short_ready"])
+            self.assertEqual(report_off["counts"]["processed"], 2)
+            self.assertEqual(report_off["counts"]["skipped"], 1)
 
 
 if __name__ == "__main__":

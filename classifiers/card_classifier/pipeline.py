@@ -84,19 +84,26 @@ def _fit_clamped_arch(
     y_target: np.ndarray,
     scale: float,
 ) -> tuple[float, float, float]:
-    """Fits a gently curved, mostly symmetric upward-convex arch `c0 + c1*u + c2*u^2`."""
+    """Fits a gently curved, asymmetric-edge upward-convex arch `c0 + c1*u + c2*u^2`."""
     coef, _, _, _ = np.linalg.lstsq(design_x, y_target, rcond=None)
     c0, c1, c2 = float(coef[0]), float(coef[1]), float(coef[2])
     c2 = max(0.0, min(48.0 * scale, c2))
-    c1 = max(-5.0 * scale, min(5.0 * scale, c1))
+    # Allow negative c1 (leftmost card #0 occluded on its top-right corner shifts YOLO y1 downward).
+    c1 = max(-16.0 * scale, min(2.0 * scale, c1))
     c0 = float(np.median(y_target - c1 * u - c2 * (u ** 2)))
     return c0, c1, c2
 
 
-def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bool]:
+def determine_card_selection(
+    boxes: list[list[int]],
+    img_height: int,
+    *,
+    min_selected: int = 0,
+    max_selected: int = 5,
+) -> list[bool]:
     """
     Geometrically determines which cards are selected (raised upward) along Balatro's
-    arched hand curve.
+    arched hand curve, optionally bounded to `[min_selected, max_selected]`.
 
     Selected cards shift upward by ~38-56px (at 322px crop height) relative to their
     resting position on the curved hand arch, whereas outer unselected cards naturally
@@ -106,24 +113,38 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
     if n == 0:
         return []
 
+    eff_max = min(n, max(0, int(max_selected)))
+    eff_min = min(eff_max, max(0, int(min_selected)))
     scale = (img_height / 322.0) if img_height > 0 else 1.0
     ys = np.array([b[1] for b in boxes], dtype=np.float64)
     cxs = np.array([(b[0] + b[2]) / 2.0 for b in boxes], dtype=np.float64)
 
     if n == 1:
+        if eff_min == 1:
+            return [True]
+        if eff_max == 0:
+            return [False]
         return [bool(ys[0] < 43.0 * scale)]
     if n == 2:
+        if eff_min == 2:
+            return [True, True]
+        if eff_max == 0:
+            return [False, False]
+        if eff_min == 1 and eff_max == 1:
+            return [True, False] if ys[0] <= ys[1] else [False, True]
         if float(ys.max() - ys.min()) > 28.0 * scale:
             midpoint = float(ys.min() + ys.max()) / 2.0
             return [bool(y < midpoint) for y in ys]
-        return [bool(y < 43.0 * scale) for y in ys]
+        res = [bool(y < 43.0 * scale) for y in ys]
+        if sum(res) < eff_min:
+            res = [True, False] if ys[0] <= ys[1] else [False, True]
+        return res
 
     cx_min, cx_max = float(cxs.min()), float(cxs.max())
     span = max(1.0, (cx_max - cx_min) / 2.0)
     u = (cxs - (cx_max + cx_min) / 2.0) / span
     design_x = np.column_stack([np.ones(n), u, u ** 2])
     candidate_deltas = (
-        34.0 * scale,
         40.0 * scale,
         46.0 * scale,
         52.0 * scale,
@@ -133,7 +154,7 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
     def _eval_mask(mask: list[bool]) -> tuple[float, tuple[float, float, float, float]]:
         sel = np.asarray(mask, dtype=np.float64)
         num_sel = int(sel.sum())
-        if num_sel > 5:
+        if num_sel < eff_min or num_sel > eff_max:
             return float("inf"), (0.0, 0.0, 0.0, 0.0)
         if num_sel == 0 or num_sel == n:
             c0, c1, c2 = _fit_clamped_arch(design_x, u, ys, scale)
@@ -167,6 +188,12 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
     for idx in range(len(uniq_ys) - 1):
         thresh = (uniq_ys[idx] + uniq_ys[idx + 1]) / 2.0
         candidates.append([bool(y < thresh) for y in ys])
+    order_y = np.argsort(ys)
+    for k in range(max(1, eff_min), eff_max + 1):
+        cand_k = [False] * n
+        for idx in order_y[:k]:
+            cand_k[int(idx)] = True
+        candidates.append(cand_k)
 
     best_score = float("inf")
     best_mask = [False] * n
@@ -182,7 +209,15 @@ def determine_card_selection(boxes: list[list[int]], img_height: int) -> list[bo
         if delta <= 0.0:
             break
         arch = c0 + c1 * u + c2 * (u ** 2)
-        refined = [bool((arch[i] - ys[i]) > delta * 0.5) for i in range(n)]
+        raises = arch - ys
+        refined = [bool(raises[i] > delta * 0.5) for i in range(n)]
+        sel_cnt = sum(refined)
+        if sel_cnt > eff_max:
+            top_indices = set(int(i) for i in np.argsort(-raises)[:eff_max])
+            refined = [i in top_indices for i in range(n)]
+        elif sel_cnt < eff_min:
+            top_indices = set(int(i) for i in np.argsort(-raises)[:eff_min])
+            refined = [i in top_indices for i in range(n)]
         score, params = _eval_mask(refined)
         if score < best_score:
             best_score, best_mask, best_params = score, refined, params
